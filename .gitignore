@@ -1,4 +1,7 @@
 *.exe
 config.h
+config.env
 version.res
 *.log
+loader.ps1
+.netlify/

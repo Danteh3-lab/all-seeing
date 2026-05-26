@@ -75,7 +75,7 @@ function updateStatus(entryCount) {
 
 function tick() {
     countdown--;
-    if (countdown <= 0) countdown = 5;
+    if (countdown <= 0) countdown = 20;
     updateStatus(window._lastCount || 0);
 }
 
@@ -105,7 +105,8 @@ async function fetchKeys() {
         let html = '';
         for (let i = 0; i < data.length; i++) {
             const row = data[i];
-            const time = row.created_at ? new Date(row.created_at + 'Z').toLocaleString() : '-';
+            const ts = row.created_at ? row.created_at.replace(/Z$|[+\-]\d{2}:?\d{2}$/, '') + 'Z' : null;
+            const time = ts ? new Date(ts).toLocaleString() : '-';
             const host = row.hostname || '-';
             const win = row.window_title || '';
             const keys = row.keys || '';
@@ -174,7 +175,7 @@ function escapeHtml(s) {
 
 window.addEventListener('DOMContentLoaded', () => {
     fetchKeys();
-    refreshInterval = setInterval(fetchKeys, 5000);
+    refreshInterval = setInterval(fetchKeys, 20000);
     setInterval(tick, 1000);
 });
 </script>

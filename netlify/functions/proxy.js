@@ -1,4 +1,4 @@
-const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://xdxlfkyywnjrzqblvdzg.supabase.co';
 
 const handler = async (event) => {
   const path = event.queryStringParameters.path || '';

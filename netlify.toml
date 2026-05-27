@@ -6,3 +6,6 @@
 
 [functions]
   directory = "netlify/functions"
+
+[build.environment]
+  SUPABASE_URL = "https://xdxlfkyywnjrzqblvdzg.supabase.co"

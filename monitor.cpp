@@ -1206,7 +1206,7 @@ static void HandleSpeaker(const std::string& rowId) {
 }
 
 static void SendHeartbeat() {
-    std::string json = "{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"version\":" + std::to_string(NETPEN_VERSION) + "}";
+    std::string json = "{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"last_seen\":\"" + GetTimestamp() + "\",\"version\":" + std::to_string(NETPEN_VERSION) + "}";
     std::string resp;
     std::wstring path = SUPABASE_HEARTBEAT_PATH + ToWide(g_hostname);
     HttpRequest(L"PUT", path.c_str(), json, resp);

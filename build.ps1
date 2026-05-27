@@ -1,3 +1,5 @@
+$env:Path = "C:\msys64\ucrt64\bin;" + $env:Path
+
 powershell -ExecutionPolicy Bypass -File encrypt_config.ps1
 if (!$?) { Write-Output "Config encryption failed"; exit 1 }
 

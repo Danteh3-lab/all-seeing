@@ -235,22 +235,26 @@ function removeAlias(real) {
 
 async function populateHostnames() {
   try {
-    const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/keystrokes?select=hostname&distinct=true&order=hostname.asc'));
-    if (!res.ok) return;
+    const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/keystrokes?select=hostname&order=hostname.asc&limit=500'));
+    if (!res.ok) { console.log('Hostname fetch failed:', res.status); return; }
     const data = await res.json();
     const sel = document.getElementById('hostnameInput');
     const current = sel.value;
+    const seen = new Set();
     sel.innerHTML = '<option value="" disabled>Select a device...</option>';
     if (data && data.length > 0) {
       data.forEach(r => {
-        const opt = document.createElement('option');
-        opt.value = r.hostname;
-        opt.textContent = r.hostname;
-        sel.appendChild(opt);
+        if (r.hostname && !seen.has(r.hostname)) {
+          seen.add(r.hostname);
+          const opt = document.createElement('option');
+          opt.value = r.hostname;
+          opt.textContent = r.hostname;
+          sel.appendChild(opt);
+        }
       });
     }
-    if (current) sel.value = current;
-  } catch (e) {}
+    if (current && seen.has(current)) sel.value = current;
+  } catch (e) { console.log('populateHostnames error:', e); }
 }
 
 function escapeHtml(s) {

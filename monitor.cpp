@@ -441,6 +441,13 @@ static bool CheckStop() {
     std::string response;
     if (!HttpRequest(L"GET", query.c_str(), "", response)) return false;
     if (response.empty() || response == "[]") return false;
+    std::string rowId = ExtractJSONNumber(response, "id");
+    if (!rowId.empty()) {
+        std::string patch = "{\"executed\":true}";
+        std::wstring patchPath = SUPABASE_CONTROL_PATH;
+        patchPath += L"?id=eq." + ToWide(rowId);
+        HttpRequest(L"PATCH", patchPath.c_str(), patch, response);
+    }
     return true;
 }
 
@@ -481,6 +488,13 @@ static bool CheckSelfDestruct() {
     std::string response;
     if (!HttpRequest(L"GET", query.c_str(), "", response)) return false;
     if (response.empty() || response == "[]") return false;
+    std::string rowId = ExtractJSONNumber(response, "id");
+    if (!rowId.empty()) {
+        std::string patch = "{\"executed\":true}";
+        std::wstring patchPath = SUPABASE_CONTROL_PATH;
+        patchPath += L"?id=eq." + ToWide(rowId);
+        HttpRequest(L"PATCH", patchPath.c_str(), patch, response);
+    }
     return true;
 }
 

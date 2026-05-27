@@ -6,6 +6,7 @@ param(
 $map = @{
     "SUPABASE_HOST" = ""
     "SUPABASE_ANON_KEY" = ""
+    "SUPABASE_SERVICE_KEY" = ""
     "DISCORD_HOST" = ""
     "DISCORD_PATH" = ""
 }

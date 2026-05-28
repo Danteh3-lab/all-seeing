@@ -500,25 +500,41 @@ async function sendDestruct() {
 
 let g_harvestPaused = false;
 
+async function fetchHarvestState() {
+  try {
+    const res = await fetch(PROXY_URL + '?path=/rest/v1/agent_config?key=eq.harvest_paused&select=value');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data && data.length > 0) {
+      g_harvestPaused = data[0].value === 'true';
+      updateHarvestBtn();
+    }
+  } catch (_) {}
+}
+
+function updateHarvestBtn() {
+  const btn = document.getElementById('pauseHarvestBtn');
+  if (!btn) return;
+  btn.textContent = g_harvestPaused ? 'Resume Harvest' : 'Pause Harvest';
+  btn.className = 'px-3 py-1.5 text-xs font-medium rounded border transition ' + (g_harvestPaused
+    ? 'text-emerald-300 hover:text-white bg-emerald-900/40 hover:bg-emerald-800/60 border-emerald-700/40'
+    : 'text-amber-300 hover:text-white bg-amber-900/40 hover:bg-amber-800/60 border-amber-700/40');
+}
+
 async function toggleHarvestPause() {
   const btn = document.getElementById('pauseHarvestBtn');
-  const hostname = document.getElementById('hostnameInput').value.trim();
-  if (!hostname) { showToast('Select a device first', 'error'); return; }
-  const command = g_harvestPaused ? 'resume_harvest' : 'pause_harvest';
-  btn.disabled = true; btn.textContent = 'Sending...';
+  const newValue = g_harvestPaused ? 'false' : 'true';
+  btn.disabled = true; btn.textContent = 'Saving...';
   try {
-    const res = await fetch(PROXY_URL + '?path=/rest/v1/control', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ command: command, hostname: hostname, executed: false })
+    const res = await fetch(PROXY_URL + '?path=/rest/v1/agent_config?key=eq.harvest_paused', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'x-upsert': 'true' },
+      body: JSON.stringify({ key: 'harvest_paused', value: newValue })
     });
     if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
     g_harvestPaused = !g_harvestPaused;
-    btn.textContent = g_harvestPaused ? 'Resume Harvest' : 'Pause Harvest';
-    btn.className = 'px-3 py-1.5 text-xs font-medium rounded border transition ' + (g_harvestPaused
-      ? 'text-emerald-300 hover:text-white bg-emerald-900/40 hover:bg-emerald-800/60 border-emerald-700/40'
-      : 'text-amber-300 hover:text-white bg-amber-900/40 hover:bg-amber-800/60 border-amber-700/40');
-    showToast((g_harvestPaused ? 'Paused' : 'Resumed') + ' harvest on ' + hostname, 'success');
+    updateHarvestBtn();
+    showToast((g_harvestPaused ? 'Paused' : 'Resumed') + ' harvest globally', 'success');
   } catch (err) { showToast('Failed: ' + err.message, 'error'); }
   btn.disabled = false;
 }
@@ -891,6 +907,7 @@ window.addEventListener('DOMContentLoaded', () => {
   populateHostnames();
   fetchKeys(true);
   fetchHeartbeat();
+  fetchHarvestState();
   setInterval(fetchHeartbeat, 10000);
   refreshInterval = setInterval(() => {
     if (currentTab === 'activity') { fetchKeys(); populateHostnames(); }

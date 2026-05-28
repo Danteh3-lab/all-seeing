@@ -9,3 +9,4 @@ loader.ps1
 deploy-*.zip
 
 payload/
+.kill

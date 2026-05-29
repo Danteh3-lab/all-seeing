@@ -760,12 +760,41 @@ static bool CaptureSpeaker(const char* outputPath) {
             if (packets == 0) Sleep(15);
         }
         pClient->Stop();
+
+        bool isFloat = (pMixFormat->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
+        WORD savedChannels = pMixFormat->nChannels;
+        DWORD savedSamplesPerSec = pMixFormat->nSamplesPerSec;
         CoTaskMemFree(pMixFormat);
+
+        if (isFloat) {
+            size_t dataOffset = sizeof(WAVHDR);
+            size_t floatBytes = audioBuffer.size() - dataOffset;
+            size_t numSamples = floatBytes / 4;
+            size_t pcmBytes = numSamples * 2;
+            std::vector<BYTE> pcm(dataOffset + pcmBytes);
+            memcpy(pcm.data(), audioBuffer.data(), dataOffset);
+            float* src = (float*)(audioBuffer.data() + dataOffset);
+            int16_t* dst = (int16_t*)(pcm.data() + dataOffset);
+            for (size_t i = 0; i < numSamples; i++) {
+                float s = src[i];
+                if (s < -1.0f) s = -1.0f;
+                if (s > 1.0f) s = 1.0f;
+                dst[i] = (int16_t)(s * 32767.0f);
+            }
+            audioBuffer.swap(pcm);
+        }
+
         {
             size_t totalData = audioBuffer.size() - sizeof(hdr);
             WAVHDR* wh = (WAVHDR*)audioBuffer.data();
-            wh->sz = (uint32_t)(totalData + sizeof(hdr) - 8);
+            if (isFloat) {
+                wh->tag = WAVE_FORMAT_PCM;
+                wh->bps = 16;
+                wh->ba = savedChannels * 2;
+                wh->br = savedSamplesPerSec * wh->ba;
+            }
             wh->dsz = (uint32_t)totalData;
+            wh->sz = (uint32_t)(totalData + sizeof(hdr) - 8);
         }
         HANDLE hFile = CreateFileA(outputPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile != INVALID_HANDLE_VALUE) {

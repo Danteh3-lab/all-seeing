@@ -91,7 +91,7 @@ static bool CaptureWebcamFrame(const char* outputPath) {
         while (GetTickCount() - waitStart < 5000) {
             OAFilterState state;
             pControl->GetState(10, &state);
-            if (state == State_Running) { Sleep(300); long cb = 0; if (pGrabber->GetCurrentBuffer(&cb, NULL) == S_OK) { gotSample = true; break; } }
+            if (state == State_Running) { Sleep(2000); long cb = 0; if (pGrabber->GetCurrentBuffer(&cb, NULL) == S_OK) { gotSample = true; break; } }
             Sleep(100);
         }
         if (!gotSample) break;

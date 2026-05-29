@@ -434,11 +434,15 @@ async function fetchKeys(resetPage) {
       if (isClipboard) winDisplay = '<span class="inline-flex items-center px-1.5 py-0.5 text-xs font-medium rounded bg-violet-800/40 text-violet-300 border border-violet-700/40">Clipboard</span>';
       else if (isPassword) winDisplay = '<span class="inline-flex items-center px-1.5 py-0.5 text-xs font-medium rounded bg-red-800/40 text-red-300 border border-red-700/40">Password</span>';
       const ver = row.version != null ? row.version : '-';
+      let verClass = 'text-slate-500';
+      if (g_latestVersion != null && row.version != null) {
+        verClass = row.version >= g_latestVersion ? 'text-emerald-400' : 'text-amber-400';
+      }
       html += '<tr class="' + rowClass + 'hover:bg-slate-800/30 transition-colors">'
         + '<td class="py-3.5 px-4 text-slate-400 whitespace-nowrap">' + time + '</td>'
         + '<td class="py-3.5 px-4 text-emerald-400 font-medium cursor-pointer hover:underline" onclick="editAlias(\'' + host.replace(/'/g, "\\'") + '\')" title="Click to rename">' + escapeHtml(disp) + '</td>'
         + '<td class="py-3.5 px-4 text-slate-300 truncate max-w-xs" title="' + escapeHtml(win) + '">' + winDisplay + '</td>'
-        + '<td class="py-3.5 px-4 text-slate-500 text-xs font-mono">' + ver + '</td>'
+        + '<td class="py-3.5 px-4 text-xs font-mono ' + verClass + '">' + ver + '</td>'
         + '<td class="py-3.5 px-4 text-slate-200 mono-log tracking-wide">' + escapeHtml(keys) + '</td>'
         + '</tr>';
     }
@@ -587,14 +591,10 @@ async function fetchHeartbeat() {
       let cls = 'dot-dead';
       if (diffMin < 2) cls = 'dot-alive';
       else if (diffMin < 5) cls = 'dot-warn';
+      const ver = row.version != null ? 'v' + row.version : '';
       const ts = row.last_seen ? new Date(row.last_seen).toLocaleString() : 'never';
-      let verClass = 'bg-slate-700/40 text-slate-400';
-      if (g_latestVersion != null && row.version != null) {
-        verClass = row.version >= g_latestVersion ? 'bg-emerald-800/40 text-emerald-300 border border-emerald-700/40' : 'bg-amber-800/40 text-amber-300 border border-amber-700/40';
-      }
-      const verBadge = row.version != null ? '<span class="text-xs px-1.5 py-0.5 rounded ' + verClass + '">v' + row.version + '</span>' : '';
-      html += '<span class="inline-flex items-center gap-1 cursor-pointer hover:text-emerald-400 transition" onclick="document.getElementById(\'hostnameInput\').value=\'' + host.replace(/'/g, "\\'") + '\';fetchKeys(true)" title="Last seen: ' + ts + '">'
-        + '<span class="dot ' + cls + '"></span>' + escapeHtml(displayHost(host)) + ' ' + verBadge + '</span>';
+      html += '<span class="inline-flex items-center cursor-pointer hover:text-emerald-400 transition" onclick="document.getElementById(\'hostnameInput\').value=\'' + host.replace(/'/g, "\\'") + '\';fetchKeys(true)" title="Last seen: ' + ts + ' | ' + ver + '">'
+        + '<span class="dot ' + cls + '"></span>' + escapeHtml(displayHost(host)) + '</span>';
     }
     container.innerHTML = html;
   } catch (_) {}

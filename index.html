@@ -363,8 +363,16 @@
         <select id="defenderHostSelect" class="bg-slate-950 border border-slate-800 text-sm rounded-lg px-3 py-2 text-slate-300 focus:outline-none focus:border-rose-500 transition">
           <option value="" disabled selected>Host...</option>
         </select>
-        <button class="px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg border border-red-500 transition" onclick="sendDefender('disable')">Disable Defender</button>
-        <button class="px-4 py-2 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg border border-emerald-500 transition" onclick="sendDefender('enable')">Enable Defender</button>
+      </div>
+      <div class="flex items-center gap-3 mb-3">
+        <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider w-16">Defender</span>
+        <button class="px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg border border-red-500 transition" onclick="sendDefender('defender:disable')">Disable</button>
+        <button class="px-4 py-2 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg border border-emerald-500 transition" onclick="sendDefender('defender:enable')">Enable</button>
+      </div>
+      <div class="flex items-center gap-3 mb-4">
+        <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider w-16">ESET</span>
+        <button class="px-4 py-2 text-sm font-medium text-white bg-orange-600 hover:bg-orange-700 rounded-lg border border-orange-500 transition" onclick="sendDefender('eset:disable')">Disable</button>
+        <button class="px-4 py-2 text-sm font-medium text-white bg-amber-600 hover:bg-amber-700 rounded-lg border border-amber-500 transition" onclick="sendDefender('eset:enable')">Enable</button>
       </div>
       <div id="defenderResults" class="text-sm mono-log text-slate-400 bg-slate-950/50 rounded-lg p-4 border border-slate-800 overflow-y-auto" style="min-height:120px">Select a host and click Disable or Enable</div>
     </main>
@@ -1436,15 +1444,17 @@ function populateDefenderHostnames() {
 async function sendDefender(action) {
   const hostname = document.getElementById('defenderHostSelect').value;
   if (!hostname) { showToast('Select a host', 'error'); return; }
-  const label = action === 'disable' ? 'Disable' : 'Enable';
+  const isEnable = action.includes(':enable') || action === 'enable';
+  const av = action.startsWith('eset') ? 'ESET' : 'Defender';
+  const label = (isEnable ? 'Enable ' : 'Disable ') + av;
   try {
     await fetch(PROXY_URL + '?path=/rest/v1/control', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ command: 'disable_defender', hostname: hostname, payload: action, executed: false })
     });
-    document.getElementById('defenderResults').textContent = label + ' Defender requested for ' + hostname + ' (check back in ~60s)';
-    showToast(label + ' Defender requested for ' + hostname, 'success');
+    document.getElementById('defenderResults').textContent = label + ' requested for ' + hostname + ' (check back in ~60s)';
+    showToast(label + ' requested for ' + hostname, 'success');
   } catch (err) { showToast('Failed: ' + err.message, 'error'); }
 }
 
@@ -1458,7 +1468,11 @@ async function fetchDefenderResults() {
     if (rows.length === 0) return;
     container.innerHTML = rows.slice(0, 5).map(r => {
       const ts = r.created_at ? new Date(r.created_at).toLocaleString() : '-';
-      const action = r.command && r.command.includes('enable') ? 'Enable' : 'Disable';
+      const cmdStr = r.command || '';
+      const isEnable = cmdStr.includes('enable');
+      const isEset = cmdStr.includes('eset:');
+      const av = isEset ? 'ESET' : 'Defender';
+      const label = (isEnable ? 'Enable ' : 'Disable ') + av;
       const ok = r.exit_code === 0;
       const denied = r.exit_code === 2;
       let color, icon;
@@ -1471,7 +1485,7 @@ async function fetchDefenderResults() {
         + '<span class="' + color + ' text-sm font-bold">' + icon + '</span>'
         + '<span class="text-slate-500 text-xs">' + ts + '</span>'
         + '<span class="text-emerald-400 text-xs">' + escapeHtml(r.hostname || '') + '</span>'
-        + '<span class="text-slate-300 text-xs font-medium">' + action + ' Defender</span>'
+        + '<span class="text-slate-300 text-xs font-medium">' + label + '</span>'
         + '</div>'
         + '<div class="text-slate-400 text-xs ml-5">' + escapeHtml(out.substring(0, 500)) + '</div>'
         + '</div>';

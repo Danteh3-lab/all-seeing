@@ -1,0 +1,286 @@
+Netpen v2 — Enterprise + Home C2 Architecture (Revised)
+===========================================================
+
+1. Core Philosophy
+-------------------
+One binary, 64-bit, always injects into a trusted process. No standalone
+mode needed — explorer.exe exists on both home and enterprise Windows.
+The injected approach works identically on all targets.
+
+Simplified: Stage 1 (loader) injects Stage 2 (agent) into a trusted
+process. The agent has no process of its own — it lives entirely
+within the host process.
+
+
+2. Architecture
+---------------
+  +-------------------------------------------+
+  |        Dashboard (index.html)              |
+  |   Netlify -> Supabase REST polling         |
+  |            +----------------+              |
+  |     +------+--------+   +--+--------+     |
+  |     | Stage 1       |   | Stage 2   |     |
+  |     | (loader,~30KB)|-> | (agent)   |     |
+  |     +---------------+   +-----------+     |
+  |           |                                |
+  |     +-----+--------+                       |
+  |     | Delivery     |                       |
+  |     | method       |                       |
+  |     +--------------+                       |
+  +-------------------------------------------+
+
+Stage 1: Tiny 64-bit loader (Rust). Downloads Stage 2 from CDN
+         (staged model) and injects via reflective loader.
+
+Stage 2: 64-bit C agent DLL. All C2 logic. Runs inside target process.
+         No exe, no process of its own.
+
+
+3. Injection Targets (tiered, walked in order)
+-----------------------------------------------
+  1. explorer.exe     — Always running (covers ~95%)
+  2. svchost.exe      — -k netsvcs, SYSTEM-owned (Server Core,
+  3. Self-injection    — Into loader process (last resort)
+
+
+4. Tech Stack
+--------------
+  Stage 1 Lang:   Rust (#![no_std] + windows-sys crate)
+  Stage 2 Lang:   C (64-bit, reflective DLL)
+  Architecture:   64-bit only (injection target is 64-bit)
+  Compiler:       MSVC (standard IAT, blends with native MS binaries)
+  C2 protocol:    HTTPS REST polling (primary), WebSocket deferred to v2.1
+  C2 transport:    HTTPS via legitimate CDN (not GitHub Releases)
+  Encryption:     AES-256-GCM (per-session key)
+  Packer:         None (UPX is heavily signatured)
+  Signing:        EV code signing certificate (optional, for loader)
+
+
+5. Delivery
+------------
+  Enterprise path (fileless):
+    Phish -> macros -> DotNetToJScript -> PowerShell ->
+      VirtualAlloc + WriteProcessMemory + CreateRemoteThread ->
+        Stage 1 DLL in powershell.exe -> injects Stage 2 -> target
+
+  Home path (one-liner):
+    One-liner -> byte mangle -> WriteAllBytes -> run loader ->
+      loader downloads Stage 2 -> injects into target
+
+  Same loader binary for both. Different delivery wrappers.
+
+
+6. Stage 1 — The Loader (~30-50KB, Rust)
+-----------------------------------------
+  - 64-bit PE, custom section layout matching MSVC binaries
+  - Stage 2 NOT embedded (staged model — loader downloads it)
+  - Embed option available as compile flag for air-gapped targets
+
+  Execution flow:
+    1. Anti-VM/anti-sandbox checks (uptime >10min, mouse moved,
+       domain-joined check for enterprise targets)
+    2. Download Stage 2 DLL from CDN over HTTPS
+    3. Verify cryptographic hash of Stage 2 (prevents corrupted
+       injection — crashing explorer.exe creates forensic dump)
+    4. AES-256-GCM decrypt Stage 2
+    5. Find injection target (walk tiered list)
+    6. Allocate memory in target (VirtualAllocEx)
+    7. Write Stage 2 PE into target
+    8. Resolve imports + relocations (reflective loader)
+    9. Create remote thread or APC injection
+    10. Self-delete from disk (if on disk)
+
+
+7. Stage 2 — The Agent (runs inside target process)
+----------------------------------------------------
+  Feature parity with v1:
+    - Keylogging (SetWindowsHookEx WH_KEYBOARD_LL — works 64-bit
+      without separate DLL; WH_KEYBOARD needs 64-bit DLL, handled by
+      reflective loader architecture)
+    - Screenshots (GDI+)
+    - Webcam/audio capture
+    - Remote shell
+    - Discord/WhatsApp harvest
+    - Browser passwords/cookies
+    - WiFi passwords
+    - Clipboard monitoring
+    - Process enumeration + kill
+    - File browser + download
+    - Defender/ESET control
+    - Reset protection (kill systemreset.exe on sight)
+    - AMSI bypass (in-process)
+
+
+8. EDR Evasion (user-mode only, no kernel driver)
+--------------------------------------------------
+  Direct syscalls:
+    Replace kernel32 API calls with inline syscall instructions
+    (Hell's Gate / Halos Gate pattern). Bypasses user-mode EDR
+    hooks on ntdll.dll.
+
+  ETW patching:
+    Write `ret;ret;` to ntdll!EtwEventWrite in-process.
+    Stops ETW telemetry for current process.
+
+  Delay loading:
+    Resolve API addresses by walking PEB -> LDR ->
+    LdrGetProcedureAddress. No IAT imports for suspicious APIs.
+
+  Unbacked memory:
+    Allocate with MEM_PRIVATE, no file backing.
+    Defeats file-based EDR detection.
+
+  Deferred to v2.1:
+    Call stack spoofing for NtCreateThreadEx.
+    High-effort, high-reward, but a bad stack walk can BSOD.
+    The delay-loaded API resolution alone eliminates many
+    detections without stack spoofing.
+
+
+9. Anti-Sandbox / Anti-VM (Stage 1 + Stage 2)
+----------------------------------------------
+  Before any C2 activity:
+    - System uptime > 10 minutes (sandboxes reboot frequently)
+    - Mouse cursor has moved (real user interaction)
+    - At least one interactive logon session exists
+    - Domain membership check (optional, compile flag)
+    - Disk size > 60GB (VM sandboxes often have tiny disks)
+    - No known VM drivers (vmtoolsd, vboxservice, etc.)
+
+  Without these checks, the agent detonates in automated sandboxes
+  that ingest the one-liner, creating signatures for security vendors.
+
+
+10. C2 Communication
+---------------------
+  Primary: HTTPS REST polling (same as v1)
+    - Polling interval 30-60s + random 15s jitter
+    - Reuses existing Supabase backend
+
+  Deferred to v2.1:
+    WebSocket for real-time command push and dashboard feed.
+    REST at 20s polling is adequate for initial release.
+    Gather operational data first, then add WebSocket for
+    high-priority events rather than full-duplex stream.
+
+  Hosting:
+    Legitimate CDN (Azure Blob, CloudFront behind plausible domain)
+    with domain fronting support.
+    NOT GitHub Releases (publishing C2 payloads there is noise).
+
+
+11. Persistence (all per-user, no admin required)
+--------------------------------------------------
+  Four layers in descending stealth order:
+
+  1. COM hijack (primary, most stealthy)
+     TreatAs key on a non-security-reviewed CLSID, loaded by
+     dllhost.exe during normal COM activation. E.g.:
+     {DD313E04-FEFF-4CE3-A6EC-D1E1C6ECC3EB}
+     No admin required (HKCU).
+
+  2. Scheduled task (secondary)
+     Same as v1 — ONLOGON trigger, 30s delay, HIGHEST privilege.
+
+  3. WMI event subscription (tertiary)
+     __EventFilter + ActiveScriptEventConsumer on
+     Win32_ProcessStartTrace for explorer.exe.
+     Note: EDRs commonly monitor __EventFilter creation.
+     No admin required.
+
+  4. Startup .vbs (last resort, most visible)
+     Same as current — WScript.Shell.Run with window style 0.
+
+
+12. Build System
+-----------------
+  Three-stage build (revised build.ps1):
+    1. Compile Stage 2 (64-bit C) -> reflective DLL
+    2. Encrypt Stage 2 with random AES-256 key
+    3. Upload encrypted Stage 2 to CDN (staged model)
+    4. Compile Stage 1 (Rust) with CDN URL + public key
+       (or with embedded Stage 2 if compile flag set)
+    5. Sign Stage 1 with EV certificate (if available)
+    6. Upload Stage 1 to CDN
+    7. Generate one-liner (byte mangle + Start-Process)
+
+  Build flags:
+    --staged       Download Stage 2 from CDN (default)
+    --embedded     Embed Stage 2 in loader (air-gapped targets)
+    --signed       Apply EV certificate (requires cert on build machine)
+    --enterprise   Enable domain-only features (AD enumeration, etc.)
+
+
+13. Dashboard
+--------------
+  Reuse existing HTML/CSS/JS with additions:
+    - Agent status indicator: "Injected into explorer.exe (PID XXXX)"
+    - Process tree view showing injection target
+    - All existing tabs and features preserved
+
+  Deferred to v2.1:
+    - WebSocket real-time feed
+    - Agent version tracking
+    - Dashboard-side injection target selection
+
+
+14. Effort Estimate
+--------------------
+  Stage 1 loader (Rust, reflective injection, anti-VM)   3-4 weeks
+  Stage 2 agent (64-bit C, feature parity with v1)       5-6 weeks
+  Direct syscalls + ETW patching                         1-2 weeks
+  COM + WMI persistence                                  1 week
+  Build pipeline (staged + embedded modes)               1 week
+  Dashboard integration + testing                        1 week
+  Testing against Defender + EDR (lab)                   Ongoing
+  -------------------------------------------------------------
+  Total rough estimate                                   ~3 months
+
+
+15. Milestone Plan
+-------------------
+  M1: Stage 1 loader (Rust)
+      - PE structure, PE section layout, TLS handshake
+      - Anti-VM checks
+      - HTTPS download + AES decrypt + hash verify
+      - VirtualAllocEx + WriteProcessMemory + reflective load
+      - CreateRemoteThread
+      - Self-injection fallback
+      - Deliverable: Loader injects a test DLL into explorer.exe
+
+  M2: Stage 2 agent (C)
+      - Port v1 features to 64-bit reflective DLL
+      - Keylogging, screenshots, webcam, audio, shell
+      - All credential harvest modules
+      - C2 REST polling integration
+
+  M3: Evasion
+      - Direct syscalls (Hell's Gate)
+      - ETW patching
+      - Delay-loaded API resolution
+      - Unbacked memory allocation
+
+  M4: Persistence + Deployment
+      - COM hijack
+      - WMI event subscription
+      - Build pipeline
+      - One-liner generator
+
+  M5: Testing
+      - Test against Windows Defender (home + enterprise)
+      - Test against CrowdStrike / SentinelOne (lab)
+      - Test on Win10 22H2, Win11 24H2, Server 2022
+      - Fix detections, iterate evasion
+
+
+16. Summary
+------------
+  This is a ground-up rewrite, not an upgrade. v1 is 32-bit MinGW with
+  patterns recognizable to any EDR. v2 is 64-bit, process-injected,
+  syscall-based, with COM/WMI persistence layered over existing
+  registry/task/startup layers.
+
+  The most practical first step: build the Stage 1 loader in Rust.
+  It's the smallest, most self-contained component, and it's the
+  foundation for everything else. A working loader that injects
+  a test DLL into explorer.exe proves the core architecture.

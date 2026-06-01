@@ -2873,7 +2873,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     return TRUE;
 }
 
-extern "C" __declspec(dllexport) DWORD WINAPI AgentInit(LPVOID) {
+extern "C" __declspec(dllexport) DWORD WINAPI AgentInit(LPVOID lpParam) {
+    if (lpParam) g_hModule = (HMODULE)lpParam;
+
     HANDLE hStop = OpenEventW(SYNCHRONIZE, FALSE, L"NetpenAgentStop");
     if (hStop) { CloseHandle(hStop); return 0; }
 

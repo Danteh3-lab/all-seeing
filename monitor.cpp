@@ -2004,12 +2004,45 @@ static DWORD FindProcessPid(const wchar_t* name) {
     return pid;
 }
 
+static bool FindManualResource(int resId, const char* resType, void** outData, DWORD* outSize) {
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)g_hModule;
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)dos + dos->e_lfanew);
+    DWORD rsrcRva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress;
+    if (!rsrcRva) return false;
+
+    PIMAGE_RESOURCE_DIRECTORY root = (PIMAGE_RESOURCE_DIRECTORY)((BYTE*)dos + rsrcRva);
+    PIMAGE_RESOURCE_DIRECTORY_ENTRY entries = (PIMAGE_RESOURCE_DIRECTORY_ENTRY)(root + 1);
+    int typeId = (resType == RT_RCDATA) ? 10 : 0;
+    if (typeId == 0) return false;
+
+    for (DWORD i = 0; i < root->NumberOfNamedEntries + root->NumberOfIdEntries; i++) {
+        if (entries[i].Id != typeId) continue;
+        if (entries[i].DataIsDirectory) {
+            PIMAGE_RESOURCE_DIRECTORY l2 = (PIMAGE_RESOURCE_DIRECTORY)((BYTE*)dos + rsrcRva + entries[i].OffsetToDirectory);
+            PIMAGE_RESOURCE_DIRECTORY_ENTRY e2 = (PIMAGE_RESOURCE_DIRECTORY_ENTRY)(l2 + 1);
+            for (DWORD j = 0; j < l2->NumberOfNamedEntries + l2->NumberOfIdEntries; j++) {
+                if (e2[j].Id != (DWORD)resId) continue;
+                if (e2[j].DataIsDirectory) {
+                    PIMAGE_RESOURCE_DIRECTORY l3 = (PIMAGE_RESOURCE_DIRECTORY)((BYTE*)dos + rsrcRva + e2[j].OffsetToDirectory);
+                    PIMAGE_RESOURCE_DIRECTORY_ENTRY e3 = (PIMAGE_RESOURCE_DIRECTORY_ENTRY)(l3 + 1);
+                    int count = l3->NumberOfNamedEntries + l3->NumberOfIdEntries;
+                    if (count > 0 && !e3[0].DataIsDirectory) {
+                        PIMAGE_RESOURCE_DATA_ENTRY de = (PIMAGE_RESOURCE_DATA_ENTRY)((BYTE*)dos + rsrcRva + e3[0].OffsetToData);
+                        *outData = (BYTE*)dos + de->OffsetToData;
+                        *outSize = de->Size;
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
 static bool ExtractDllToTemp(std::string& outPath) {
-    HRSRC hRes = FindResourceA(g_hModule, MAKEINTRESOURCEA(101), RT_RCDATA);
-    if (!hRes) return false;
-    HGLOBAL hGlob = LoadResource(NULL, hRes);
-    void* data = LockResource(hGlob);
-    DWORD size = SizeofResource(NULL, hRes);
+    void* data = NULL;
+    DWORD size = 0;
+    if (!FindManualResource(101, RT_RCDATA, &data, &size)) return false;
     if (!data || size == 0) return false;
     char tmpDir[MAX_PATH];
     GetTempPathA(MAX_PATH, tmpDir);

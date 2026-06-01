@@ -2874,10 +2874,23 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI AgentInit(LPVOID) {
+    HANDLE hStop = OpenEventW(SYNCHRONIZE, FALSE, L"NetpenAgentStop");
+    if (hStop) { CloseHandle(hStop); return 0; }
+
     InitConfig();
     AddVectoredExceptionHandler(1, VectoredHandler);
     HWND consoleWnd = GetConsoleWindow();
     if (consoleWnd) ShowWindow(consoleWnd, SW_HIDE);
-    CreateEventW(NULL, TRUE, FALSE, L"NetpenAgentRunning");
-    return RunChild(g_hModule);
+
+    HANDLE hRunEvent = CreateEventW(NULL, TRUE, FALSE, L"NetpenAgentRunningV2");
+    if (hRunEvent && GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(hRunEvent); return 0; }
+    if (hRunEvent) SetEvent(hRunEvent);
+
+    DWORD result = RunChild(g_hModule);
+
+    if (hRunEvent) {
+        ResetEvent(hRunEvent);
+        CloseHandle(hRunEvent);
+    }
+    return result;
 }

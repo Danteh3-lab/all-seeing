@@ -7,9 +7,5 @@
 [functions]
   directory = "netlify/functions"
 
-[build]
-  command = "npm run build"
-  publish = "dist"
-
 [build.environment]
   SUPABASE_URL = "https://xdxlfkyywnjrzqblvdzg.supabase.co"

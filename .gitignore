@@ -11,3 +11,5 @@ deploy-*.zip
 
 payload/
 .kill
+node_modules/
+dist/

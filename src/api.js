@@ -27,20 +27,3 @@ export async function fetchLatestVersion() {
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return parseInt(await res.text(), 10);
 }
-
-export async function discordApi(token, path, options = {}) {
-  const res = await fetch(`https://discord.com/api/v9${path}`, {
-    ...options,
-    headers: {
-      Authorization: token,
-      'Content-Type': 'application/json',
-      ...(options.headers || {})
-    }
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text || `${res.status} ${res.statusText}`);
-  }
-  const text = await res.text();
-  return text ? JSON.parse(text) : null;
-}

